@@ -1,0 +1,35 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/hidden-env-bandit"
+description = "Infer the best arm of a hidden multi-armed bandit by interacting with it over the env socket, then submit a policy."
+
+[environment]
+required_resources = "2vcpu+6gib"
+storage_mb = 10000
+allow_internet = false
+# Turn on the hidden-environment RPC server. The agent reaches make_env() over
+# /tmp/env.sock via /data/env_client.py and can never read the env source.
+hidden_env = "env"
+
+[agent]
+timeout_sec = 1800
+
+[verifier]
+timeout_sec = 600
+env = []
+
+[difficulty]
+# hidden_env is orthogonal to task_type: this is an RL/agentic ml task.
+task_type = "ml"
+domain = "reinforcement_learning_agentic_systems"
+reward_type = "continuous_scoring_function"
+# Fully synthetic env (no external dataset), so the task generates its own data.
+license = "self_generated"
+# Justification for self_generated: the env and all data are generated in-repo.
+license_source = "fully synthetic bandit env generated in-repo; no external dataset"
+
+[[outputs]]
+path = "/tmp/output/policy.py"
+required = true
+description = "Python module defining load_policy() -> object with choose() -> int (the best arm)"

@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "opensees-base-isolation",
+    "description": "Design a lead-rubber base-isolation system for a three-story building and verify it with OpenSeesPy nonlinear response-history analysis across a band of design-basis ground motions."
+  }
+}

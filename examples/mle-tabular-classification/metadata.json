@@ -1,0 +1,8 @@
+{
+  "ml_task_type": "dataset",
+  "required_resources": "12vcpu+100gib+h100/2",
+  "domain": "scientific_discovery_computational_science",
+  "license": "CC0-1.0",
+  "license_source": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "description": "Synthetic tabular regression plus classification task using continuous ML_Envs-style scoring"
+}

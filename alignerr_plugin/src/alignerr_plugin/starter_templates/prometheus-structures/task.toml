@@ -1,0 +1,48 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/prometheus-structures-replace-me"
+description = "Design or repair a structural model scored deterministically, then submit passing CI to Prometheus and Taiga."
+
+[delivery]
+# Mothership keeps the normal structures trusted-CI gates, then submits
+# independently to the Prometheus Agent Service runner and dedicated Taiga mirror.
+platform = "prometheus"
+eval = false
+
+[environment]
+required_resources = "8vcpu+64gib"
+storage_mb = 50000
+allow_internet = true
+
+[agent]
+timeout_sec = 3600
+user = "agent"
+
+[runner.timeouts]
+setup_sec = 1800
+grading_sec = 1800
+tool_sec = 600
+max_episode_sec = 3600
+
+[verifier]
+timeout_sec = 1800
+user = "root"
+env = []
+
+[difficulty]
+task_type = "structures"
+domain = "structural_mechanics"
+reward_type = "multi_deterministic_rubrics"
+[ground_truth]
+score_epsilon = 0.001
+in_container = true
+render_command = "bash solution/render.sh"
+render_outputs = [
+  { path = "/tmp/output/rendering.mp4", required = true, description = "Reviewer animation comparing the oracle design against the baseline" },
+]
+
+[[outputs]]
+path = "/tmp/output/design.json"
+required = true
+description = "JSON structural design graded by hidden structural-response checks"

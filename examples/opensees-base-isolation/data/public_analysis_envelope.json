@@ -1,0 +1,75 @@
+{
+  "task": "lead_rubber_base_isolation_design",
+  "units": "kip, inch, second; g = 386.089 in/s^2",
+  "seismic_weight_kip": 4100.0,
+  "design_variables": {
+    "Qd_kip": {"min": 80.0, "max": 650.0, "meaning": "isolation-system characteristic (lead) strength"},
+    "Kd_kip_per_in": {"min": 10.0, "max": 90.0, "meaning": "isolation-system post-yield (rubber) stiffness"},
+    "Dy_in": {"min": 0.30, "max": 1.50, "meaning": "lead-core yield displacement; initial stiffness = Qd_kip / Dy_in"}
+  },
+  "ground_motion_band": {
+    "pga_g_range": [0.26, 0.36],
+    "predominant_period_tp_sec_range": [1.20, 3.40],
+    "duration_sec_range": [22.0, 30.0],
+    "phase_seed_integer_range": [1, 999],
+    "generator": "Deterministic Kanai-Tajimi accelerogram, spectral peak near 1/tp_sec, scaled to pga_g. An integer phase_seed in [1,999] selects the Fourier-phase realization. The same generator and seed convention are used for public, self-generated, and private records.",
+    "hidden_case_count": 6,
+    "design_basis_vs_mce": "The graded score is the WORST case over six private records spanning the FULL band up to pga 0.36, predominant period 3.4 s, duration 30 s, and multiple phase realizations. The published suite-composition policy ensures the DBE, strong-motion, long-period, and MCE regimes are represented.",
+    "robustness_note": "Optimizing a design only against mild records systematically under-controls isolator displacement at the MCE corner and ignores record-to-record phase variability. Reason about several phase seeds at the demanding end of the band (for example pga 0.35-0.36, tp 3.2-3.4, duration 30) before finalizing."
+  },
+  "public_representative_cases": [
+    {"case_id": "public_dbe_short", "pga_g": 0.28, "tp_sec": 1.5, "duration_sec": 24.0, "phase_seed": 101},
+    {"case_id": "public_dbe_mid", "pga_g": 0.28, "tp_sec": 2.4, "duration_sec": 24.0, "phase_seed": 211},
+    {"case_id": "public_dbe_long", "pga_g": 0.28, "tp_sec": 3.0, "duration_sec": 24.0, "phase_seed": 307}
+  ],
+  "graded_metrics": {
+    "peak_isolator_disp_in": "Peak absolute isolator (base-mat) displacement across the response history, in. Lower is better; bounded above by the moat capacity.",
+    "peak_interstory_drift_ratio": "Peak superstructure interstory drift ratio across the three stories. Lower is better.",
+    "peak_floor_acceleration_g": "Peak total floor acceleration across the base mat and three floors, in g. Lower is better.",
+    "peak_base_shear_coeff": "Peak isolator force divided by the seismic weight (4100 kip). Lower is better.",
+    "residual_isolator_disp_in": "Largest absolute isolator displacement remaining at the end of a record, in. Lower is better; the recentering capacity is a separate post-earthquake functionality limit."
+  },
+  "performance_targets": {
+    "peak_isolator_disp_in": 43.6,
+    "peak_interstory_drift_ratio": 0.00865,
+    "peak_floor_acceleration_g": 0.720,
+    "peak_base_shear_coeff": 0.366,
+    "residual_isolator_disp_in": 8.2,
+    "note": "A worst-case value (over the six private records) at or below a target earns full credit for that metric. These targets reflect the performance achievable at the MCE corner by a well-balanced design; they are achievable simultaneously only near the balanced optimum."
+  },
+  "moat_capacity_in": 45.0,
+  "moat_note": "The seismic moat (clearance to the surrounding retaining wall) is 45.0 in. If the worst-case isolator displacement exceeds the moat capacity the isolated building pounds against the wall; this is a distinct hard limit state from the displacement serviceability target and is applied as a multiplicative gate on the final score.",
+  "recentering_capacity_in": 9.0,
+  "recentering_note": "Residual isolator displacement above 9.0 in prevents post-earthquake inspection and reoccupation without jacking the building. This distinct functionality limit is applied as a multiplicative recentering gate; residual displacement also receives continuous metric credit against its 8.3 in target.",
+  "scoring": {
+    "aggregation": "For each metric, take the worst (maximum) value over the six private ground motions.",
+    "metric_credit": "credit = lower_ratio_curve( worst_value / target ).",
+    "weights": {
+      "isolator_displacement_control": 0.22,
+      "floor_acceleration_control": 0.25,
+      "interstory_drift_control": 0.19,
+      "base_shear_control": 0.18,
+      "residual_displacement_control": 0.16
+    },
+    "moat_gate": "moat_gate = moat_gate_curve( worst_isolator_disp / moat_capacity_in ).",
+    "recentering_gate": "recentering_gate = recentering_gate_curve( worst_residual_isolator_disp / recentering_capacity_in ).",
+    "final_score": "score = ( sum_k weight_k * credit_k ) ** final_score_exponent * moat_gate * recentering_gate.",
+    "final_score_exponent": 3.8,
+    "lower_ratio_curve": [
+      [0.0, 1.0], [1.0, 1.0], [1.05, 0.80], [1.12, 0.55], [1.22, 0.32], [1.38, 0.13], [1.6, 0.03], [2.0, 0.0]
+    ],
+    "moat_gate_curve": [
+      [0.0, 1.0], [1.0, 1.0], [1.08, 0.45], [1.18, 0.15], [1.35, 0.0]
+    ],
+    "recentering_gate_curve": [
+      [0.0, 1.0], [1.0, 1.0], [1.08, 0.45], [1.18, 0.15], [1.35, 0.0]
+    ],
+    "interpolation": "Piecewise linear between listed points, clamped to the endpoint values outside the listed range.",
+    "hard_zero_conditions": [
+      "missing isolation_design.json",
+      "design outside the allowed variable ranges or with extra/missing keys",
+      "a non-converged response history on any design-basis ground motion"
+    ]
+  },
+  "not_public": "The six private (pga_g, tp_sec, duration_sec, phase_seed) records and the oracle design are private. Their full selection envelope and suite-composition rules are public. The structural model, isolator model, ground-motion generator, phase-seed convention, metric definitions, targets, moat capacity, credit curves, weights, and exponent are disclosed here."
+}

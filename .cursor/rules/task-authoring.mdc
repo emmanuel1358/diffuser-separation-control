@@ -1,0 +1,41 @@
+---
+description: Alignerr RL task authoring conventions
+globs: "{problems,examples}/**/*"
+alwaysApply: false
+---
+
+# Alignerr Task Authoring
+
+- Author submitted work under `problems/<task_id>/`; use `examples/` only as template-owned references.
+- Keep one task per directory with `task.toml`, `metadata.json`, `instruction.md`, `environment/Dockerfile`, and `scorer/compute_score.py`.
+- Tell agents to write final graded artifacts under `/tmp/output`, and declare each required artifact in `task.toml` with `[[outputs]]`.
+- Put public agent-readable files in `data/`; put hidden grader fixtures in `scorer/data/`.
+- Do not commit credentials or provider keys anywhere, including `scorer/data/`.
+- Keep Dockerfile copy paths aligned with the template: the shared `grader/` package is already installed in the base image; copy task `data/` to `/data/`, `scorer/data/` to `/mcp_server/data/`, and `scorer/` to `/mcp_server/grader/`.
+- Keep task Dockerfiles writable for Taiga's non-root tool user: include `WORKDIR /workdir` and `RUN mkdir -p /mcp_server/data /workdir /tmp/output && chown -R 1000:1000 /workdir /tmp/output` near the top.
+- Prefer GPU: we want GPU-accelerated tasks. Set `[environment].required_resources` to one of the Taiga enum values in `alignerr_plugin.taiga_resources`; use an H100 enum whenever the work can use acceleration (training, deep models, RAPIDS/cuDF, CUDA solvers, batched eval), and pick a CPU enum only when the task genuinely cannot use a GPU.
+- **`ml` tasks default to GPU.** The `ml` starter scaffolds `required_resources = "12vcpu+100gib+h100/2"`; keep an H100 enum unless the task truly cannot use a GPU.
+- Available resource enums: CPU `2vcpu+6gib`, `4vcpu+16gib`, `6vcpu+32gib`, `8vcpu+64gib`, `16vcpu+64gib`, `16vcpu+128gib`; CPU perf `2vcpu+6gib+perf`, `4vcpu+16gib+perf`, `6vcpu+32gib+perf`, `8vcpu+64gib+perf`, `16vcpu+64gib+perf`, `16vcpu+128gib+perf`; TPU `13vcpu+32gib+tpuv5e1x1`, `16vcpu+64gib+tpuv5e2x2`, `50vcpu+128gib+tpuv5e2x2`; H100 `3vcpu+25gib+h100/8`, `6vcpu+50gib+h100/4`, `12vcpu+100gib+h100/2`, `24vcpu+200gib+h100/1`; H100 graphics `3vcpu+25gib+h100/8+graphics`, `6vcpu+50gib+h100/4+graphics`, `12vcpu+100gib+h100/2+graphics`, `24vcpu+200gib+h100/1+graphics`.
+- For accelerator tasks, keep Dockerfiles generic with `ARG BASE_IMAGE`, `ARG BASE_TAG`, and `FROM ${BASE_IMAGE}:${BASE_TAG}` so the harness and mothership can inject the right base (`base_flavor = "auto"` infers CPU/GPU/graphics/TPU from `required_resources`).
+- Use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>` while developing the reference solution (especially ML training loops); use `--skip-solve` to re-grade cached outputs without rerunning training.
+- Use `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` before opening or updating a PR; commit the generated `problems/<task_id>/.alignerr/build_proof.json`.
+- Run `uv run lbx-rl-harness run --problem-dir problems/<task_id>` after changing task config, Dockerfile, grader code, or image-copied data when you need a full local check including optional agent feedback.
+- Every task must include a ground-truth/reference `solution/solve.sh` that matches the declared `[difficulty].reward_type` target under the same `scorer/compute_score.py` used for agents.
+- Every task must declare enum-backed `[difficulty].task_type`, `[difficulty].domain`, and `[difficulty].reward_type`; master values live in `alignerr_plugin.task_metadata`.
+- `task_type` values are `ml`, `mujoco`, `cfd`, `structures`; `domain` is scoped by task type and includes multiple values per type (see `alignerr_plugin.task_metadata`).
+- `reward_type` values are `continuous_scoring_function` (reference target `0.5 ± 0.05`) and `multi_deterministic_rubrics` (oracle target `1.0`).
+- `ml` tasks must declare `[difficulty].license`: a permissive SPDX id from `task_metadata.LICENSES` (MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unlicense, CC0-1.0, CC-BY-4.0, PDDL-1.0, UPL-1.0), or `not_applicable` for edge cases with no external dataset. Trace the license upstream; copyleft / non-commercial / research-only data is rejected. Other task types may omit it.
+- For ML_Envs-style tasks (dataset/CSV, model module, executable, HDF5, k-fold), read submissions via the sanctioned loaders and calibrate with `grading.calibration`; see `docs/MLENVS_TASKS.md`.
+- Respect the reward-hacking mitigations in `docs/REWARD_HACKING.md`: never trust agent stdout, never exec/pickle agent artifacts in the grader, and use the AgentFault keep-vs-discard discipline. `lbx-rl-template validate` enforces the blocking `agent_fault` stage.
+- Select a base image with `[environment].base_flavor` (`auto` default, or compatible `cpu`/`gpu`/`gpu-openroad`/`cuda-graphics`/`tpu`). Use `gpu-openroad` only for EDA/OpenROAD tasks with a non-graphics H100 enum and `cuda-graphics` for rendering (hardware GL is not deployable under gVisor; CUDA-native raster is). Bases are tagged with a content drift hash by `base/build_and_push.sh`.
+- Mount large datasets / model weights with `[[preloaded_files]]` (a local `source` tree or an `hf_repo`) instead of baking them into the image; `scripts/sync_mount.sh` packs/uploads/stamps and the exporter emits the manifest. See `docs/MLENVS_TASKS.md`.
+- For numerical-solver tasks (CFD/structures), use the in-base solver stack; see the `numerical-solvers` rule, `docs/NUMERICAL_SOLVERS.md`, `project_guidelines/cfd/cfd_environments.md`, and `examples/openfoam-hydrofoil-flap`.
+- `mujoco` tasks must declare `[ground_truth]` in `task.toml` and generate at least one required reviewer video.
+- Any task type (not just `mujoco`) can attach a reviewer video by declaring `[ground_truth].render_outputs` (named `rendering.mp4`, exactly `1280x720` h264). For tasks whose grader/renderer needs a base-image-only engine (OpenFOAM/SU2/Meep/OpenROAD), set `[ground_truth].in_container = true` so solve+grade+render run inside the task image.
+- MuJoCo reviewer videos must be exactly `1280x720`; `verify-ground-truth` validates this with `ffprobe`.
+- MuJoCo tasks should use the shared `uv run python -m lbx_rl_tasks_harness.render_mujoco` renderer. Put only task-specific rollout setup, observation extras, and camera hooks in `solution/render_config.py`.
+- MuJoCo policy artifacts should expose `act(obs)` or `class Policy` with `act(obs)`; optional `reset(seed=None, metadata=None)` is supported.
+- Use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>` to check the oracle without calling an LLM and without refreshing build proof (ideal for ML iteration).
+- Use `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` before PR to update build proof.
+- Commit both `problems/<task_id>/.alignerr/build_proof.json` and generated videos under `problems/<task_id>/.alignerr/ground_truth/`.
+- `ground_truth_result.review_artifacts[]` must include `path`, `logical_path`, `sha256`, `bytes`, `width`, and `height`.

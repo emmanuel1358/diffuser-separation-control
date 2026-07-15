@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "prometheus-replace-me",
+    "description": "Replace with a concise Prometheus task description"
+  }
+}

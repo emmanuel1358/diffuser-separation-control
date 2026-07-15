@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "mujoco-replace-me",
+    "description": "MuJoCo robotics control task"
+  }
+}

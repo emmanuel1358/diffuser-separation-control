@@ -1,0 +1,17 @@
+---
+description: Continuous ML_Envs-style scoring conventions
+globs: "{problems,examples}/**/scorer/compute_score.py,{problems,examples}/**/task.toml"
+alwaysApply: false
+---
+
+# Continuous Scoring Tasks
+
+- Use this style for ML_Envs-style dataset tasks where score is a continuous function of submitted predictions, not a rubric. See `docs/MLENVS_TASKS.md`.
+- Set `[difficulty].task_type = "ml"` and `[difficulty].reward_type = "continuous_scoring_function"` (this template's enum has no `dataset` type; the submission paradigm is expressed via the loader you call, not the task_type).
+- `ml` tasks must declare `[difficulty].license`: a permissive SPDX id from `task_metadata.LICENSES`, or `not_applicable` for edge cases (e.g. fully synthetic data).
+- Read agent artifacts only via the sanctioned loader (e.g. `helpers.load_submission_or_fault(workspace / "submission.csv", ...)`); read hidden targets from `private` (e.g. `private / "test_target.parquet"`).
+- Calibrate with the shared toolkit, not hand-rolled math: `from grading import calibration`, map raw metrics with `calibration.progress_lower_better` / `progress_higher_better`, then `calibration.ExponentialCurve.from_reference(X_REF).score(x_agg)`. `FLOOR` = worst plausible raw metric, `REF` -> 0.5, `PERFECT` = optimum.
+- Return a bare `float` for headline-only scoring, or a dict with authoritative `score` plus diagnostic `subscores` (normalized `[0, 1]` progress), `weights`, and `metadata`. The runtime must not recompute the headline from subscores.
+- Ship `solution/solve.sh` (reference, scores `0.5 ± 0.05`) and at least one `baselines/<name>/` (naive solution scoring `~0`). The validator's learnability gate fails the task if a baseline reaches the reference target.
+- Do not introduce `RubricBuilder` unless the task is actually decomposed into rubric criteria.
+- Before opening or updating a PR, run `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` and commit the generated `problems/<task_id>/.alignerr/build_proof.json`. While iterating, use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>` (cached solve + grade, no proof refresh).

@@ -1,0 +1,32 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/mujoco-pendulum"
+description = "Create a damped single-pendulum MJCF with target structural and dynamic properties."
+
+[environment]
+required_resources = "4vcpu+16gib"
+storage_mb = 10000
+allow_internet = true
+
+[agent]
+timeout_sec = 1200
+
+[verifier]
+timeout_sec = 300
+env = []
+
+[difficulty]
+task_type = "mujoco"
+domain = "model_environment_construction"
+reward_type = "multi_deterministic_rubrics"
+[ground_truth]
+render_command = "bash solution/render.sh"
+render_outputs = [
+  { path = "/tmp/output/rendering.mp4", required = true, description = "Reviewer video of the oracle pendulum rollout" },
+]
+
+[[outputs]]
+path = "/tmp/output/model.xml"
+required = true
+description = "MJCF XML model for the damped pendulum"

@@ -1,0 +1,33 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/openfoam-hydrofoil-flap"
+description = "Design a 2D marine hydrofoil aft flap using public geometry bounds and off-design transfer guidance, then submit a JSON design for private physical scoring."
+
+[environment]
+required_resources = "8vcpu+64gib"
+storage_mb = 50000
+allow_internet = false
+
+
+[agent]
+timeout_sec = 1800
+
+[verifier]
+timeout_sec = 900
+env = []
+
+[ground_truth]
+score_epsilon = 0.001
+in_container = true
+
+[difficulty]
+level = "medium-hard"
+task_type = "cfd"
+domain = "aerodynamics"
+reward_type = "multi_deterministic_rubrics"
+
+[[outputs]]
+path = "/tmp/output/hydrofoil_flap.json"
+required = true
+description = "Marine hydrofoil aft-flap design JSON with SI geometry values and flap deflection in degrees"

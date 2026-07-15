@@ -1,0 +1,20 @@
+---
+description: Reward-hacking mitigations the grader enforces
+globs: "{problems,examples}/**/scorer/**/*.py,grader/src/grading/**/*.py"
+alwaysApply: false
+---
+
+# Reward-Hacking Mitigations
+
+The grader runs as root and can read held-out truth under `/mcp_server`. Untrusted
+agent code/artifacts must never reach the grader's process, stdout, or trusted
+reads. Full catalog: `docs/REWARD_HACKING.md`.
+
+- Never trust the agent's stdout or self-reported score; compute the score from the declared output artifacts.
+- Never `import` / `exec_module` / `exec` / `eval` an agent file, and never `pickle.load` / `joblib.load` / `torch.load` / `read_pickle` / `numpy.load(allow_pickle=True)` an agent artifact in the grader. Run submitted code via the sandboxed `helpers.run_policy` / `helpers.run_model_module` and read the score from the return value.
+- Read each submission type through its sanctioned loader (carries the attack closure): `load_submission_or_fault` (CSV), `run_submitted_executable` (strips `RUBRIC_SCORE=` stdout forging), `load_submission_h5_or_fault` (rejects external links / virtual datasets), `score_kfold_cv` (closes cross-fold leakage via fresh worker + `CLONE_NEWIPC` + per-fold pristine rebuild).
+- AgentFault keep-vs-discard discipline: `raise grading.faults.AgentFault(...)` for agent-controlled failures (missing/malformed/oversized/wrong-shape submission, policy load/act failure) so the 0.0 is KEPT for training; let author/infra failures (missing truth, broken import, simulator crash, OOM) PROPAGATE so the rollout is discarded.
+- A broad `except Exception: return 0.0` (or `return _failure(...)`) is rejected by the blocking `agent_fault` validator stage: it converts author/infra bugs into a kept 0.0. Catch the specific agent exception and raise AgentFault; keep hidden-truth reads outside the agent `try`.
+- Continuous tasks: a no-op submission must not exceed `[ground_truth].max_trivial_score`, and committed `baselines/<name>/` must score clearly below the reference (learnability gate). Calibrate via `grading.calibration` so naive baselines map to ~0.
+- MuJoCo: gate the score on `helpers.world_integrity(model, ...)` to catch physics reward-hacks (gravity off, gravcomp abuse, welds, contacts off).
+- Runtime hardening (symlink/FIFO scrub, PID-namespace, non-finite trap, uid-1000/0700) is automatic; do not weaken it. See `docs/POLICY_ISOLATION.md`.

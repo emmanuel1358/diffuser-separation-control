@@ -1,0 +1,35 @@
+# Numerical-solver stack for non-MuJoCo RL task domains.
+#
+# These are the open-source engines from numerical_solver_dataset_proposal.md
+# that are (a) pip-installable on python:3.13-slim, (b) CPU-friendly, and
+# (c) deterministic given pinned versions. Versions are pinned because the
+# determinism playbook requires "same submission -> same score": a solver
+# version bump can shift the reference field a task grades against.
+#
+# Verified to import AND run a tiny solve on python:3.13-slim (linux/amd64 and
+# arm64) — see the per-domain smoke tests in base/tests/test_solvers.py.
+#
+# Heavier engines that are NOT pip-friendly (Meep, OpenFOAM/SU2, OpenROAD,
+# DREAMPlace, XFOIL/AVL, CalculiX, PyNEC, ahkab) are intentionally left out of
+# the shared base; install them per-task. See docs/NUMERICAL_SOLVERS.md.
+
+# Domain 1 — CFD & Aerodynamics (vortex-lattice / airfoil)
+aerosandbox==4.2.9          # pulls casadi + neuralfoil
+
+# Domain 2 — Analog & Mixed-Signal Circuits (SPICE)
+PySpice==1.5                # needs apt: ngspice / libngspice0 (see install-common.sh)
+
+# Domain 3 — Structural Mechanics & FEM
+scikit-fem==12.0.1
+PyniteFEA==3.0.0            # import name: `Pynite`
+anastruct==1.6.2
+
+# Domain 4 — Computational Electromagnetics (RF network / S-parameters)
+scikit-rf==1.12.0
+
+# Domain 5 — Reacting Flow, Combustion & Thermodynamics
+cantera==3.2.0
+CoolProp==7.2.0
+
+# Domain 6 — Digital Chip Floorplanning & Placement (layout I/O, DRC, figures)
+klayout==0.30.9

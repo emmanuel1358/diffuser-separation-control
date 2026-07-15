@@ -1,0 +1,24 @@
+# JAX TPU stack for the tpu base flavor (Python 3.12).
+#
+# Every package is pinned (==) so the build is deterministic and matches the
+# Taiga v5e TPU runtime (libtpu 0.0.10.1). On real v5e the jaxlib <-> libtpu <->
+# host TPU-runtime versions must match exactly; an unpinned resolve picks
+# "whatever is latest at build time", which won't match the host libtpu and
+# fails at `import jax` / first device init with an unrecoverable ABI mismatch
+# (Taiga runners cannot pip at runtime). jax 0.5.2's tpu extra itself wants
+# jaxlib>=0.5.1,<=0.5.2 and libtpu==0.0.10.*; we pin jaxlib==0.5.1 and
+# libtpu==0.0.10.1 explicitly so a newer transitive jaxlib/libtpu cannot slip
+# in (this install does NOT inherit the requirements-runtime.txt constraints).
+#
+# This list must be installed with the libtpu releases extra index:
+#   --extra-index-url https://storage.googleapis.com/jax-releases/libtpu_releases.html
+# After install, the Dockerfile runs base/clear_execstack.py to strip the
+# executable-stack flag off jaxlib/libtpu .so files (jax-ml/jax#26781), which
+# the hardened grading loader otherwise refuses.
+jax[tpu]==0.5.2
+jaxlib==0.5.1
+libtpu==0.0.10.1
+flax==0.10.4
+optax==0.2.4
+orbax-checkpoint==0.11.1
+chex==0.1.89

@@ -1,0 +1,17 @@
+---
+description: Local harness usage for task debugging
+globs: "{problems,examples}/**/*,harness/**/*,.env.example"
+alwaysApply: false
+---
+
+# Local Harness
+
+- Use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>` while iterating on `solution/solve.sh` (train/solve + grade with persistent cache under `.alignerr/reference_cache/output`). Use `--skip-solve` to re-grade cached artifacts, `--no-grade` to train only, and `--clean-cache` to wipe the cache.
+- Use `uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime ground-truth` before opening a PR; this updates `.alignerr/build_proof.json` with `ground_truth_result`.
+- Use `uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime agent` for optional local DeepAgents runs (requires API keys in `.env.local`).
+- A successful ground-truth run creates or overwrites `problems/<task_id>/.alignerr/build_proof.json`; before opening or updating a PR, commit that file with the task.
+- If an agent can reason but cannot write `/tmp/output/<artifact>`, check that the task Dockerfile includes `WORKDIR /workdir` and `chown -R 1000:1000 /workdir /tmp/output`.
+- The harness auto-loads `.env.local`; never read or print `.env.local` contents.
+- Use `--runtime solution` only for deterministic reference-solution scorer checks.
+- Inspect `.harness-runs/<run>/trajectory.json` and `verifier/reward-details.json` when debugging failures.
+- Keep `.env.local` and `.harness-runs/` out of git.

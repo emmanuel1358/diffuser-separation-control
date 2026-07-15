@@ -1,0 +1,21 @@
+{
+  "graded_case_sampling_policy": {
+    "case_count": 6,
+    "selection": "The hidden grader uses six fixed deterministic records selected before evaluation from this disclosed envelope. At least four are strong-motion records, at least three have long predominant period, and the suite includes both a short-period DBE record and a high-intensity long-period MCE record. The same disclosed structural model and generator are used without hidden coefficients.",
+    "parameter_bounds": {
+      "pga_g_inclusive": [0.26, 0.36],
+      "predominant_period_sec_inclusive": [1.20, 3.40],
+      "duration_sec_inclusive": [22.0, 30.0],
+      "phase_seed_integer_inclusive": [1, 999]
+    },
+    "suite_composition": {
+      "strong_motion_minimum_count": 4,
+      "strong_motion_definition": "pga_g >= 0.32",
+      "long_period_minimum_count": 3,
+      "long_period_definition": "predominant period >= 2.8 sec",
+      "mce_corner_minimum_count": 1,
+      "mce_corner_definition": "pga_g >= 0.35 and predominant period >= 3.2 sec"
+    },
+    "phase_seed_rule": "An integer seed selects only the Fourier phases in synthesize_ground_motion; seed does not change the spectrum, envelope, PGA scaling, model, metrics, or scoring. Robust designs should be screened over several seeds, not one realization."
+  }
+}

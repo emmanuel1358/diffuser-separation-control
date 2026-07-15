@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "mujoco-pendulum",
+    "description": "Create a damped single-pendulum MJCF matching target dynamics"
+  }
+}

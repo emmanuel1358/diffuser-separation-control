@@ -1,0 +1,7 @@
+{
+  "isolation_system": {
+    "Qd_kip": 300.0,
+    "Kd_kip_per_in": 16.0,
+    "Dy_in": 0.6
+  }
+}

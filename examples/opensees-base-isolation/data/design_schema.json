@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LeadRubberBaseIsolationDesign",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["isolation_system"],
+  "properties": {
+    "isolation_system": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Qd_kip", "Kd_kip_per_in", "Dy_in"],
+      "properties": {
+        "Qd_kip": {
+          "type": "number",
+          "minimum": 80.0,
+          "maximum": 650.0,
+          "description": "Characteristic (lead-core) strength of the whole isolation system, kip."
+        },
+        "Kd_kip_per_in": {
+          "type": "number",
+          "minimum": 10.0,
+          "maximum": 90.0,
+          "description": "Post-yield (rubber) stiffness of the whole isolation system, kip/in."
+        },
+        "Dy_in": {
+          "type": "number",
+          "minimum": 0.30,
+          "maximum": 1.50,
+          "description": "Yield displacement of the lead core, in. Initial stiffness is Qd_kip / Dy_in."
+        }
+      }
+    }
+  }
+}

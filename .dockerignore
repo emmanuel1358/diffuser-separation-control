@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+**/.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.DS_Store
+
+# Local validation/build artifacts should not enter base image contexts.
+.alignerr
+problems/**/.alignerr
+validation-output
+.harness-runs

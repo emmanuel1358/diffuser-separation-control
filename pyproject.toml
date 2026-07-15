@@ -1,0 +1,63 @@
+[project]
+name = "lbx-rl-tasks-template"
+version = "0.1.0"
+description = "Contributor-facing template repo for Alignerr-authored RL tasks. Hosts the runtime grading library, grader runner, alignerr CLI plugin, and example tasks."
+requires-python = ">=3.13"
+dependencies = [
+    "lbx-rl-tasks-grading",
+    "lbx-rl-tasks-alignerr-plugin",
+    "lbx-rl-tasks-harness",
+]
+
+# This is a uv workspace — the root grader package and the alignerr_plugin/
+# at repo root are workspace members. `uv sync` from
+# the repo root installs all of them in editable mode. Alignerrs get the
+# entire local authoring + grading + harness stack with zero mothership access.
+[tool.uv.workspace]
+members = [
+    "grader",
+    "alignerr_plugin",
+    "harness",
+]
+
+[tool.uv.sources]
+lbx-rl-tasks-grading = { workspace = true }
+lbx-rl-tasks-alignerr-plugin = { workspace = true }
+lbx-rl-tasks-harness = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "h5py",
+    "mujoco>=3.8.0",
+    "numpy>=2.4.4",
+    "pandas",
+    "pyarrow",
+    "pytest>=9.0.3",
+    "scikit-learn",
+]
+
+# Repo root is not itself an importable package; this section just
+# satisfies hatchling so `uv sync` works on the workspace.
+[tool.hatch.build.targets.wheel]
+packages = []
+bypass-selection = true
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 120
+exclude = ["problems/", "examples/"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["grader/tests", "harness/tests"]
+norecursedirs = ["problems", "examples", ".git", ".venv", "grader/tests/__pycache__", "harness/tests/__pycache__"]

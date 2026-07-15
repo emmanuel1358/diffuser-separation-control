@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "cfd-replace-me",
+    "description": "CFD case authoring / repair task"
+  }
+}

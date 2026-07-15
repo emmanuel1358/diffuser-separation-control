@@ -1,0 +1,13 @@
+================================================================
+Per-target raw metrics:
+  t1     SRE =  0.2661  (floor=0.2661, ref=0.033, perfect=0.0)
+  t2     SRE =  0.7770  (floor=0.777, ref=0.2107, perfect=0.0)
+  label  F1  =  0.9231  (floor=0.9231, ref=0.9939, perfect=1.0)
+Per-target progress x_i in [0, 1]:
+  xt1 = 0.0000  w=0.35
+  xt2 = 0.0000  w=0.35
+  xlb = 0.0000  w=0.3
+Aggregate x     = 0.0000  (x_ref = 0.8379)
+Exponential (a, b) = (0.0155, 4.18229)
+Final score     = 0.0000
+================================================================

@@ -1,0 +1,20 @@
+# CUDA-native rasterization deps that ARE on PyPI.
+#
+# IMPORTANT: hardware GL/EGL is NOT deployable on Taiga's gVisor + nvproxy nodes
+# (the graphics-memory ioctls are not forwarded; glBufferData returns
+# GL_OUT_OF_MEMORY even on an 80GB H100). Do NOT register NVIDIA EGL/Vulkan ICDs.
+# CUDA-native rasterization (nvdiffrast / pytorch3d) is the only render path that
+# works under the sandbox.
+#
+# nvdiffrast and pytorch3d are NOT published on PyPI (verified: `pip install
+# nvdiffrast` resolves to "no matching distribution"). They are installed from
+# source in base/cuda-graphics/Dockerfile against the torch+CUDA the base
+# provides (pytorch3d compiles CUDA extensions, which is why that base uses the
+# CUDA -devel image and ninja). fvcore + iopath are pytorch3d build/runtime deps
+# and DO live on PyPI.
+trimesh
+pyrender
+imageio
+imageio-ffmpeg
+fvcore
+iopath

@@ -1,0 +1,36 @@
+---
+description: When and how to use the hidden-environment RPC server (simulation/interaction tasks)
+globs: "{problems,examples}/**/scorer/**/*.py,{problems,examples}/**/task.toml,{problems,examples}/**/data/env_client.py,grader/src/env_server/**/*.py"
+alwaysApply: false
+---
+
+# Hidden-environment (simulation) tasks
+
+Use the env server ONLY for simulation / interaction based tasks where the agent
+must probe a black-box environment whose dynamics / reward must stay hidden. Do
+NOT use it for static-data tasks (ship data under `data/` and grade the
+artifact). `hidden_env` is orthogonal to `task_type`. Full guide:
+`docs/HIDDEN_ENV.md`; reference: `examples/hidden-env-bandit/`.
+
+- Enable with `[environment].hidden_env = "env"` (socket only) or `"hybrid"`
+  (socket + static `data/`). The rubric MCP server spawns `python -m env_server`
+  at boot when set; it is a no-op otherwise.
+- The hidden env lives at `scorer/data/env.py` defining `make_env(**env_kwargs)`;
+  it is baked root-only to `/mcp_server/data/env.py`. NEVER place the env source
+  (or its module) under `data/` -- that makes it agent-readable and leaks the
+  hidden dynamics. The blocking `hidden_env` validator stage enforces this plus
+  the presence of `make_env` and a public `data/env_client.py`.
+- Keep oracle / held-out-target / budget methods OFF the socket: prefix them with
+  `_`, or pin the surface with a class-level `_env_public_methods` allow-list
+  (it fails CLOSED on a malformed value). Agent-facing methods stay public.
+- The agent reaches the env via `/data/env_client.py` over `/tmp/env.sock`; copy
+  the canonical `grader/src/env_server/env_client.py` into the task's `data/`.
+- Grade in-process, never over the socket (it is closed before grading by
+  `stop_env_server()`): `env = grading.load_env_module(private / "env.py").make_env(...)`
+  for the held-out env, and `grading.load_submitted_policy(workspace / "policy.py")`
+  for the agent's policy (sandboxed; raises `AgentFault` for missing/bad policy).
+- `env_kwargs` the agent passes to `make_env` are screened: any value resolving
+  under `/mcp_server` is rejected; declare `allowed_env_kwargs` in
+  `scorer/data/env_config.json` to pin the create contract.
+- Apply the same AgentFault keep-vs-discard discipline as every grader: agent
+  faults -> `raise AgentFault` (kept 0.0); author/infra faults propagate.

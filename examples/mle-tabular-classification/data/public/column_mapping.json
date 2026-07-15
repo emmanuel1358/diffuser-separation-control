@@ -1,0 +1,16 @@
+{
+  "features": {
+    "x1": "continuous feature, drawn from a uniform distribution over a bounded range; training rows have x1 in a narrower sub-range than the test rows",
+    "x2": "continuous feature, drawn from a uniform distribution on [-1, 1]",
+    "x3": "continuous angular feature, drawn from a uniform distribution on [0, 2*pi]"
+  },
+  "targets": {
+    "t1": "regression target: smooth continuous function of x1 and x2 (plus small observation noise)",
+    "t2": "regression target: smooth continuous function of x1 and x3 (plus small observation noise)",
+    "label": "binary classification target; a function of x2 and x3 alone (does not depend on x1)"
+  },
+  "split": {
+    "kind": "parameter-range split on x1",
+    "note": "train and test have the same marginal distributions over x2 and x3, but train's x1 range is strictly below the test's x1 range. Models must extrapolate over x1."
+  }
+}

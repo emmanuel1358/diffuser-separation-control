@@ -1,0 +1,50 @@
+---
+description: Authoring numerical-solver (CFD/structures/circuits/EM/reacting/EDA) RL tasks
+globs: "{problems,examples}/**/*"
+alwaysApply: false
+---
+
+# Numerical-Solver Tasks
+
+The base image bundles open-source solvers so non-MuJoCo engineering tasks reuse
+the deterministic-scoring contract. See `docs/NUMERICAL_SOLVERS.md` (full
+inventory) and `project_guidelines/cfd/cfd_environments.md` (CFD/AVL+OpenFOAM guide).
+Worked reference: `examples/openfoam-hydrofoil-flap`.
+
+- Set `[difficulty].task_type` to the solver domain: `cfd`, `structures`,
+  `circuits`, `electromagnetics`, `reacting-flow`, or `eda` (NOT `ml` — these are
+  usually deterministic `RubricBuilder` rubrics, not continuous ML metrics).
+  Optionally set `[difficulty].domain` to a finer free-form field
+  (e.g. `aerodynamics`, `topology-optimization`, `analog-filter`).
+- In-base, import directly in `scorer/compute_score.py`: `aerosandbox`, `PySpice`
+  (ngspice), `skfem`, `Pynite`, `anastruct`, `skrf`, `cantera`, `CoolProp`,
+  `klayout`, `openseespy`.
+- In-base heavy engines run via subprocess: OpenFOAM after
+  `source /etc/solver-envs.d/openfoam.sh`; `ccx` (CalculiX), `SU2_CFD` on PATH;
+  Meep via `/opt/solver-envs/meep/bin/python`. OpenROAD requires
+  `base_flavor = "gpu-openroad"`.
+- Per-task only (build in `environment/Dockerfile`): AVL, XFOIL, PyNEC, DREAMPlace.
+- Determinism is load-bearing: pin the solver version, run **serial**, use fixed
+  iteration counts or fixed `deltaT`+`endTime` (no adaptive timestep), a
+  parametric `blockMesh` (never `snappyHexMesh` at grade time) or pre-built mesh,
+  fixed seeds, and grade on tolerances. Divergence / NaN / non-convergence => `0`.
+- Precompute reference values into `scorer/data/` (never regenerate
+  nondeterministically at grade time). Keep the hidden sweep small and ensure
+  `N_cases * per_case_timeout` < `[verifier].timeout_sec`.
+- A solver whose grader needs a base-only engine cannot grade on the host. Set
+  `[ground_truth].in_container = true` so the harness runs solve + grade inside
+  the task image; add render output only when the task declares a reviewer video.
+
+## Reviewer artifact (any task type, not just mujoco)
+
+Declare `[ground_truth].render_outputs` to get the render+commit+validate flow.
+The artifact must be named `rendering.mp4` and be exactly **1280x720 h264**.
+
+```toml
+[ground_truth]
+in_container = true
+render_command = "bash solution/render.sh"
+render_outputs = [
+  { path = "/tmp/output/rendering.mp4", required = true, description = "..." },
+]
+```

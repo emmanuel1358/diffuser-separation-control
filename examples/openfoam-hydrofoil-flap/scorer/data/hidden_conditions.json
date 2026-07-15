@@ -1,0 +1,71 @@
+{
+  "case_family": "2d_marine_hydrofoil_flap",
+  "openfoam": {
+    "solver": "simpleFoam",
+    "source_env": "/etc/solver-envs.d/openfoam.sh",
+    "iterations": 70,
+    "per_case_timeout_sec": 105,
+    "run_check_mesh": false,
+    "total_timeout_sec": 600,
+    "block_mesh_timeout_sec": 35,
+    "simple_foam_timeout_sec": 70,
+    "timeout_policy_note": "Batch6 uses an internal bounded runtime budget. Four hidden cases use blockMesh and simpleFoam budgets whose worst-case sum stays well below the verifier wall-clock limit, leaving setup and overhead margin."
+  },
+  "cases": [
+    {
+      "name": "nominal_tow",
+      "tow_speed_m_per_s": 3.4,
+      "trim_bias_deg": 0.0,
+      "submergence_multiplier": 1.0,
+      "effective_reynolds": 6500
+    },
+    {
+      "name": "fast_positive_trim",
+      "tow_speed_m_per_s": 4.6,
+      "trim_bias_deg": 1.1,
+      "submergence_multiplier": 0.92,
+      "effective_reynolds": 8600
+    },
+    {
+      "name": "slow_negative_trim",
+      "tow_speed_m_per_s": 2.7,
+      "trim_bias_deg": -0.8,
+      "submergence_multiplier": 1.1,
+      "effective_reynolds": 5400
+    },
+    {
+      "name": "mid_speed_shallow",
+      "tow_speed_m_per_s": 3.9,
+      "trim_bias_deg": 0.55,
+      "submergence_multiplier": 0.88,
+      "effective_reynolds": 7600
+    }
+  ],
+  "public_disclosure_bridge": {
+    "public_file": "/data/public_transfer_guidance.json",
+    "note": "The public bridge file discloses the operating-condition magnitudes needed to reason about off-design robustness. Private coefficient anchors remain hidden.",
+    "tolerances": {
+      "iterations": {
+        "absolute": 25,
+        "reason": "public validation and hidden verification may use different fixed iteration budgets"
+      },
+      "tow_speed_m_per_s": {
+        "absolute": 2.5,
+        "reason": "hidden cases stay inside disclosed public off-design transfer cases and operating ranges"
+      },
+      "trim_bias_deg": {
+        "absolute": 1.4,
+        "reason": "trim-bias magnitudes are disclosed in public_transfer_guidance.json"
+      },
+      "submergence_multiplier": {
+        "absolute": 0.12,
+        "reason": "submergence magnitudes are disclosed in public_transfer_guidance.json"
+      },
+      "effective_reynolds": {
+        "absolute": 3800,
+        "reason": "Reynolds magnitudes are disclosed in public_transfer_guidance.json"
+      }
+    }
+  },
+  "env_preflight_note": "Public bridge data uses public-specific field names; private hidden case fields are only consumed by the scorer and are not meant to be compared one-to-one against the public diagnostic case."
+}

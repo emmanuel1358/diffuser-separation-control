@@ -1,0 +1,11 @@
+# Direct runtime dependencies for taiga_runtime/rubric and grader/.
+# Docker installs these once in the base image, then installs the local packages
+# with --no-deps so task layers cannot silently re-resolve grader dependencies.
+httpx==0.28.1
+json-numpy==2.1.1
+mcp[cli]==1.27.1
+msgpack==1.2.0
+mujoco==3.8.0
+numpy==2.4.4
+pydantic==2.13.4
+typer==0.25.1

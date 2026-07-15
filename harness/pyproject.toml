@@ -1,0 +1,34 @@
+[project]
+name = "lbx-rl-tasks-harness"
+version = "0.1.0"
+description = "Local LLM and format-parity harness for lbx RL tasks."
+requires-python = ">=3.13"
+dependencies = [
+    "claude-agent-sdk>=0.1.60",
+    "deepagents==0.5.3",
+    "langchain-anthropic>=1.4.0,<2.0.0",
+    "langchain-google-genai>=4.2.0",
+    "langchain-core>=0.3.0",
+    "langchain-mcp-adapters==0.2.2",
+    "langchain-openai>=1.1.0",
+    "lbx-rl-tasks-alignerr-plugin",
+    "lbx-rl-tasks-grading",
+    "mcp[cli]>=1.10.0",
+    "pydantic>=2.12.0",
+    "rich>=14.0.0",
+    "typer>=0.19.0",
+]
+
+[project.scripts]
+lbx-rl-harness = "lbx_rl_tasks_harness.cli:app"
+
+[tool.uv.sources]
+lbx-rl-tasks-alignerr-plugin = { workspace = true }
+lbx-rl-tasks-grading = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lbx_rl_tasks_harness"]

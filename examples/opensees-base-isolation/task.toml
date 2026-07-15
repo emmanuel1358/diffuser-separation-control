@@ -1,0 +1,60 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/opensees-base-isolation"
+description = "Design a lead-rubber base-isolation system for a three-story building, scored with hidden nonlinear response-history analysis across a band of design-basis ground motions."
+
+[environment]
+required_resources = "8vcpu+64gib"
+storage_mb = 50000
+allow_internet = false
+
+[agent]
+timeout_sec = 3600
+
+[verifier]
+timeout_sec = 1800
+env = []
+
+[ground_truth]
+score_epsilon = 0.001
+in_container = true
+max_trivial_score = 0.20
+
+[difficulty]
+level = "medium-hard"
+task_type = "structures"
+domain = "structural_mechanics"
+reward_type = "multi_deterministic_rubrics"
+is_impossible = false
+
+[runner]
+attempts = 3
+turn_limit = 1500
+max_ctx = 1000000
+context_mode = "none"
+required_tools = ["bash", "tmux"]
+container_runtime = "firecracker"
+enable_anthropic_api = true
+
+[runner.timeouts]
+setup_sec = 1800
+grading_sec = 1800
+tool_sec = 600
+max_episode_sec = 3600
+
+[[hint]]
+text = "Use the disclosed ground-motion band and analysis envelope to reason about multiple in-band records before finalizing the design."
+
+[[hint]]
+text = "The design variables create a trade-off: softer isolation generally helps acceleration, drift, and base shear but can increase isolator displacement; stronger or stiffer isolation can control displacement but may raise superstructure demands."
+
+[[outputs]]
+path = "/tmp/output/isolation_design.json"
+required = true
+description = "JSON base-isolation design (isolation_system: Qd_kip, Kd_kip_per_in, Dy_in)"
+
+[metadata]
+template = "generic-taiga-rl"
+source_example = "Lead-rubber base-isolation response-history design with hidden physical scoring"
+rendered = false

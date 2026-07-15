@@ -1,0 +1,210 @@
+name: Template MuJoCo Adversarial AutoQA Handoff
+
+on:
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Template PR number to review"
+        required: true
+        type: string
+      problem_dir:
+        description: "Optional problems/<task> or examples/<task> override"
+        required: false
+        default: ""
+        type: string
+      base_ref:
+        description: "Diff base ref recorded in the reviewer context"
+        required: false
+        default: origin/main
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  dispatch:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request_target' &&
+      (github.event.label.name == 'run_qa' ||
+      github.event.label.name == 'run_adversarial' ||
+      github.event.label.name == 'run_mujoco_adversarial'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve template PR context
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          INPUT_PROBLEM_DIR: ${{ github.event.inputs.problem_dir }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.name }}
+          EVENT_HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "pull_request_target" ]]; then
+            pr_number="${EVENT_PR_NUMBER}"
+            head_sha="${EVENT_HEAD_SHA}"
+            fork_name="${EVENT_HEAD_REPO}"
+            fork_owner="${EVENT_HEAD_OWNER}"
+            changed="$(gh pr diff "${pr_number}" --repo "${GITHUB_REPOSITORY}" --name-only || true)"
+          else
+            pr_number="${INPUT_PR_NUMBER}"
+            pr_json="$(gh pr view "${pr_number}" --repo "${GITHUB_REPOSITORY}" --json headRefOid,headRepository,headRepositoryOwner)"
+            head_sha="$(PR_JSON="${pr_json}" python3 - <<'PY'
+          import json, os
+          print(json.loads(os.environ["PR_JSON"])["headRefOid"])
+          PY
+          )"
+            fork_name="$(PR_JSON="${pr_json}" python3 - <<'PY'
+          import json, os
+          print(json.loads(os.environ["PR_JSON"])["headRepository"]["name"])
+          PY
+          )"
+            fork_owner="$(PR_JSON="${pr_json}" python3 - <<'PY'
+          import json, os
+          print(json.loads(os.environ["PR_JSON"])["headRepositoryOwner"]["login"])
+          PY
+          )"
+            changed="$(gh pr diff "${pr_number}" --repo "${GITHUB_REPOSITORY}" --name-only || true)"
+          fi
+          if [[ "${fork_owner}" != "Alignerr-Code-Labeling" ]]; then
+            echo "::error::ISO mothership adversarial review expects an Alignerr-Code-Labeling source repo; got ${fork_owner}/${fork_name}"
+            exit 1
+          fi
+          if [[ -n "${INPUT_PROBLEM_DIR:-}" ]]; then
+            problem_dir="${INPUT_PROBLEM_DIR}"
+          else
+            task_dirs="$(printf '%s\n' "${changed}" \
+              | grep -E '^(problems|examples)/[^/]+/' \
+              | grep -Ev '^(problems|examples)/[^/]+/README\.md$' \
+              | cut -d/ -f1-2 \
+              | sort -u \
+              | sed '/^$/d')"
+            count="$(printf '%s\n' "${task_dirs}" | sed '/^$/d' | wc -l | tr -d ' ')"
+            if [[ "${count}" != "1" ]]; then
+              echo "::error::Expected exactly one changed task directory, found ${count}. Pass workflow_dispatch problem_dir to override."
+              printf '%s\n' "${task_dirs}"
+              exit 1
+            fi
+            problem_dir="$(printf '%s\n' "${task_dirs}" | head -1)"
+          fi
+          if [[ ! "${problem_dir}" =~ ^(problems|examples)/[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid problem_dir: ${problem_dir}"
+            exit 1
+          fi
+          {
+            echo "pr_number=${pr_number}"
+            echo "head_sha=${head_sha}"
+            echo "fork_name=${fork_name}"
+            echo "problem_dir=${problem_dir}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment adversarial handoff queued
+        env:
+          GITHUB_TOKEN: ${{ secrets.RL_TASKS_GH_WORKFLOW_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PROBLEM_DIR: ${{ steps.pr.outputs.problem_dir }}
+          ACTIONS_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/template_ci_handoff_comment.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pr-number "${PR_NUMBER}" \
+            --kind mujoco-adversarial \
+            --state queued \
+            --head-sha "${HEAD_SHA}" \
+            --problem-dir "${PROBLEM_DIR}" \
+            --target-workflow mujoco-adversarial-autoqa.yml \
+            --actions-run-url "${ACTIONS_RUN_URL}"
+
+      - name: Dispatch MuJoCo adversarial review to ISO mothership
+        env:
+          DISPATCH_TOKEN: ${{ secrets.RL_TASKS_GH_WORKFLOW_TOKEN }}
+          FORK_NAME: ${{ steps.pr.outputs.fork_name }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          PROBLEM_DIR: ${{ steps.pr.outputs.problem_dir }}
+          BASE_REF: ${{ github.event.inputs.base_ref || 'origin/main' }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DISPATCH_TOKEN:-}" ]]; then
+            echo "::error::RL_TASKS_GH_WORKFLOW_TOKEN is required to dispatch ISO mothership adversarial review."
+            exit 1
+          fi
+          payload="$(python3 - <<'PY'
+          import json, os
+          print(json.dumps({
+              "ref": "main",
+              "inputs": {
+                  "fork_name": os.environ["FORK_NAME"],
+                  "pr_number": os.environ["PR_NUMBER"],
+                  "problem_dir": os.environ["PROBLEM_DIR"],
+                  "base_ref": os.environ.get("BASE_REF") or "origin/main",
+                  "post_comment": "true",
+              },
+          }))
+          PY
+          )"
+          curl -sSf -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d "${payload}" \
+            "https://api.github.com/repos/Alignerr-Code-Labeling/lbx-rl-tasks-iso-mothership/actions/workflows/mujoco-adversarial-autoqa.yml/dispatches"
+
+      - name: Remove trigger label
+        if: github.event_name == 'pull_request_target'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.RL_TASKS_GH_WORKFLOW_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          LABEL_NAME: ${{ github.event.label.name }}
+        run: gh pr edit "${PR_NUMBER}" --remove-label "${LABEL_NAME}"
+
+      - name: Comment adversarial handoff dispatched
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.RL_TASKS_GH_WORKFLOW_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PROBLEM_DIR: ${{ steps.pr.outputs.problem_dir }}
+          ACTIONS_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/template_ci_handoff_comment.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pr-number "${PR_NUMBER}" \
+            --kind mujoco-adversarial \
+            --state dispatched \
+            --head-sha "${HEAD_SHA}" \
+            --problem-dir "${PROBLEM_DIR}" \
+            --target-workflow mujoco-adversarial-autoqa.yml \
+            --actions-run-url "${ACTIONS_RUN_URL}"
+
+      - name: Comment adversarial handoff failure
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.RL_TASKS_GH_WORKFLOW_TOKEN || github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number || github.event.pull_request.number || github.event.inputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha || github.event.pull_request.head.sha }}
+          PROBLEM_DIR: ${{ steps.pr.outputs.problem_dir || github.event.inputs.problem_dir }}
+          ACTIONS_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 .github/scripts/template_ci_handoff_comment.py \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pr-number "${PR_NUMBER}" \
+            --kind mujoco-adversarial \
+            --state failed \
+            --head-sha "${HEAD_SHA}" \
+            --problem-dir "${PROBLEM_DIR}" \
+            --target-workflow mujoco-adversarial-autoqa.yml \
+            --actions-run-url "${ACTIONS_RUN_URL}"
