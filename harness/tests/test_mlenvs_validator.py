@@ -4,6 +4,7 @@ here, so the validator runs without Docker."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -35,14 +36,52 @@ _GRADER = (
 )
 
 
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_valid_strategy(root: Path, *, role: str, training_data: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "train.py").write_text("print('train')\n")
+    model = root / "model.json"
+    model.write_text(json.dumps({"role": role}) + "\n")
+    (root / "solution.py").write_text(
+        "from pathlib import Path\n"
+        "import shutil\n"
+        "MODEL = Path(__file__).with_name('model.json')\n"
+        "def main():\n"
+        "    out = Path('/tmp/output')\n"
+        "    out.mkdir(parents=True, exist_ok=True)\n"
+        "    shutil.copy2(MODEL, out / 'model.json')\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+    (root / "model.manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "role": role,
+                "training_entrypoint": "train.py",
+                "inference_entrypoint": "solution.py",
+                "seed": 7,
+                "public_training_data": {
+                    "path": str(training_data.relative_to(root, walk_up=True)),
+                    "sha256": _sha(training_data),
+                },
+                "artifacts": [{"path": "model.json", "sha256": _sha(model)}],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
 def _write_mlenvs_task(
     root: Path, *, grader: str = _GRADER, prompt: str = _PROMPT
 ) -> Path:
     task_dir = root / "demo-task_taiga"
     (task_dir / "data" / "public").mkdir(parents=True)
     (task_dir / "data" / "private").mkdir(parents=True)
-    (task_dir / "reference_solution").mkdir(parents=True)
-    (task_dir / "baselines" / "naive").mkdir(parents=True)
     (task_dir / "metadata.json").write_text(
         json.dumps(
             {
@@ -57,11 +96,18 @@ def _write_mlenvs_task(
     )
     (task_dir / "prompt.md").write_text(prompt)
     (task_dir / "test_file.py").write_text(grader)
-    (task_dir / "data" / "public" / "train.csv").write_text("x,y\n1,2\n")
+    train_csv = task_dir / "data" / "public" / "train.csv"
+    train_csv.write_text("x,y\n1,2\n")
     (task_dir / "data" / "private" / "truth.csv").write_text("y\n2\n")
-    (task_dir / "reference_solution" / "solution.py").write_text("print('ref')\n")
-    (task_dir / "baselines" / "naive" / "solve.sh").write_text(
-        "#!/bin/bash\necho naive\n"
+    _write_valid_strategy(
+        task_dir / "reference_solution",
+        role="reference",
+        training_data=train_csv,
+    )
+    _write_valid_strategy(
+        task_dir / "baselines" / "naive",
+        role="naive",
+        training_data=train_csv,
     )
     return task_dir
 
@@ -96,11 +142,15 @@ def _write_continuous_evidence(task_dir: Path) -> None:
         input_digests={"fixture": "digest"},
     )
     write_calibration_lock_atomic(task_dir / "calibration.lock.json", lock)
-    for strategy in (
-        task_dir / "reference_solution",
-        task_dir / "baselines" / "naive",
+    # Strategies already have valid manifests from _write_mlenvs_task; refresh
+    # digests if authors mutated them in individual tests.
+    training_data = task_dir / "data" / "public" / "train.csv"
+    for role, strategy in (
+        ("reference", task_dir / "reference_solution"),
+        ("naive", task_dir / "baselines" / "naive"),
     ):
-        (strategy / "model.manifest.json").write_text("{}\n")
+        if not (strategy / "model.manifest.json").is_file():
+            _write_valid_strategy(strategy, role=role, training_data=training_data)
     proof_path = task_dir / PROOF_PATH
     proof_path.parent.mkdir(exist_ok=True)
     proof_path.parent.joinpath("calibration.evidence.json").write_text(

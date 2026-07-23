@@ -176,8 +176,9 @@ only regenerating one JSON file.
   calibration binding and final quality mapping.
 - **Unambiguous metrics:** SRE/F1 (and other registered kernels) are exact,
   versioned, and recorded in the lock.
-- **Reproducible models:** reference/naive assets include training scripts,
-  configs, seeds, manifests, and digests.
+- **Reproducible models (mandatory):** reference/naive assets **must** include
+  training scripts, committed weights, `model.manifest.json` digests, and
+  inference-only `solution.py`. Trusted CI never trains.
 - **One-command finalization:** ground truth runs inference, measures metrics,
   generates the lock, verifies 0 / 0.5 / 1 anchors, and updates proof evidence.
 - **Automatic invalidation:** changes to data, models, metrics, rationales,
@@ -227,11 +228,20 @@ V2 locks are not patched in place — regenerate.
 
 1. Replace local metric and curve copies with registered targets +
    `GeneratedCalibration`.
-2. Commit reproducible reference and weak input-dependent naive models (with
-   manifests/seeds as required by the family).
-3. Add `TASK` (`ContinuousTask.model()` if possible).
-4. Wire production `compute_score()` to `TASK.grade(...)`.
-5. Run local ground truth for feedback; open/update the fork PR so Trusted CI
+2. Commit the **mandatory** two-artifact model contract for
+   `reference_solution/` and `TASK.naive` (usually `baselines/naive/`):
+   - `train.py` (provenance only; never executed by validate / ground-truth /
+     Trusted CI seal)
+   - trained model artifact(s)
+   - `model.manifest.json` with matching SHA-256 digests
+   - inference-only `solution.py` that loads those weights into `/tmp/output`
+3. If the old reference **trained at run time** inside `solution.py` /
+   `solve.sh`, split it: move fitting into `train.py`, commit the resulting
+   weights + refreshed manifest, and leave `solution.py` as load→predict only.
+   A checked-in `submission.csv` alone does **not** satisfy the contract.
+4. Add `TASK` (`ContinuousTask.model()` if possible).
+5. Wire production `compute_score()` to `TASK.grade(...)`.
+6. Run local ground truth for feedback; open/update the fork PR so Trusted CI
    seals production evidence.
 
 #### B2. Calibration lock v2 → v3

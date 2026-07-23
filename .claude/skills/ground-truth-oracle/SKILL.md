@@ -7,10 +7,11 @@ description: Guides Alignerr RL task ground-truth/oracle submissions. Use when c
 
 ## Contract
 
-- Every task needs `solution/solve.sh`; it is the oracle submission.
+- Every native task needs `solution/solve.sh`; ML_Envs continuous tasks use `reference_solution/solution.py` instead.
 - Every task must declare enum-backed `[difficulty].task_type`, `[difficulty].domain`, and `[difficulty].reward_type`; values live in `alignerr_plugin.task_metadata`.
 - `reward_type = "multi_deterministic_rubrics"` oracles must score `1.0` under the same `scorer/compute_score.py` used for agents.
 - `reward_type = "continuous_scoring_function"` references must score `0.5 ± 0.05`.
+- Continuous ML (`task_type=ml`) **must** commit train.py + trained weights + `model.manifest.json` and keep the solve path inference-only. Trusted CI / ground-truth never train. See `docs/MLENVS_TASKS.md` §4 / `docs/GROUND_TRUTH.md`.
 - If a MuJoCo task needs a trained policy/model, commit the trained artifact or deterministic exporter under `solution/`; full training code is optional provenance, not the validation path.
 - Reviewer video is required for `mujoco` tasks. Declare it in `[ground_truth]` and generate it with `solution/render.sh`.
 - Reviewer videos are MuJoCo-specific and must be 16:9 720p: exactly `1280x720`.

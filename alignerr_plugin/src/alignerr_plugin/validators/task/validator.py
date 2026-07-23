@@ -451,6 +451,9 @@ class TaskValidator:
             "agent_fault": self._agent_fault(problem_dir),
             "scorer_determinism": self._scorer_determinism(problem_dir),
             "sanctioned_curve": self._sanctioned_curve(problem_dir),
+            "continuous_ml_model_contract": self._continuous_ml_model_contract(
+                problem_dir
+            ),
             "continuous_calibration": self._continuous_calibration(problem_dir),
             "rubric_protocol": self._rubric_protocol(problem_dir),
             "outputs": self._outputs(problem_dir),
@@ -897,6 +900,54 @@ class TaskValidator:
             )
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
+    def _continuous_ml_model_contract(self, problem_dir: Path) -> StageResult:
+        """Fail-closed committed-model + training-code contract for continuous ML.
+
+        Runs before calibration-lock handling so missing local evidence cannot
+        skip the train.py / weights / manifest / inference-only requirements.
+        """
+        issues: list[str] = []
+        try:
+            task_toml = load_task_toml(problem_dir)
+        except Exception:
+            return StageResult(passed=True, issues=[], duration_ms=0)
+        if (
+            normalize_enum_value(task_toml.difficulty.task_type) != "ml"
+            or normalize_enum_value(task_toml.difficulty.reward_type)
+            != "continuous_scoring_function"
+        ):
+            return StageResult(passed=True, issues=[], duration_ms=0)
+
+        grader_path = problem_dir / _grader_source_rel(problem_dir)
+        try:
+            grader_source = grader_path.read_text(encoding="utf-8")
+        except OSError:
+            return StageResult(passed=True, issues=[], duration_ms=0)
+        if not _declares_continuous_task(grader_source):
+            # continuous_calibration reports the missing TASK registration.
+            return StageResult(passed=True, issues=[], duration_ms=0)
+
+        naive_rel = "baselines/naive"
+        try:
+            from grading.evaluation import load_task_registration
+
+            registration = load_task_registration(grader_path)
+            if registration is not None and getattr(registration, "naive", None):
+                naive_rel = str(registration.naive)
+        except Exception as exc:
+            issues.append(f"could not load continuous TASK registration: {exc}")
+            return StageResult(passed=False, issues=issues, duration_ms=0)
+
+        from alignerr_plugin.ml_model_contract import (
+            validate_problem_ml_model_contracts,
+        )
+
+        try:
+            validate_problem_ml_model_contracts(problem_dir, naive_rel=naive_rel)
+        except ValueError as exc:
+            issues.append(str(exc))
+        return StageResult(passed=not issues, issues=issues, duration_ms=0)
+
     def _continuous_calibration(self, problem_dir: Path) -> StageResult:
         """Hard-block any continuous-scoring task without evaluation evidence."""
         issues: list[str] = []
@@ -1111,26 +1162,33 @@ class TaskValidator:
                 )
 
         if task_type == "ml":
-            generated_names = {"results.txt", "submission.csv"}
-            for strategy_rel in (
-                "reference_solution",
-                registration.naive,
+            from alignerr_plugin.ml_model_contract import (
+                FORBIDDEN_GENERATED_SCORE_FILES,
+                validate_ml_strategy_contract,
+            )
+
+            for role, strategy_rel in (
+                ("reference", "reference_solution"),
+                ("naive", registration.naive),
             ):
                 strategy_dir = problem_dir / strategy_rel
+                if not strategy_dir.is_dir() and role == "reference":
+                    # Native continuous ML may use solution/ instead.
+                    strategy_dir = problem_dir / "solution"
+                    strategy_rel = "solution"
                 for generated in sorted(
                     path
                     for path in strategy_dir.rglob("*")
-                    if path.is_file() and path.name in generated_names
+                    if path.is_file() and path.name in FORBIDDEN_GENERATED_SCORE_FILES
                 ):
                     issues.append(
                         "continuous ML calibration must not commit generated "
                         f"score/output artifact {generated.relative_to(problem_dir)}"
                     )
-                if not (strategy_dir / "model.manifest.json").is_file():
-                    issues.append(
-                        f"continuous ML calibration strategy {strategy_rel}/ is "
-                        "missing model.manifest.json"
-                    )
+                try:
+                    validate_ml_strategy_contract(strategy_dir, role=role)
+                except ValueError as exc:
+                    issues.append(str(exc))
 
         return StageResult(
             passed=not issues,

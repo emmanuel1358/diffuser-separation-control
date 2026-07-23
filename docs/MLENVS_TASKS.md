@@ -143,14 +143,34 @@ Rules:
 
 The image bakes `test_file.py` as the grader; the no-arg signature and the `grading.*` helper import surface are handled by the grader runtime.
 
-## 4. Reference + baselines (calibration gate)
+## 4. Reference + baselines (committed-model hard contract)
 
-- `reference_solution/` — committed trained model, `train.py`, inference
-  `solution.py`, and `model.manifest.json`. It must score `0.5 ± 0.05`.
-- `baselines/naive/` — committed weak but input-dependent model plus the same
-  reproducibility surface. It must earn a small positive score below the
-  reference; constant/mean strategies remain null probes at zero.
-- Generated submissions and `results.txt` are not committed.
+Trusted CI, ground-truth, and Taiga seal generation **must never train**. For
+`reference_solution/` and every calibration-declared baseline (`TASK.naive`,
+normally `baselines/naive/`), authors **must** commit all of:
+
+| Required | Purpose |
+| --- | --- |
+| `train.py` (or equivalent named training entry in the manifest) | Provenance / reproducibility — **not** executed by Trusted CI / ground-truth / seal |
+| Committed model artifact(s) (e.g. `model.json`, `.pt`, …) | What inference loads |
+| `model.manifest.json` (digest, paths, seed/config pointers) | Integrity + calibration invalidation |
+| `solution.py` | Inference only: load committed model → write `/tmp/output/...` |
+
+Rules:
+
+- `solution.py` / `solve.sh` must **not** train (no `fit` / epoch loops that
+  produce the scored artifact). Loading weights + predict/package only.
+- Training may live in-repo; validate and CI treat “train on the seal path” as
+  an error.
+- Optional: committed `submission.csv` is allowed as a **Tier-B** static
+  artifact *in addition to* model+train+manifest — **not** as a substitute.
+- Generated score logs (`results.txt`) must not be committed.
+- Hand-edited `calibration.lock.json` remains forbidden; Trusted CI generates
+  or restores the production lock.
+
+`reference_solution/` must score `0.5 ± 0.05`. The declared naive baseline must
+earn a small positive score below the reference; constant/mean strategies remain
+null probes at zero.
 
 Finalize in one command:
 
@@ -160,6 +180,8 @@ uv run lbx-rl-harness run \
   --problem-dir problems/<task_id>
 ```
 
+That command validates manifests, runs **inference only**, measures anchors, and
+writes the development lock/evidence bundle. It never shells out to `train.py`.
 ## 5. Licensing
 
 `license` must be a permissive SPDX id (`MIT`, `Apache-2.0`, `BSD-2/3-Clause`, `ISC`, `Unlicense`, `CC0-1.0`, `CC-BY-4.0`, `PDDL-1.0`, `UPL-1.0`) or `self_generated`. Trace the dataset license **upstream**; copyleft / non-commercial / research-only data is rejected. `license_source` is the upstream http(s) URL where you confirmed it (or a justification for `self_generated`). Validation checks the allowlist mechanically; a licensing code-owner approves the PR.

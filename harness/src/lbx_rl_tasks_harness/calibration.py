@@ -11,6 +11,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from alignerr_plugin.ml_model_contract import (
+    validate_committed_model_manifest,
+    validate_ml_strategy_contract,
+)
 from alignerr_plugin.proof import PROOF_PATH
 from alignerr_plugin.utils import read_json
 from grading.evaluation import (
@@ -39,8 +43,10 @@ _IGNORED_STRATEGY_PARTS = {
     "local_harness_run",
     "solution_run",
 }
-_IGNORED_STRATEGY_FILES = {"results.txt", "submission.csv", ".DS_Store"}
-MODEL_MANIFEST_FILENAME = "model.manifest.json"
+# results.txt is generated score noise. submission.csv is a Tier-B additive
+# static artifact and MUST participate in strategy digests so edits invalidate
+# calibration; it never substitutes for train.py / model / manifest.
+_IGNORED_STRATEGY_FILES = {"results.txt", ".DS_Store"}
 CALIBRATION_EVIDENCE_SCHEMA = "continuous-calibration-evidence.v1"
 CALIBRATION_EVIDENCE_PATH = Path(".alignerr") / "calibration.evidence.json"
 CALIBRATION_FRAMEWORK_REVISION_ENV = "LBX_CALIBRATION_FRAMEWORK_REVISION"
@@ -121,103 +127,6 @@ def _tree_sha256(
         digest.update(file.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def validate_committed_model_manifest(
-    strategy_dir: Path, *, role: str
-) -> dict[str, Any]:
-    """Validate a committed trained-model manifest without loading the model."""
-    manifest_path = strategy_dir / MODEL_MANIFEST_FILENAME
-    if not manifest_path.is_file():
-        raise ValueError(
-            f"{role} strategy is missing {MODEL_MANIFEST_FILENAME}: {strategy_dir}"
-        )
-    try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid {role} model manifest: {exc}") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != "1.0":
-        raise ValueError(f"{role} model manifest must use schema_version '1.0'")
-    if manifest.get("role") != role:
-        raise ValueError(
-            f"{role} model manifest role must be {role!r}, got {manifest.get('role')!r}"
-        )
-    for field in ("training_entrypoint", "inference_entrypoint"):
-        raw = manifest.get(field)
-        if not isinstance(raw, str) or not raw:
-            raise ValueError(f"{role} model manifest is missing {field}")
-        relative = Path(raw)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(f"{role} model manifest {field} must be strategy-relative")
-        if not (strategy_dir / relative).is_file():
-            raise ValueError(f"{role} model manifest {field} does not exist: {raw}")
-    if not isinstance(manifest.get("seed"), int):
-        raise ValueError(f"{role} model manifest seed must be an integer")
-    training_data = manifest.get("public_training_data")
-    if not isinstance(training_data, dict):
-        raise ValueError(f"{role} model manifest is missing public_training_data")
-    training_path_raw = training_data.get("path")
-    training_sha = training_data.get("sha256")
-    if not isinstance(training_path_raw, str) or not isinstance(training_sha, str):
-        raise ValueError(
-            f"{role} model manifest public_training_data needs path and sha256"
-        )
-    task_root = next(
-        (
-            parent
-            for parent in (strategy_dir, *strategy_dir.parents)
-            if (parent / "metadata.json").is_file() or (parent / "task.toml").is_file()
-        ),
-        None,
-    )
-    if task_root is None:
-        raise ValueError(f"could not resolve task root for {role} model manifest")
-    training_path = (strategy_dir / training_path_raw).resolve()
-    try:
-        training_path.relative_to(task_root.resolve())
-    except ValueError as exc:
-        raise ValueError(
-            f"{role} model training data escapes the task root: {training_path_raw}"
-        ) from exc
-    if not training_path.is_file():
-        raise ValueError(f"{role} model training data is missing: {training_path_raw}")
-    actual_training_sha = _file_sha256(training_path)
-    if actual_training_sha != training_sha:
-        raise ValueError(
-            f"{role} model is stale for public training data {training_path_raw}: "
-            f"expected {training_sha}, got {actual_training_sha}"
-        )
-    artifacts = manifest.get("artifacts")
-    if not isinstance(artifacts, list) or not artifacts:
-        raise ValueError(f"{role} model manifest must declare trained artifacts")
-    for entry in artifacts:
-        if not isinstance(entry, dict):
-            raise ValueError(f"{role} model manifest artifact entries must be objects")
-        raw_path = entry.get("path")
-        expected = entry.get("sha256")
-        if not isinstance(raw_path, str) or not isinstance(expected, str):
-            raise ValueError(f"{role} model manifest artifact needs path and sha256")
-        relative = Path(raw_path)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ValueError(f"{role} model artifact path must be strategy-relative")
-        artifact = strategy_dir / relative
-        if not artifact.is_file():
-            raise ValueError(f"{role} trained model artifact is missing: {raw_path}")
-        actual = _file_sha256(artifact)
-        if actual != expected:
-            raise ValueError(
-                f"{role} model artifact digest mismatch for {raw_path}: "
-                f"expected {expected}, got {actual}"
-            )
-    return manifest
 
 
 def calibration_input_digests(
@@ -546,8 +455,12 @@ def _run_ml_calibrated_ground_truth_impl(
         "reference_solution" if (source / "reference_solution").is_dir() else "solution"
     )
     naive_strategy = source / task.naive
-    validate_committed_model_manifest(reference_strategy, role="reference")
-    validate_committed_model_manifest(naive_strategy, role="naive")
+    # Fail closed before any container solve: require train+weights+manifest and
+    # an inference-only entrypoint. Never invoke training_entrypoint.
+    reference_contract = validate_ml_strategy_contract(
+        reference_strategy, role="reference"
+    )
+    naive_contract = validate_ml_strategy_contract(naive_strategy, role="naive")
 
     # Reference inference. ML metadata-mode tasks default "solution" to
     # reference_solution; native tasks retain solution/solve.sh.
@@ -557,7 +470,11 @@ def _run_ml_calibrated_ground_truth_impl(
     reference_cache = (run_dir / "calibration" / "reference-cache").resolve()
     reference_problem = replace(
         problem,
-        reference=replace(problem.reference, cache_dir=str(reference_cache)),
+        reference=replace(
+            problem.reference,
+            cache_dir=str(reference_cache),
+            entrypoint=reference_contract.inference_entrypoint,
+        ),
     )
     run_reference(
         reference_problem,
@@ -587,7 +504,11 @@ def _run_ml_calibrated_ground_truth_impl(
     naive_cache = (run_dir / "calibration" / "naive-cache").resolve()
     naive_problem = replace(
         problem,
-        reference=replace(problem.reference, cache_dir=str(naive_cache)),
+        reference=replace(
+            problem.reference,
+            cache_dir=str(naive_cache),
+            entrypoint=naive_contract.inference_entrypoint,
+        ),
     )
     run_reference(
         naive_problem,

@@ -18,32 +18,40 @@ development evidence for feedback. The **oracle proof** is its
 | **Expected oracle score** | **1.0** (within `[ground_truth].score_epsilon`) | **0.5 ± 0.05** (within `[ground_truth].continuous_score_epsilon`) |
 | **What proof means** | Reference is a perfect oracle under deterministic rubrics | Reference is a **calibrated anchor**: competent, not optimal; agents should beat it toward 1.0 |
 | **Reviewer video** | Required for `mujoco`; optional for other types if `[ground_truth].render_outputs` is declared | Usually none unless you explicitly declare render outputs |
-| **Static artifacts in `solution/`** | Common (MJCF, control JSON, policies) | Common (CSV, weights); `solve.sh` may copy a checked-in artifact rather than retrain |
-| **What ground-truth verifies** | Solve → grade → (render) → CI proof | Same pipeline: proves Dockerfile, grader, loaders, and **calibration** are correct |
+| **Static artifacts in `solution/`** | Common (MJCF, control JSON, policies) | **Required** trained weights + `model.manifest.json` + training provenance; inference-only `solve.sh`/`solution.py` |
+| **What ground-truth verifies** | Solve → grade → (render) → CI proof | Same pipeline: proves Dockerfile, grader, loaders, and **calibration** are correct — **inference only, never train** |
 
-For ML tasks, oracle proof does **not** mean “we retrained the model in CI.” It
-means `solution/solve.sh` runs in the task environment, the grader accepts the
-submission, and the reference lands at the calibration midpoint (~0.5). Training
-code may live in `solution/` for provenance; the validation path should stay
-deterministic (precomputed weights, cached CSV, etc.).
+For continuous ML tasks, oracle proof does **not** mean “we retrained the model
+in CI.” Authors **must** commit both reproducible training code and trained
+artifacts; Trusted CI / ground-truth / Taiga seal only load models and run
+inference to produce calibration anchors. Training code may live next to the
+inference entrypoint for provenance, but `solution.py` / `solve.sh` must stay
+inference-only. A committed `submission.csv` is an optional Tier-B additive
+artifact — never a substitute for missing `train.py` / weights / manifest.
 
 Learnability (baselines scoring clearly below the reference) is validated
 separately by `lbx-rl-template validate`, not by the oracle score alone.
 
 ## Contract
 
-- `solution/solve.sh` is required.
-- Running `solution/solve.sh` must create all required `[[outputs]]` artifacts.
+- `solution/solve.sh` is required for native (`task.toml`) layouts; ML_Envs uses
+  `reference_solution/solution.py` instead (see `docs/MLENVS_TASKS.md`).
+- Running the inference entrypoint must create all required `[[outputs]]`
+  artifacts.
 - `[difficulty].reward_type = "multi_deterministic_rubrics"` tasks must score
   `1.0` within `[ground_truth].score_epsilon`.
 - `[difficulty].reward_type = "continuous_scoring_function"` tasks must score
   `0.5 ± [ground_truth].continuous_score_epsilon` (default `0.05`). This is the
   ML_Envs reference-solution convention: the checked-in reference is competent
   but leaves headroom for better agents.
-- If the task requires a trained policy or model, include the trained artifact
-  in `solution/` and make `solve.sh` copy or export it into `/tmp/output`.
-- Training code may be included for provenance, but validation should use the
-  already-trained artifact so the oracle run is deterministic and fast.
+- For continuous ML (`task_type=ml` + `continuous_scoring_function`), the
+  committed-model hard contract is **mandatory** on `reference_solution/` (or
+  native `solution/`) and every calibration-declared baseline (`TASK.naive`):
+  training entrypoint, trained artifact(s), `model.manifest.json` with matching
+  digests, and an inference-only solve path. Validate fails closed if any piece
+  is missing or if the solve path looks like training.
+- Training code is for provenance only; validation / Trusted CI / seal must use
+  already-trained artifacts so the oracle run is deterministic and fast.
 - Every task must declare `[difficulty].task_type`, `[difficulty].domain`, and
   `[difficulty].reward_type`. These are enum fields defined in
   `alignerr_plugin.task_metadata`.
@@ -63,14 +71,15 @@ solution/
 └── train.py              # optional: documents how the policy was produced
 ```
 
-Example layout (ML continuous task):
+Example layout (ML continuous / ML_Envs — **required** two-artifact contract):
 
 ```text
-solution/
-├── solve.sh              # required: writes /tmp/output artifacts; should score ~0.5
-├── submission.csv        # allowed: precomputed reference submission
-├── model.pt              # allowed: precomputed weights
-└── train.py              # optional: provenance only; not run during CI proof
+reference_solution/          # or native solution/
+├── solution.py              # required: inference only; loads committed weights
+├── train.py                 # required: provenance; NEVER run by CI / ground-truth
+├── model.json / model.pt    # required: committed trained artifact(s)
+├── model.manifest.json      # required: digests + seed + entrypoint pointers
+└── submission.csv           # optional Tier-B additive static artifact
 ```
 
 ## `task.toml`

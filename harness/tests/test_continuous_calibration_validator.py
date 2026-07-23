@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -28,12 +29,50 @@ HIGH = FloorAnchor(
 )
 
 
+def _sha(path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_valid_strategy(root, *, role: str, training_data) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "train.py").write_text("print('train')\n")
+    model = root / "model.json"
+    model.write_text(json.dumps({"role": role}) + "\n")
+    (root / "solution.py").write_text(
+        "from pathlib import Path\n"
+        "import shutil\n"
+        "MODEL = Path(__file__).with_name('model.json')\n"
+        "def main():\n"
+        "    out = Path('/tmp/output')\n"
+        "    out.mkdir(parents=True, exist_ok=True)\n"
+        "    shutil.copy2(MODEL, out / 'model.json')\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+    (root / "model.manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "role": role,
+                "training_entrypoint": "train.py",
+                "inference_entrypoint": "solution.py",
+                "seed": 7,
+                "public_training_data": {
+                    "path": str(training_data.relative_to(root, walk_up=True)),
+                    "sha256": _sha(training_data),
+                },
+                "artifacts": [{"path": "model.json", "sha256": _sha(model)}],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
 def _write_v2_task(tmp_path):
     task_dir = tmp_path / "demo_taiga"
     (task_dir / "data" / "public").mkdir(parents=True)
     (task_dir / "data" / "private").mkdir(parents=True)
-    (task_dir / "reference_solution").mkdir()
-    (task_dir / "baselines" / "naive").mkdir(parents=True)
     (task_dir / "metadata.json").write_text(
         json.dumps(
             {
@@ -61,12 +100,18 @@ def _write_v2_task(tmp_path):
         ]
     )
     (task_dir / "test_file.py").write_text(source)
-    for strategy in (
+    training_data = task_dir / "data" / "public" / "train.csv"
+    training_data.write_text("x,y\n1,2\n")
+    _write_valid_strategy(
         task_dir / "reference_solution",
+        role="reference",
+        training_data=training_data,
+    )
+    _write_valid_strategy(
         task_dir / "baselines" / "naive",
-    ):
-        (strategy / "solution.py").write_text("pass\n")
-        (strategy / "model.manifest.json").write_text("{}\n")
+        role="naive",
+        training_data=training_data,
+    )
 
     task = ContinuousTask.calibrated(
         targets=[

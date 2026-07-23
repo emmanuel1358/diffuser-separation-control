@@ -162,6 +162,53 @@ def test_reference_cache_and_entrypoint() -> None:
     assert solution_script_rel(problem, solution_dir="solution") == "solution/train.sh"
 
 
+def test_native_ml_prefers_manifest_inference_entrypoint(tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    problem_dir = tmp_path / "problem"
+    strategy = problem_dir / "solution"
+    strategy.mkdir(parents=True)
+    (problem_dir / "task.toml").write_text(
+        '[difficulty]\ntask_type = "ml"\nreward_type = "continuous_scoring_function"\n'
+    )
+    (problem_dir / "metadata.json").write_text("{}\n")
+    train_csv = problem_dir / "train.csv"
+    train_csv.write_text("x,y\n1,1\n")
+    (strategy / "train.py").write_text("print('train')\n")
+    (strategy / "solve.sh").write_text("#!/bin/bash\ncp model.json /tmp/output/\n")
+    model = strategy / "model.json"
+    model.write_text("{}\n")
+    (strategy / "model.manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "role": "reference",
+                "training_entrypoint": "train.py",
+                "inference_entrypoint": "solve.sh",
+                "seed": 1,
+                "public_training_data": {
+                    "path": "../train.csv",
+                    "sha256": hashlib.sha256(train_csv.read_bytes()).hexdigest(),
+                },
+                "artifacts": [
+                    {
+                        "path": "model.json",
+                        "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+    problem = _problem(
+        source_problem_dir=problem_dir,
+        reference=ReferenceSpec(entrypoint="train.sh"),
+        metadata={"difficulty": {"task_type": "ml"}},
+    )
+    assert solution_script_rel(problem, solution_dir="solution") == "solution/solve.sh"
+
+
 def test_container_script_bootstraps_hidden_env() -> None:
     problem = _problem(metadata={"environment": {"hidden_env": "env"}})
     prefix = _container_script_prefix(problem, skip_solve=False)

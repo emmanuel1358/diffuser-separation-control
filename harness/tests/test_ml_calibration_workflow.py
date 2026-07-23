@@ -19,7 +19,15 @@ def _sha(path: Path) -> str:
 def _write_strategy(root: Path, *, role: str, training_data: Path) -> None:
     root.mkdir(parents=True)
     (root / "train.py").write_text("print('train')\n")
-    (root / "solution.py").write_text("print('infer')\n")
+    (root / "solution.py").write_text(
+        "from pathlib import Path\n"
+        "import shutil\n"
+        "MODEL = Path(__file__).with_name('model.json')\n"
+        "print('infer')\n"
+        "out = Path('/tmp/output')\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "shutil.copy2(MODEL, out / 'model.json')\n"
+    )
     (root / "model.json").write_text(json.dumps({"role": role}) + "\n")
     (root / "model.manifest.json").write_text(
         json.dumps(
@@ -170,6 +178,7 @@ def test_ml_ground_truth_generates_lock_and_replays(monkeypatch, tmp_path) -> No
     problem = _problem(tmp_path)
     source = problem.source_problem_dir
     assert source is not None
+    invoked_entrypoints: list[str] = []
 
     def fake_run_reference(
         _problem,
@@ -181,6 +190,12 @@ def test_ml_ground_truth_generates_lock_and_replays(monkeypatch, tmp_path) -> No
         run_dir,
     ):
         del _workspace, _verifier, _transcript, run_dir
+        entrypoint = _problem.reference.entrypoint or "solution.py"
+        invoked_entrypoints.append(f"{options.solution_dir}/{entrypoint}")
+        assert "train" not in Path(entrypoint).name.lower()
+        assert options.solution_dir.endswith(
+            ("reference_solution", "baselines/naive", "naive")
+        ) or options.solution_dir in {"reference_solution", "baselines/naive"}
         cache = Path(_problem.reference.cache_dir)
         if cache.exists():
             import shutil
@@ -252,6 +267,36 @@ def test_ml_ground_truth_generates_lock_and_replays(monkeypatch, tmp_path) -> No
     assert evidence["lock_sha256"] == result.lock.sha256
     assert evidence["cache_key"] == result.cache_key
     assert (workspace / "submission.csv").is_file()
+    assert invoked_entrypoints
+    assert all(path.endswith("solution.py") for path in invoked_entrypoints)
+    assert not any("train.py" in path for path in invoked_entrypoints)
+
+
+def test_ml_ground_truth_rejects_train_in_solution(tmp_path) -> None:
+    from alignerr_plugin.ml_model_contract import validate_ml_strategy_contract
+
+    problem = _problem(tmp_path)
+    source = problem.source_problem_dir
+    assert source is not None
+    (source / "reference_solution" / "solution.py").write_text(
+        "from sklearn.linear_model import LogisticRegression\n"
+        "LogisticRegression().fit([[0], [1]], [0, 1])\n"
+    )
+
+    with pytest.raises(ValueError, match="looks like a training"):
+        validate_ml_strategy_contract(source / "reference_solution", role="reference")
+
+
+def test_tier_b_submission_csv_participates_in_strategy_digest(tmp_path) -> None:
+    problem = _problem(tmp_path)
+    task = calibration.load_continuous_task(problem)
+    assert task is not None
+    before = calibration.calibration_input_digests(problem, task)["reference_strategy"]
+    (problem.source_problem_dir / "reference_solution" / "submission.csv").write_text(
+        "value,label\n0,0\n"
+    )
+    after = calibration.calibration_input_digests(problem, task)["reference_strategy"]
+    assert before != after
 
 
 def test_proof_hash_refreshes_after_generated_lock(tmp_path) -> None:

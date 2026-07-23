@@ -16,8 +16,8 @@ problems/<task_id>/
 ├── prompt.md              # agent prompt (no anchors, no internals)
 ├── test_file.py           # no-arg compute_score() reading /tmp/output + /mcp_server/data
 ├── data/{public,private}/ # public -> /data/ (read-only); private -> /mcp_server/data/ (root)
-├── reference_solution/    # solution.py + captured output + results.txt (scores 0.5)
-├── baselines/<name>/      # naive output scoring below the reference (learnability gate)
+├── reference_solution/    # train.py + solution.py + model + model.manifest.json (scores 0.5)
+├── baselines/<name>/      # naive: same committed-model contract; scores below reference
 └── data-generation/       # provenance
 ```
 
@@ -76,9 +76,18 @@ Local runs take `harness run --flavor {auto,heavy,slim}` (default `auto`): `heav
 
 No internet at runtime. To ship pretrained weights / HF datasets, declare `hf_resources` in `metadata.json`: a list of bare `"org/name"` strings (model, `main`) or objects `{repo_id, revision, repo_type: model|dataset, allow_patterns, ignore_patterns}`. `scripts/sync_mount.sh` sha-content-addresses each repo, fetches it into the HF hub-cache layout, and mounts it read-only at `/tmp/.cache/huggingface/hub/<repo_type>s--<org>--<name>` (bases set `HF_HOME=/tmp/.cache/huggingface`), so `from_pretrained("org/name")` resolves offline. Downloaded once, shared across tasks. Gated repos need `HF_TOKEN` on the deploy host. Not available on the TPU base. Faithful ML_Envs pipeline (`scripts/pack_hf_resource.py`); see `docs/MLENVS_TASKS.md` §8.
 
-## Calibration gate
+## Calibration gate (committed-model hard contract)
 
-Reference (`reference_solution/`) must score `0.5 ± 0.05`; committed baselines must score clearly below it. Model submissions: both `grading.helpers.load_submitted_model` (ML_Envs pickle/joblib-proxy for `model.pkl` with `predict(...)`) and `grading.helpers.run_model_module` (module-callable `model.py`) are available.
+Trusted CI / ground-truth / seal **never train**. For `reference_solution/` and `TASK.naive` (usually `baselines/naive/`) authors **must** commit:
+
+1. `train.py` (provenance only — not executed by CI)
+2. trained model artifact(s)
+3. `model.manifest.json` with matching digests
+4. inference-only `solution.py` (load weights → `/tmp/output`)
+
+Optional `submission.csv` is Tier-B additive only — never a substitute. `results.txt` must not be committed. Reference must score `0.5 ± 0.05`; declared baselines must score clearly below it. See `docs/MLENVS_TASKS.md` §4 and `examples/mle-tabular-classification/`.
+
+Model submissions for agents: both `grading.helpers.load_submitted_model` (ML_Envs pickle/joblib-proxy for `model.pkl` with `predict(...)`) and `grading.helpers.run_model_module` (module-callable `model.py`) are available.
 
 ## Reward-hacking discipline
 

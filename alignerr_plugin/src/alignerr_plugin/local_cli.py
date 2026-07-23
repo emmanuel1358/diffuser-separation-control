@@ -48,6 +48,21 @@ STAGE_HINTS: dict[str, str] = {
     "grader_sandbox": "scorer crashed under the sandbox. Make grading deterministic and self-contained.",
     "agent_fault": "Agent-fault handling is misconfigured; a crashing submission must score 0.0, not error.",
     "scorer_determinism": "compute_score is non-deterministic: same input must yield the same score.",
+    "sanctioned_curve": (
+        "PiecewiseLinearCurve is required for continuous scoring; ExponentialCurve "
+        "is rejected."
+    ),
+    "continuous_ml_model_contract": (
+        "Continuous ML strategies must commit train.py + trained weights + "
+        "model.manifest.json, and solution.py/solve.sh must be inference-only "
+        "(load committed model; never train on the seal/ground-truth path). "
+        "See docs/MLENVS_TASKS.md §4 and examples/mle-tabular-classification/."
+    ),
+    "continuous_calibration": (
+        "Continuous calibration lock/evidence failed. Regenerate with "
+        "`uv run lbx-rl-harness run --runtime ground-truth --problem-dir <task>` "
+        "(Trusted CI seals the production bundle)."
+    ),
     "rubric_protocol": (
         "Declarative RubricTask contract failed. Regenerate "
         "scorer/evaluation.plan.json via harness reference/ground-truth "
