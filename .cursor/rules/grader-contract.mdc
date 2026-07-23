@@ -6,11 +6,23 @@ alwaysApply: false
 
 # Grader Contract
 
-- Task scorers must define `compute_score(workspace, trajectory, private)` with those first three parameter names.
+- `multi_deterministic_rubrics` scorers must declare `TASK = RubricTask(...)`;
+  the shared runner invokes it directly and authors must not define
+  `compute_score()`.
+- Continuous/legacy scorers define `compute_score(workspace, trajectory,
+  private)` or the documented no-argument metadata-mode form.
 - `workspace` is the agent output directory (`/tmp/output`), `private` is hidden scorer data, and `trajectory` is usually `None` today.
-- Return exactly one supported shape: `float` in `[0, 1]`, a dict with `score` plus optional `subscores` / `weights` / `metadata`, or `RubricBuilder.grade().to_dict()`.
-- Prefer `from grading import RubricBuilder, helpers` for new multi-criterion tasks so Taiga and Harbor receive per-criterion subscores.
-- RubricBuilder criteria must be deterministic Python checks. Do not call `rb.llm_criterion(...)` or any model provider from `compute_score.py`.
+- RubricTask evaluators return exactly the declared criterion mapping or
+  `RubricEvaluation`; the framework builds the score payload.
+- Use artifact descriptors and `RubricContext`; never hand-roll artifact
+  parsing, number coercion, denominators, subprocesses, aggregation, or failure
+  handling in rubric task code.
+- Sealed `scorer/evaluation.plan.json` is written by
+  `refresh_evaluation_plan` (harness reference/ground-truth, scaffold, Trusted
+  CI seal step) and verified by `check_evaluation_plan` (validate). Never
+  hand-edit; commit the generated file after local refresh.
+- Rubric criteria must be deterministic Python checks. Do not call any model
+  provider from rubric evaluation.
 - For ML_Envs-style continuous scoring, do not force a rubric; return the continuous headline as a bare float or score dict.
 - When returning a custom dict, treat `score` as the authoritative headline; do not assume the runtime recomputes it from subscores.
 - Keep normalization centralized in `grading.normalize.normalize_compute_score_return`; Taiga and Harbor should share the same return-shape behavior.

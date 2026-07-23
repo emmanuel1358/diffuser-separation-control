@@ -89,5 +89,5 @@ in_container = true
 
 Iterate: `uv run lbx-rl-harness reference --problem-dir problems/<task_id>`
 
-Validate: `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>`
-(oracle must match the declared `reward_type` target and commit the build proof; commit reviewer artifacts only when declared).
+Validate locally when useful: `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>`
+(oracle must match the declared `reward_type` target; trusted CI generates the authoritative proof, while authors commit reviewer artifacts only when declared).

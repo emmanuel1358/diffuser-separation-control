@@ -1,0 +1,20 @@
+{
+  "decision_ids": [
+    "rollout"
+  ],
+  "evidence": {
+    "aggregation": "weighted",
+    "artifact": {
+      "max_bytes": 67108864,
+      "path": "policy.py",
+      "type": "regular-file-artifact.v1"
+    },
+    "type": "declarative-rubric.v1"
+  },
+  "metric_ids": [],
+  "plan_sha256": "0b5df156a749d361e36f9ae09549269c9f7a84ccc66f6c8c1af24107bf080c94",
+  "protocol": "declarative-rubric.v1",
+  "schema_version": "evaluation-plan.v2",
+  "security_tier": "sealed_rescore",
+  "task_spec_sha256": "cc9524870791342680a0ad8e62ce08f6935deb35bd51c7b40d0b898a89d03f95"
+}

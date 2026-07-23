@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,20 @@ from alignerr_plugin.base_image import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_build_script_handles_empty_cpu_suffix_and_parent_args() -> None:
+    script = REPO_ROOT / "base" / "build_and_push.sh"
+    completed = subprocess.run(
+        ["bash", "-n", str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    text = script.read_text()
+    assert "IFS='|' read -r suffix dockerfile tag_prefix" in text
+    assert 'if [[ "${#parent_build_args[@]}" -gt 0 ]]' in text
 
 
 def _fake_repo(tmp_path: Path) -> Path:

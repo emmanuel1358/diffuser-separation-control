@@ -160,23 +160,28 @@ For solvers or renderers that only exist inside the task image, set
 
 ## Scorer Rules
 
-Implement `scorer/compute_score.py` as:
+For continuous tasks, implement `scorer/compute_score.py` as:
 
 ```python
 def compute_score(workspace, trajectory, private):
     ...
 ```
 
-Return a finite score in `[0, 1]` as a `float`, a score `dict`, or
-`RubricBuilder.grade().to_dict()`. Grading must be deterministic: do not use LLM
-judges or external services in `compute_score.py`.
+Return a finite score in `[0, 1]` as a `float` or a score `dict`.
 
-If the submitted artifact is malformed, unreadable, or crashes, raise
-`grading.AgentFault` (or use helpers such as
-`helpers.load_submission_or_fault`). Do not catch grader bugs as `AgentFault`,
-and never import, exec, pickle-load, or otherwise run agent-authored code in the
-root grader process. Use the sanctioned sandbox helpers for submitted Python
-policies or modules.
+For `reward_type = "multi_deterministic_rubrics"`, declare
+`TASK = RubricTask(...)` instead (no `compute_score()`). Harness
+reference/ground-truth (and Trusted CI's seal step) write
+`scorer/evaluation.plan.json` from `TASK`; validate only checks it.
+Commit the generated file. See
+[`docs/RUBRIC_EVALUATION.md`](../docs/RUBRIC_EVALUATION.md).
+
+Grading must be deterministic: do not use LLM judges or external services in
+the scorer. If the submitted artifact is malformed, unreadable, or crashes,
+raise `grading.AgentFault` (or use shared artifact/`helpers` APIs). Do not
+catch grader bugs as `AgentFault`, and never import, exec, pickle-load, or
+otherwise run agent-authored code in the root grader process. Use the
+sanctioned sandbox helpers for submitted Python policies or modules.
 
 ## Hidden Environment Tasks
 

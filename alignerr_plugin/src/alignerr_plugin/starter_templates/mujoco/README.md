@@ -9,7 +9,9 @@ After creating a task, update:
 - `instruction.md` with the model, policy, or control objective.
 - `task.toml` with resources, timeouts, and required `/tmp/output/...`
   artifacts.
-- `scorer/compute_score.py` with task-specific hidden evaluation.
+- `scorer/compute_score.py` with `TASK = RubricTask(...)` and a pure evaluator;
+  use `RegularFileArtifact` plus `context.policy(...)` for submitted Python.
+- `scorer/evaluation.plan.json`: sealed plan refreshed from `TASK` by harness reference/ground-truth (commit; never hand-edit).
 - `data/` with public examples, starter assets, or environment clients.
 - `scorer/data/` with private test fixtures, seeds, XML assets, or target
   specifications.

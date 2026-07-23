@@ -67,6 +67,7 @@ def _run(
     model: str | None,
     max_steps: int | None = None,
     flavor: str = "auto",
+    calibration_check: bool = False,
 ) -> None:
     load_env_file()
     try:
@@ -80,6 +81,7 @@ def _run(
                     model=model,
                     max_steps=max_steps,
                     flavor=flavor,
+                    calibration_check=calibration_check,
                 )
             )
     except Exception as exc:  # noqa: BLE001 - CLI boundary
@@ -95,6 +97,36 @@ def _expand_runtime(runtime: RuntimeName) -> list[RuntimeName]:
     if runtime == "rubric-quality":
         return ["noop"]
     return [runtime]
+
+
+@app.command("calibration-key")
+def calibration_key(
+    problem_dir: Path = typer.Option(
+        ..., "--problem-dir", "-d", exists=True, file_okay=False
+    ),
+    framework_revision: str | None = typer.Option(
+        None,
+        "--framework-revision",
+        help="Trusted grading framework revision included in the cache identity.",
+    ),
+) -> None:
+    """Print the semantic cache key for a ContinuousTask calibration."""
+    from lbx_rl_tasks_harness.calibration import (
+        calibration_cache_key,
+        load_continuous_task,
+    )
+
+    problem = load_problem_dir(problem_dir)
+    task = load_continuous_task(problem)
+    if task is None:
+        raise typer.BadParameter("problem does not declare a calibrated ContinuousTask")
+    typer.echo(
+        calibration_cache_key(
+            problem,
+            task,
+            framework_revision=framework_revision,
+        )
+    )
 
 
 @app.command()
@@ -194,6 +226,15 @@ def run(
             "for low-RAM hosts (ML_Envs compute tasks only)."
         ),
     ),
+    calibration_check: bool = typer.Option(
+        False,
+        "--calibration-check",
+        help=(
+            "For a v2 ML ground-truth run, regenerate calibration in an "
+            "isolated workspace and verify the committed lock/proof without "
+            "rewriting task files."
+        ),
+    ),
 ) -> None:
     """Run a local authoring-format task directory."""
     if flavor not in VALID_FLAVORS:
@@ -207,6 +248,7 @@ def run(
         model,
         max_steps=max_steps,
         flavor=flavor,
+        calibration_check=calibration_check,
     )
 
 

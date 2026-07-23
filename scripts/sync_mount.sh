@@ -5,14 +5,15 @@
 # at deploy time instead of baking datasets/weights into the per-task image.
 #
 # Two task shapes are handled:
-#   * NATIVE (task.toml): auto-mount the conventional dataset dirs (ml: data/ ->
-#     /data, scorer/data -> /mcp_server/data) plus declared [[preloaded_files]];
-#     a declared mount_path wins over an auto one at the same path.
+#   * NATIVE (task.toml): expose bounded public data/ trees (or prompt-referenced
+#     files from larger trees) for every task type; auto-mount the conventional
+#     ML dataset dirs; and process declared [[preloaded_files]]. A declared
+#     mount_path wins over an auto one at the same path.
 #   * metadata mode (metadata.json, no task.toml):
-#       - DATA: for ml_task_type == "dataset", data/public -> /data (agent) and
-#         data/private -> /mcp_server/data (root-only) as squashfs. env / hybrid
-#         / sim_policy bake their data. The image also bakes data for local runs;
-#         at deploy the squashfs overrides that layer and dedups across versions.
+#       - PUBLIC: expose bounded data/public trees (or prompt-referenced files)
+#         for every ml_task_type so Taiga QA sees the logical payload.
+#       - DATASET: additionally mount public/private data as squashfs fallbacks.
+#         env / hybrid / sim_policy retain their baked data for runtime behavior.
 #       - HF: hf_resources repos are fetched into an HF hub-cache layout
 #         (refs/snapshots/blobs) and packed for offline from_pretrained,
 #         content-addressed by commit sha under cache/huggingface/. Gated repos
@@ -51,6 +52,7 @@ print('1' if is_mlenvs_task(Path('$PROBLEM_DIR')) else '0')
 ")"
 
 STAMP_ARGS=()
+QA_PUBLIC_EXPANSION_COMPLETE=false
 
 # --- metadata dataset data mounts -----------------------------------------
 # public -> /data (agent-visible), private -> /mcp_server/data (root-only). Only
@@ -85,17 +87,84 @@ print(remote_squashfs_name('${TASK_ID}', '${name}', '${address}'))
   STAMP_ARGS+=(--entry "${mount_path}::${remote_path}::true")
 }
 
+_upload_qa_visible_public_tree() {
+  local src="$1" mount_path="$2" selection expand complete address encoded entry relative local_path remote_name remote_path
+  QA_PUBLIC_EXPANSION_COMPLETE=false
+  selection="$(cd "$REPO_ROOT" && python3 - "$src" "$mount_path" "$PROBLEM_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "alignerr_plugin/src")
+from alignerr_plugin.preloaded import qa_visible_public_file_selection
+from alignerr_plugin.utils import read_prompt
+
+try:
+    prompt = read_prompt(Path(sys.argv[3]))
+except OSError:
+    prompt = ""
+files, complete = qa_visible_public_file_selection(
+    Path(sys.argv[1]),
+    sys.argv[2],
+    prompt_text=prompt,
+)
+print(
+    json.dumps(
+        {
+            "expand": files is not None,
+            "complete": complete,
+            "files": [
+                {"relative": relative, "local_path": local_path}
+                for relative, local_path in (files or [])
+            ],
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+)"
+  expand="$(jq -r '.expand' <<<"$selection")"
+  [[ "$expand" == "true" ]] || return 1
+  complete="$(jq -r '.complete' <<<"$selection")"
+  QA_PUBLIC_EXPANSION_COMPLETE="$complete"
+  address="$(cd "$REPO_ROOT" && python3 -c "
+import sys; sys.path.insert(0, 'alignerr_plugin/src')
+from pathlib import Path
+from alignerr_plugin.preloaded import content_address
+print(content_address(Path('${src}')))
+")"
+  for encoded in $(jq -r '.files[] | @base64' <<<"$selection"); do
+    entry="$(printf '%s' "$encoded" | base64 -d)"
+    relative="$(jq -r '.relative' <<<"$entry")"
+    local_path="$(jq -r '.local_path' <<<"$entry")"
+    if [[ "$complete" != "true" ]]; then
+      local_path="/lbx-public-files/${address}/${relative}"
+    fi
+    remote_name="${TASK_ID}/public-${address}/${relative}"
+    remote_path="$(bash "$UPLOAD" "${src}/${relative}" "$remote_name")"
+    STAMP_ARGS+=(--entry "${local_path}::${remote_path}::false")
+  done
+  echo ":: expanded $(jq '.files | length' <<<"$selection") QA-visible public files at ${mount_path} (complete=${complete})"
+  return 0
+}
+
 sync_mlenvs_data_mounts() {
-  local ml_task_type
+  local ml_task_type public_expanded=false public_complete=false
   ml_task_type="$(python3 -c "
 import json
 print(json.load(open('${PROBLEM_DIR}/metadata.json')).get('ml_task_type', ''))
 ")"
+  if _upload_qa_visible_public_tree "${PROBLEM_DIR}/data/public" "/data"; then
+    public_expanded=true
+    public_complete="$QA_PUBLIC_EXPANSION_COMPLETE"
+  fi
   if [[ "$ml_task_type" != "dataset" ]]; then
-    echo ":: $TASK_ID ml_task_type=${ml_task_type:-?}: data is baked (no squashfs mount)"
+    echo ":: $TASK_ID ml_task_type=${ml_task_type:-?}: public QA expansion=${public_expanded}; data remains baked"
     return 0
   fi
-  _pack_data_tree "${PROBLEM_DIR}/data/public" "/data"
+  if [[ "$public_complete" != "true" ]]; then
+    _pack_data_tree "${PROBLEM_DIR}/data/public" "/data"
+  fi
   _pack_data_tree "${PROBLEM_DIR}/data/private" "/mcp_server/data"
 }
 
@@ -169,21 +238,38 @@ pd = Path('$PROBLEM_DIR')
 task = load_task_toml(pd)
 declared = task.preloaded_files
 declared_paths = {e.mount_path for e in declared}
-for source_rel, mount_path in auto_mount_entries(
+auto = auto_mount_entries(
     pd, task.difficulty.task_type, hidden_env=task.environment.hidden_env
-):
+)
+auto_paths = {mount_path for _source_rel, mount_path in auto}
+for source_rel, mount_path in auto:
     if mount_path in declared_paths:
         continue
-    print(sep.join([source_rel, '', '', mount_path, 'true']))
+    print(sep.join([source_rel, '', '', mount_path, 'true', 'auto']))
+if '/data' not in declared_paths and '/data' not in auto_paths and (pd / 'data').is_dir():
+    print(sep.join(['data', '', '', '/data', 'true', 'public']))
 for e in declared:
     print(sep.join([
         e.source, e.hf_repo, e.hf_revision,
         e.mount_path, 'true' if e.read_only else 'false',
+        'declared',
     ]))
 ")
-  local line source hf_repo hf_revision mount_path read_only idx=0 name staging address remote_name squashfs remote_path
+  local line source hf_repo hf_revision mount_path read_only origin idx=0 name staging address remote_name squashfs remote_path
   for line in "${entries[@]}"; do
-    IFS="${ENTRY_SEP}" read -r source hf_repo hf_revision mount_path read_only <<< "$line"
+    IFS="${ENTRY_SEP}" read -r source hf_repo hf_revision mount_path read_only origin <<< "$line"
+    if [[ -n "$source" && "$read_only" == "true" \
+          && ( "$mount_path" == "/data" || "$mount_path" == /data/* ) ]]; then
+      if _upload_qa_visible_public_tree "${PROBLEM_DIR}/${source}" "$mount_path"; then
+        if [[ "$QA_PUBLIC_EXPANSION_COMPLETE" == "true" || "$origin" == "public" ]]; then
+          continue
+        fi
+      fi
+    fi
+    if [[ "$origin" == "public" ]]; then
+      echo ":: public data remains baked; no bounded QA-visible expansion available"
+      continue
+    fi
     idx=$((idx + 1))
     name="m${idx}"
     staging="${WORK}/${name}"

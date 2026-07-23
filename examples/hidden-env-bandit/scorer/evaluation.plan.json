@@ -1,0 +1,15 @@
+{
+  "evidence": {
+    "alpha": 0.01,
+    "controls": "author-registered-trusted",
+    "scenarios": 128,
+    "type": "paired-policy-challenge.v1"
+  },
+  "metric_ids": [
+    "paired.normalized_return.v1"
+  ],
+  "plan_sha256": "2a85b002f04cf63faad6a91925b8da65a954ba1c541ec31b134637079ad6224b",
+  "schema_version": "continuous-evaluation-plan.v1",
+  "security_tier": "sealed_challenge",
+  "task_spec_sha256": "c6c34160cfbdfc90f61f4eb30fc29c983790809d1301c41fd3ea97e33bf7d1e2"
+}

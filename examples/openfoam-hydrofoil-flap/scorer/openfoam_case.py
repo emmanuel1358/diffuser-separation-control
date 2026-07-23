@@ -17,10 +17,11 @@ from __future__ import annotations
 import math
 import re
 import shlex
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from grading.helpers import SolverResult, run_trusted_solver
 
 FIELDS = ("flap_deflection_deg", "hinge_gap_m", "flap_chord_fraction", "blend_radius_m")
 OF_ENV = "source /etc/solver-envs.d/openfoam.sh >/dev/null 2>&1"
@@ -99,8 +100,15 @@ def to_geometry(design: dict[str, Any], public: dict[str, Any]) -> Geometry:
     )
 
 
-def feasibility_scores(design: dict[str, Any] | None, public: dict[str, Any]) -> tuple[dict[str, float], list[str], Geometry | None]:
-    scores = {"required_fields": 0.0, "finite_numeric": 0.0, "public_ranges": 0.0, "derived_geometry": 0.0}
+def feasibility_scores(
+    design: dict[str, Any] | None, public: dict[str, Any]
+) -> tuple[dict[str, float], list[str], Geometry | None]:
+    scores = {
+        "required_fields": 0.0,
+        "finite_numeric": 0.0,
+        "public_ranges": 0.0,
+        "derived_geometry": 0.0,
+    }
     errors: list[str] = []
     if not isinstance(design, dict):
         return scores, ["hydrofoil_flap.json must contain a JSON object"], None
@@ -153,19 +161,25 @@ def feasibility_scores(design: dict[str, Any] | None, public: dict[str, Any]) ->
     if geom.minimum_clearance_m >= min_clearance:
         derived_parts.append(1.0)
     else:
-        derived_parts.append(_clamp(geom.minimum_clearance_m / max(min_clearance, 1e-9)))
+        derived_parts.append(
+            _clamp(geom.minimum_clearance_m / max(min_clearance, 1e-9))
+        )
         errors.append("flap geometry violates minimum test-section clearance")
 
     if 0.0 <= geom.trailing_edge_offset_m <= max_te:
         derived_parts.append(1.0)
     else:
-        derived_parts.append(_clamp(1.0 - (geom.trailing_edge_offset_m - max_te) / 0.050))
+        derived_parts.append(
+            _clamp(1.0 - (geom.trailing_edge_offset_m - max_te) / 0.050)
+        )
         errors.append("trailing-edge offset exceeds packaging limit")
 
     if geom.blend_radius_m <= 0.22 * geom.flap_length_m:
         derived_parts.append(1.0)
     else:
-        derived_parts.append(_clamp(1.0 - (geom.blend_radius_m - 0.22 * geom.flap_length_m) / 0.030))
+        derived_parts.append(
+            _clamp(1.0 - (geom.blend_radius_m - 0.22 * geom.flap_length_m) / 0.030)
+        )
         errors.append("blend radius too large for the submitted flap chord")
 
     if 0.015 <= geom.gap_ratio <= 0.14:
@@ -179,7 +193,9 @@ def feasibility_scores(design: dict[str, Any] | None, public: dict[str, Any]) ->
         derived_parts.append(1.0)
     else:
         derived_parts.append(_clamp(1.0 - abs(geom.blockage_fraction - 0.24) / 0.24))
-        errors.append("flap blockage is outside the plausible control-authority envelope")
+        errors.append(
+            "flap blockage is outside the plausible control-authority envelope"
+        )
 
     scores["derived_geometry"] = sum(derived_parts) / len(derived_parts)
     return scores, errors, geom
@@ -215,13 +231,22 @@ def response_metrics(geom: Geometry, case: dict[str, Any]) -> dict[str, float]:
     separation -= min(0.16, max(0.0, (blend - 0.010) / 0.018) * 0.12)
     separation = _clamp(separation)
 
-    lift = 0.165 + 0.052 * effective_deflection + 1.05 * (geom.flap_chord_fraction - 0.18) + 0.46 * block
-    lift -= 0.36 * separation + 1.40 * abs(gap - 0.0085) + 0.030 * abs(speed_factor - 1.0)
+    lift = (
+        0.165
+        + 0.052 * effective_deflection
+        + 1.05 * (geom.flap_chord_fraction - 0.18)
+        + 0.46 * block
+    )
+    lift -= (
+        0.36 * separation + 1.40 * abs(gap - 0.0085) + 0.030 * abs(speed_factor - 1.0)
+    )
     lift_coefficient = _clamp(lift, 0.0, 0.92)
 
     drag = 0.048 + 0.0064 * (effective_deflection / 6.8) ** 2
     drag += 0.046 * (geom.flap_chord_fraction - 0.22) ** 2 / 0.012
-    drag += 0.073 * separation + 0.38 * max(0.0, gap - 0.011) + 0.17 * max(0.0, 0.006 - gap)
+    drag += (
+        0.073 * separation + 0.38 * max(0.0, gap - 0.011) + 0.17 * max(0.0, 0.006 - gap)
+    )
     drag += 0.014 * abs(speed_factor - 1.0)
     drag_coefficient = _clamp(drag, 0.0, 0.40)
 
@@ -289,8 +314,9 @@ def _block_mesh_dict(geom: Geometry) -> str:
     farfield_faces = []
     front_faces = []
     back_faces = []
-    min_height = max(0.030, min(yt - yb for yb, yt in zip(ybs, yts)))
-    global_ny = max(14, min(34, int(round((geom.test_section_height_m - min(ybs)) / 0.006))))
+    global_ny = max(
+        14, min(34, int(round((geom.test_section_height_m - min(ybs)) / 0.006)))
+    )
 
     for j in range(len(xs) - 1):
         dx = xs[j + 1] - xs[j]
@@ -305,7 +331,9 @@ def _block_mesh_dict(geom: Geometry) -> str:
         back_faces.append(f"        ({b(j,1)} {b(j+1,1)} {t(j+1,1)} {t(j,1)})")
 
     inlet_face = f"        ({b(0,0)} {t(0,0)} {t(0,1)} {b(0,1)})"
-    outlet_face = f"        ({b(len(xs)-1,0)} {b(len(xs)-1,1)} {t(len(xs)-1,1)} {t(len(xs)-1,0)})"
+    outlet_face = (
+        f"        ({b(len(xs)-1,0)} {b(len(xs)-1,1)} {t(len(xs)-1,1)} {t(len(xs)-1,0)})"
+    )
     front_back = "\n".join(front_faces + back_faces)
     return f"""FoamFile {{ version 2.0; format ascii; class dictionary; object blockMeshDict; }}
 scale 1;
@@ -330,7 +358,9 @@ mergePatchPairs ();
 """
 
 
-def write_case(case_dir: Path, design: dict[str, Any], public: dict[str, Any], case: dict[str, Any]) -> Geometry:
+def write_case(
+    case_dir: Path, design: dict[str, Any], public: dict[str, Any], case: dict[str, Any]
+) -> Geometry:
     case_dir = Path(case_dir)
     for sub in ("system", "constant", "0"):
         (case_dir / sub).mkdir(parents=True, exist_ok=True)
@@ -342,13 +372,13 @@ def write_case(case_dir: Path, design: dict[str, Any], public: dict[str, Any], c
 
     (case_dir / "system/blockMeshDict").write_text(_block_mesh_dict(geom))
     (case_dir / "constant/transportProperties").write_text(
-        _fh("dictionary", "transportProperties") + f"\ntransportModel Newtonian;\nnu {nu:.10e};\n"
+        _fh("dictionary", "transportProperties")
+        + f"\ntransportModel Newtonian;\nnu {nu:.10e};\n"
     )
     (case_dir / "constant/turbulenceProperties").write_text(
         _fh("dictionary", "turbulenceProperties") + "\nsimulationType laminar;\n"
     )
-    (case_dir / "0/U").write_text(
-        _fh("volVectorField", "U") + f"""
+    (case_dir / "0/U").write_text(_fh("volVectorField", "U") + f"""
 dimensions [0 1 -1 0 0 0 0];
 internalField uniform ({u:.8f} 0 0);
 boundaryField
@@ -359,10 +389,8 @@ boundaryField
     farfield {{ type slip; }}
     frontAndBack {{ type empty; }}
 }}
-"""
-    )
-    (case_dir / "0/p").write_text(
-        _fh("volScalarField", "p") + """
+""")
+    (case_dir / "0/p").write_text(_fh("volScalarField", "p") + """
 dimensions [0 2 -2 0 0 0 0];
 internalField uniform 0;
 boundaryField
@@ -373,29 +401,23 @@ boundaryField
     farfield { type zeroGradient; }
     frontAndBack { type empty; }
 }
-"""
-    )
-    (case_dir / "system/controlDict").write_text(
-        _fh("dictionary", "controlDict") + f"""
+""")
+    (case_dir / "system/controlDict").write_text(_fh("dictionary", "controlDict") + f"""
 application simpleFoam;
 startFrom startTime; startTime 0; stopAt endTime; endTime {iterations};
 deltaT 1; writeControl timeStep; writeInterval {iterations}; purgeWrite 0;
 writeFormat ascii; writePrecision 8; timeFormat general; timePrecision 8;
 runTimeModifiable false;
-"""
-    )
-    (case_dir / "system/fvSchemes").write_text(
-        _fh("dictionary", "fvSchemes") + """
+""")
+    (case_dir / "system/fvSchemes").write_text(_fh("dictionary", "fvSchemes") + """
 ddtSchemes { default steadyState; }
 gradSchemes { default Gauss linear; }
 divSchemes { default none; div(phi,U) bounded Gauss linearUpwind grad(U); div((nuEff*dev2(T(grad(U))))) Gauss linear; }
 laplacianSchemes { default Gauss linear corrected; }
 interpolationSchemes { default linear; }
 snGradSchemes { default corrected; }
-"""
-    )
-    (case_dir / "system/fvSolution").write_text(
-        _fh("dictionary", "fvSolution") + """
+""")
+    (case_dir / "system/fvSolution").write_text(_fh("dictionary", "fvSolution") + """
 solvers
 {
     p { solver GAMG; smoother GaussSeidel; tolerance 1e-7; relTol 0.05; }
@@ -411,21 +433,26 @@ relaxationFactors
     fields { p 0.3; }
     equations { U 0.7; }
 }
-"""
-    )
+""")
     return geom
 
 
-def _run(case_dir: Path, cmd: str, timeout: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def _run(case_dir: Path, cmd: str, timeout: int) -> SolverResult:
+    return run_trusted_solver(
         ["bash", "-lc", f"{OF_ENV}; cd {shlex.quote(str(case_dir))}; {cmd}"],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
+        timeout_s=timeout,
+        max_output_bytes=4 * 1024 * 1024,
     )
 
 
-def _case_result(ok: bool, mesh_ok: bool, solver_ok: bool, metrics: dict[str, float] | None = None, *, reason: str = "") -> CaseResult:
+def _case_result(
+    ok: bool,
+    mesh_ok: bool,
+    solver_ok: bool,
+    metrics: dict[str, float] | None = None,
+    *,
+    reason: str = "",
+) -> CaseResult:
     metrics = metrics or {}
     return CaseResult(
         ok=ok,
@@ -463,15 +490,37 @@ def build_and_run(
         return _case_result(False, False, False, reason=f"case write failed: {exc}")
     metrics = response_metrics(geom, case)
     timeout = max(1, int(timeout))
-    block_budget = max(1, min(int(block_timeout if block_timeout is not None else 35), timeout))
-    solver_budget = max(1, min(int(solver_timeout if solver_timeout is not None else max(1, timeout - block_budget)), timeout))
+    block_budget = max(
+        1, min(int(block_timeout if block_timeout is not None else 35), timeout)
+    )
+    solver_budget = max(
+        1,
+        min(
+            int(
+                solver_timeout
+                if solver_timeout is not None
+                else max(1, timeout - block_budget)
+            ),
+            timeout,
+        ),
+    )
     r = _run(case_dir, "blockMesh", block_budget)
     if r.returncode != 0:
-        return _case_result(False, False, False, metrics, reason=f"blockMesh failed: {(r.stderr or r.stdout)[-400:]}")
+        return _case_result(
+            False,
+            False,
+            False,
+            metrics,
+            reason=f"blockMesh failed: {r.output[-400:]}",
+        )
     r = _run(case_dir, "simpleFoam", solver_budget)
-    blob = (r.stdout or "") + (r.stderr or "")
+    blob = r.output
     if r.returncode != 0:
-        return _case_result(False, True, False, metrics, reason=f"simpleFoam failed: {blob[-400:]}")
+        return _case_result(
+            False, True, False, metrics, reason=f"simpleFoam failed: {blob[-400:]}"
+        )
     if "FOAM FATAL" in blob or re.search(r"\b(nan|inf|-nan)\b", blob.lower()):
-        return _case_result(False, True, False, metrics, reason="solver emitted fatal/NaN/inf")
+        return _case_result(
+            False, True, False, metrics, reason="solver emitted fatal/NaN/inf"
+        )
     return _case_result(True, True, True, metrics, reason="ok")

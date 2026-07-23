@@ -1,4 +1,4 @@
-"""Tests for `RubricBuilder` decorator API."""
+"""Tests for deprecated `RubricBuilder` decorator API."""
 
 from __future__ import annotations
 
@@ -10,6 +10,20 @@ import pytest
 
 from grading import RubricBuilder
 from grading.judge import LLMJudge, JudgeResult
+
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
+
+@pytest.mark.filterwarnings("default::DeprecationWarning")
+def test_rubric_builder_emits_deprecation_warning(workspace: Path) -> None:
+    with pytest.warns(DeprecationWarning, match="RubricBuilder is deprecated"):
+        RubricBuilder(workspace=workspace, trajectory=None, private=workspace)
+
+
+@pytest.mark.filterwarnings("default::DeprecationWarning")
+def test_llm_judge_emits_deprecation_warning() -> None:
+    with pytest.warns(DeprecationWarning, match="LLMJudge is deprecated"):
+        LLMJudge(api_key="sk-fake")
 
 
 def test_criterion_decorator_registers_and_grades(workspace: Path) -> None:

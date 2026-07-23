@@ -15,4 +15,6 @@ The model should be a single damped pendulum:
 - joint position and velocity sensors,
 - damping that makes the pendulum settle.
 
+`/data/` contains no additional required inputs for this self-contained example.
+
 This example is designed for end-to-end workflow testing and as a simple starter for richer MuJoCo robotics tasks.

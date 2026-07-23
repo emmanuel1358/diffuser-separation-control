@@ -40,6 +40,8 @@ A good workflow is to inspect the public files, compare candidate designs agains
 
 The public transfer guidance gives enough public operating-regime information to reason about robustness across speed, trim, and submergence changes without exposing private case rows or coefficient anchors.
 
+Read the disclosed geometry, calibration, and transfer files from `/data/`.
+
 Scoring is deterministic and gradual. Credit comes from a valid design file, numeric fields, public-bound compliance, public guidance alignment, off-design transfer alignment, derived geometry feasibility, private case health, lift authority, drag control, separation control, wake quality, and robustness spread across private operating cases. The grader recomputes the physical response quantities from the public problem definition and the submitted geometry and checks them against hidden operating cases and tolerances.
 
 Do not try to read private scorer files, create alternate output paths, or submit constants unrelated to the hydrofoil flap geometry. The verifier reads the required file under `/tmp/output` and evaluates the submitted geometry with fixed private cases.

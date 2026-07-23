@@ -14,23 +14,30 @@ Public surface:
 
   - `Grade`                          dataclass + `to_dict()` (Boreal/Harbor schema)
   - `AgentFault`                     mark agent-controlled malformed outputs as score 0
-  - `RubricBuilder`                  decorator API for weighted deterministic criteria + penalties
-  - `LLMJudge`                       legacy/internal judge helper; do not use in submitted task rubrics
+  - `RubricTask`                     mandatory declarative deterministic rubric protocol
+  - `RubricBuilder`                  **deprecated**; legacy compatibility for immutable task images
+  - `LLMJudge`                       **deprecated**; do not use in submitted task rubrics
   - `helpers`                        deterministic predicates (file_exists, regex_search, ...)
   - `PolicyWorker`                   out-of-process runner for submitted policy.py files
   - `normalize_compute_score_return` accepts float / dict / Grade, returns a Grade
 
-The three accepted return shapes from `compute_score()` are:
+The accepted return shapes from continuous/legacy `compute_score()` are:
 
   1. `float` in `[0, 1]`                    -> ML_Envs-style continuous scoring
   2. `dict {score, subscores, weights, metadata}` -> headline `score` is authoritative
-  3. `RubricBuilder.grade().to_dict()`      -> rich rubric with per-criterion detail
+  3. `RubricBuilder.grade().to_dict()`      -> **deprecated** legacy rubric path
 
-See `docs/GRADING.md` in this repo for the full author guide.
+New `multi_deterministic_rubrics` tasks declare `TASK = RubricTask(...)` instead.
 """
 
 from grading.env_loading import load_env_module
-from grading.faults import AgentFault
+from grading.evaluation.rubric import (
+    RubricContext,
+    RubricCriterion,
+    RubricEvaluation,
+    RubricTask,
+)
+from grading.faults import AgentFault, GraderFault, InfrastructureFault
 from grading.grade import PASS_THRESHOLD, Grade
 from grading.judge import LLMJudge, LLMJudgeError
 from grading.kfold import score_kfold_cv
@@ -48,12 +55,15 @@ from grading.rubric_builder import RubricBuilder
 # flattened at top level. Keeps `from grading import RubricBuilder, helpers`
 # clean and avoids name collisions with whatever the author has in scope.
 from grading import calibration  # noqa: F401  re-exported
+from grading import evaluation  # noqa: F401  re-exported
 from grading import helpers  # noqa: F401  re-exported
 from grading import policy_eval  # noqa: F401  re-exported
 
 __all__ = [
     "Grade",
     "AgentFault",
+    "GraderFault",
+    "InfrastructureFault",
     "LLMJudge",
     "LLMJudgeError",
     "PASS_THRESHOLD",
@@ -62,7 +72,12 @@ __all__ = [
     "PolicyWorker",
     "PolicyWorkerError",
     "RubricBuilder",
+    "RubricContext",
+    "RubricCriterion",
+    "RubricEvaluation",
+    "RubricTask",
     "calibration",
+    "evaluation",
     "helpers",
     "load_env_module",
     "load_submitted_policy",

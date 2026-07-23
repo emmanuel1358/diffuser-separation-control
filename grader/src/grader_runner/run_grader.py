@@ -12,6 +12,8 @@ into a canonical :class:`grading.Grade`, and writes:
   * ``<output-dir>/reward.json``           Harbor canonical headline
   * ``<output-dir>/reward.txt``            single float (Harbor fallback)
   * ``<output-dir>/reward-details.json``   full ``Grade.to_dict()`` (per-criterion)
+  * ``<output-dir>/evaluation-details.json`` root-only private evidence trace
+    (only for protected continuous evaluations)
 
 Customer flow (RL training)::
 
@@ -35,6 +37,7 @@ import argparse
 import json
 import logging
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -150,6 +153,11 @@ def _run_worker(
     timeout_s: float | None,
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
+    evaluation_trace_path = output_dir / "evaluation-details.json"
+    try:
+        evaluation_trace_path.unlink()
+    except FileNotFoundError:
+        pass
     fd, raw_result_path = tempfile.mkstemp(
         prefix="lbx-harbor-grader-", suffix=".json", dir=output_dir
     )
@@ -197,6 +205,8 @@ def _run_worker(
             except Exception as exc:  # noqa: BLE001 - never block grading
                 print(f"[ENV_SERVER] stop_env_server failed: {exc}", file=sys.stderr)
             env = prepare_grader_cache()
+            if env.get("LBX_EVALUATION_PLAN_ATTESTED") == "1":
+                env.setdefault("LBX_EVALUATION_NONCE", secrets.token_hex(16))
             cmd = [
                 sys.executable,
                 "-P",
@@ -210,6 +220,8 @@ def _run_worker(
                 str(private),
                 "--result-path",
                 str(result_path),
+                "--evaluation-trace",
+                str(evaluation_trace_path),
             ]
             if transcript is not None:
                 cmd.extend(["--transcript", str(transcript)])

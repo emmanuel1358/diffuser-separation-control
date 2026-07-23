@@ -27,7 +27,8 @@ At a high level, the workflow is:
 1. Write the task prompt in `instruction.md`.
 2. Put any public files the model may inspect in `data/`.
 3. Put hidden grading fixtures in `scorer/data/`.
-4. Write a deterministic grader in `scorer/compute_score.py`.
+4. Declare a deterministic `RubricTask` in `scorer/compute_score.py` and
+   let harness reference/ground-truth refresh sealed `scorer/evaluation.plan.json` from `TASK` (commit it; never hand-edit).
 5. Write an oracle solution in `solution/solve.sh`.
 6. Run the local harness to prove the oracle scores `1.0`.
 7. Run a model attempt, then use the PR Boreal report to confirm the task is
@@ -146,7 +147,9 @@ The main files are:
 - `environment/Dockerfile`: installs task dependencies and copies public/private
   files into the container.
 - `data/`: public files available to the model at `/data`.
-- `scorer/compute_score.py`: deterministic grading code.
+- `scorer/compute_score.py`: declarative criteria and pure domain evaluation;
+  shared APIs own artifact/error/aggregation plumbing.
+- `scorer/evaluation.plan.json`: hash-bound rubric protocol identity.
 - `scorer/<solver>_case.py`: optional helper that builds, runs, and parses a
   deterministic solver case.
 - `scorer/data/`: private files available only to the grader.
@@ -608,9 +611,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ... then the standard grader COPY/install block ...
 ```
 
-Call `avl` from the scorer with `subprocess`, feed it a deterministic command
-script, and parse printed forces or stability derivatives. Treat failed or
-non-converged AVL runs as failed grading cases.
+Call `avl` through `context.run_solver(...)`, feed it a deterministic command
+script, and parse the typed bounded result. Do not call `subprocess` directly;
+the shared API owns process-group timeout and output-cap handling.
 
 ## 13. Final Author Checklist
 
@@ -622,7 +625,9 @@ Before opening or updating a task PR, check:
   answers.
 - Private fixtures, hidden conditions, and reference anchors live under
   `scorer/data/`.
-- `scorer/compute_score.py` is deterministic and returns a score in `[0, 1]`.
+- `scorer/compute_score.py` declares `TASK = RubricTask(...)`, contains no
+  author-owned `compute_score`, raw candidate reads, subprocesses, or failure
+  payloads, and has a matching `scorer/evaluation.plan.json`.
 - Solver version, serial execution, mesh generation, timestep or iteration
   budget, schemes, boundary conditions, and seeds are pinned.
 - The task uses deterministic `blockMesh` or a pre-built mesh; no nondeterministic
@@ -659,7 +664,7 @@ uv run lbx-rl-harness run \
   treating the task as review-ready. Findings often appear 1.5-3 hours after the
   PR dispatch; if the section is still missing after about 3 hours, check the
   mothership `poll-taiga-runs.yml` workflow or re-run the poller.
-- `.alignerr/build_proof.json` is committed after the final task edits.
+- Trusted CI generates `.alignerr/build_proof.json` from the final PR revision.
 - `.alignerr/ground_truth/` artifacts are committed when the task declares them.
 - `.env.local`, `.harness-runs/`, API keys, and other secrets are not committed.
 

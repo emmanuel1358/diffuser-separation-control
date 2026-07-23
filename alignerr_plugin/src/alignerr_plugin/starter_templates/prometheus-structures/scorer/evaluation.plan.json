@@ -1,0 +1,26 @@
+{
+  "decision_ids": [
+    "design_present"
+  ],
+  "evidence": {
+    "aggregation": "weighted",
+    "artifact": {
+      "allow_extra_keys": true,
+      "max_bytes": 67108864,
+      "max_depth": 64,
+      "max_nodes": 100000,
+      "numeric_fields": [],
+      "path": "design.json",
+      "require_object": true,
+      "required_keys": [],
+      "type": "json-artifact.v1"
+    },
+    "type": "declarative-rubric.v1"
+  },
+  "metric_ids": [],
+  "plan_sha256": "ff54ac24c3a585378f2bf305b1d33bbb503290edb4441d2b0d32f18d5019815d",
+  "protocol": "declarative-rubric.v1",
+  "schema_version": "evaluation-plan.v2",
+  "security_tier": "sealed_rescore",
+  "task_spec_sha256": "68045e20afccd15c5861381cc0019ab9d98b36a905ab07bfd7346eec8194b29c"
+}

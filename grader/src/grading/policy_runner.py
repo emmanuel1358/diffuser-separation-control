@@ -100,6 +100,9 @@ _SECRET_ENV_SUBSTRINGS = (
     "PASSWORD",
     "PASSWD",
     "CREDENTIAL",
+    "EVALUATION_NONCE",
+    "EVALUATION_PLAN_ATTESTED",
+    "EVALUATION_TRACE_PATH",
 )
 
 
@@ -118,6 +121,7 @@ def _isolated_python_environ() -> dict[str, str]:
     env = _scrubbed_environ()
     env.pop("PYTHONPATH", None)
     env["PYTHONSAFEPATH"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
 
@@ -721,6 +725,7 @@ while True:
 # deps like MuJoCo / torch) happens during the init handshake, so a tight
 # per-step ``timeout_s`` must not race that one-time startup cost.
 _FIRST_CALL_FLOOR_S = 30.0
+_MAX_POLICY_REPLY_BYTES = 64 * 1024 * 1024
 
 
 class PolicyWorker:
@@ -735,6 +740,7 @@ class PolicyWorker:
         first_call_timeout_s: float | None = None,
         cwd: Path | None = None,
         max_stderr_chars: int = 8000,
+        max_reply_bytes: int = _MAX_POLICY_REPLY_BYTES,
         drop_privileges: bool = True,
         unshare_ipc: bool = True,
         factory_name: str | None = None,
@@ -747,6 +753,9 @@ class PolicyWorker:
         self._first_call_done = False
         self.cwd = Path(cwd) if cwd is not None else None
         self.max_stderr_chars = max_stderr_chars
+        if max_reply_bytes <= 0:
+            raise ValueError("max_reply_bytes must be positive")
+        self.max_reply_bytes = int(max_reply_bytes)
         self.drop_privileges = drop_privileges
         self.unshare_ipc = unshare_ipc
         # Named factory (e.g. "load_policy"); None keeps the legacy auto-detect
@@ -758,6 +767,7 @@ class PolicyWorker:
         self.sys_path_dirs = sys_path_dirs
         self._proc: subprocess.Popen[bytes] | None = None
         self._responses: queue.Queue[bytes | None] = queue.Queue()
+        self._reader_error: str | None = None
         self._stderr_parts: list[str] = []
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -813,6 +823,7 @@ class PolicyWorker:
         if self.source is None and not self.policy_path.exists():
             raise FileNotFoundError(f"missing policy file: {self.policy_path}")
         self._responses = queue.Queue()
+        self._reader_error = None
         self._stderr_parts = []
         self._first_call_done = False
 
@@ -827,9 +838,7 @@ class PolicyWorker:
             ipc_status_r, ipc_status_w = os.pipe()
 
         popen_kwargs = (
-            _agent_drop_kwargs(
-                unshare_ipc=self.unshare_ipc, ipc_status_fd=ipc_status_w
-            )
+            _agent_drop_kwargs(unshare_ipc=self.unshare_ipc, ipc_status_fd=ipc_status_w)
             if self.drop_privileges
             else {"env": _isolated_python_environ()}
         )
@@ -1040,6 +1049,8 @@ class PolicyWorker:
                 f"policy.{what} timed out after {timeout_s:.3f}s"
             ) from exc
         if frame is None:
+            if self._reader_error:
+                raise PolicyWorkerError(self._reader_error)
             raise PolicyWorkerError(self._error_context("policy worker exited"))
         return _unpack(frame)
 
@@ -1107,6 +1118,12 @@ class PolicyWorker:
                 if not header or len(header) < _FRAME_HEADER.size:
                     break
                 (length,) = _FRAME_HEADER.unpack(header)
+                if length > self.max_reply_bytes:
+                    self._reader_error = (
+                        "policy worker reply exceeds "
+                        f"{self.max_reply_bytes}-byte serialized limit"
+                    )
+                    break
                 body = b""
                 while len(body) < length:
                     chunk = stream.read(length - len(body))

@@ -9,9 +9,10 @@ After creating a task, update:
 
 - `instruction.md` with the structural problem and the exact `/tmp/output/...` artifact.
 - `task.toml` with resources, timeouts, the `structures` `domain`, and required outputs.
-- `scorer/compute_score.py` with task-specific hidden evaluation. Read the
-  agent submission through a guarded loader (`except OSError: raise AgentFault(...)`);
-  run OpenSeesPy against held-out load cases and score deterministically.
+- `scorer/compute_score.py` with `TASK = RubricTask(...)` and pure hidden
+  evaluation. Declare `JsonArtifact`/`TrustedJson`; run trusted structural
+  analysis through `RubricContext`. Do not hand-write loaders/error handling.
+- `scorer/evaluation.plan.json`: sealed plan refreshed from `TASK` by harness reference/ground-truth (commit; never hand-edit).
 - `data/` with public assets (model summary, schema, public probe).
 - `scorer/data/` with private hidden load cases / target specifications.
 - `solution/solve.sh` with the reference (oracle) design.

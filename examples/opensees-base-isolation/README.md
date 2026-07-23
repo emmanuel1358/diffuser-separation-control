@@ -22,11 +22,11 @@ and is gated by the moat.
 
 ## How it is graded
 
-`scorer/compute_score.py` validates the design (it never imports/execs the
-submission), then independently runs the hidden structural model on the six
-private records and scores four worst-case metrics (isolator displacement, floor
-acceleration, interstory drift, base shear) against disclosed targets and credit
-curves, with a moat-capacity pounding gate and a disclosed final exponent.
+`scorer/compute_score.py` declares a `RubricTask`. Its `JsonArtifact` owns
+bounded UTF-8/JSON parsing, nested finite-number/range checks, and malformed
+submission faults; `TrustedJson` owns the private case fixture. Pure domain
+evaluation runs the hidden structural model on six records and scores worst-case
+metrics against the disclosed targets and gates.
 
 ## Local results
 
@@ -42,7 +42,8 @@ possible here for billing reasons).
 
 - `instruction.md`, `task.toml`, `metadata.json`
 - `data/` - public schema, envelope, summary, starter, description, and support model
-- `scorer/compute_score.py`, `scorer/data/hidden_cases.json`
+- `scorer/compute_score.py`, `scorer/evaluation.plan.json`,
+  `scorer/data/hidden_cases.json`
 - `solution/solve.sh`, `solution/oracle_search.py`
 - `baselines/naive.sh`, `tests/test.sh`
 - `environment/Dockerfile`

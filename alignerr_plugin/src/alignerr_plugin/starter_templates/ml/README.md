@@ -1,58 +1,63 @@
-# ML task template (ML_Envs mode)
+# ML task template
 
-This scaffolds an **ML_Envs-mode** task: the minimal authoring contract for ML
-tasks in this template. You edit a tiny `metadata.json`, the prompt, the grader,
-and the data - there is **no `task.toml`, no per-task Dockerfile, and no
-`tests/test.sh`**. Every operational field (task type, reward type, timeouts,
-runner knobs, the `/tmp/output` convention) is pinned centrally; the image builds
-from the shared `base/task.mlenvs.Dockerfile`. See
-[`docs/MLENVS_TASKS.md`](../../../../../docs/MLENVS_TASKS.md) for the full
-contract and [`examples/mle-tabular-classification/`](../../../../../examples/mle-tabular-classification/)
-for a complete working task.
+This scaffolds a v3 sealed-challenge continuous ML task. Authors declare a
+queryable predictor, private challenge bank, registered targets, and reviewed
+quality anchors through `grading.evaluation.ContinuousTask`.
 
-## Layout
+## Required authored surface
 
 ```text
-<task_id>/
-  metadata.json          # ml_task_type, required_resources, domain, license(+source), description
-  prompt.md              # agent-facing prompt (no anchors, no internals)
-  test_file.py           # no-arg compute_score() reading /tmp/output + /mcp_server/data
-  data/public/           # agent-visible  -> /data/
-  data/private/          # root-only truth -> /mcp_server/data/
-  reference_solution/    # solution.py (the expert reference; anchors 0.5)
-  baselines/naive/       # >=1 naive solution scoring clearly below the reference
-  data-generation/       # provenance for the data
+metadata.json
+prompt.md
+test_file.py
+data/public/
+data/private/
+data-generation/
+reference_solution/
+  train.py
+  solution.py
+  <trained model artifacts>
+  model.manifest.json
+baselines/naive/
+  train.py
+  solution.py
+  <trained model artifacts>
+  model.manifest.json
 ```
 
-## After scaffolding, fill in
+The reference and naive models, training/inference scripts, configs, dependency
+locks, and seeds are committed. Generated submissions and score logs are not.
+`data/private/challenge.parquet` contains private features and target truth.
 
-- **`metadata.json`**: set `ml_task_type` (`dataset` | `env` | `hybrid` |
-  `sim_policy`), the `required_resources` enum, `domain`, and the real `license`
-  + upstream `license_source`. Add `docker-base`, `dependencies`, `apt_extras`,
-  or `hf_resources` only if needed (see the docs).
-- **`prompt.md`**: the exact task prompt. Name installed tools/libraries
-  directly. Keep it agent-facing: do not reveal the scoring anchors or grader
-  internals, do not tell the agent to read the base image / `metadata.json` /
-  declared dependencies to find packages, and do not add your own accelerator or
-  tmux lines (the export appends those runtime notices automatically).
-- **`test_file.py`**: your no-arg `compute_score()`. Read submissions only
-  through `grading.helpers.*` loaders; calibrate with FLOOR/REF/PERFECT +
-  `PiecewiseLinearCurve`. Raise `AgentFault` only for agent-controlled failures.
-- **`data/public/`** and **`data/private/`**: the agent-visible files and the
-  root-only held-out truth.
-- **`reference_solution/solution.py`**: the expert reference (must score
-  `0.5 +/- 0.05`); **`baselines/naive/`**: a trivial solution scoring clearly
-  below it (the learnability gate).
+## Finalize the task
 
-## Iterate
+After filling the TODOs and training the committed models:
 
 ```bash
-# Run the reference solve/grade loop.
-uv run lbx-rl-tasks-harness reference --problem-dir problems/<task_id>
-
-# Prove ground truth before opening a PR.
-uv run lbx-rl-tasks-harness run --runtime ground-truth --problem-dir problems/<task_id>
+uv run lbx-rl-harness run \
+  --runtime ground-truth \
+  --problem-dir problems/<task_id>
 ```
 
-On a low-RAM dev host, `run` also accepts `--flavor slim` (or the default
-`--flavor auto`, which falls back to the slim base if the heavy build OOMs).
+For `task_type=ml`, this command:
+
+1. Validates committed model manifests.
+2. Runs reference and naive inference in isolated containers.
+3. Measures raw metrics against private truth.
+4. Generates and qualifies the three-anchor curve.
+5. Atomically writes ignored local calibration lock/evidence state.
+6. Replays no-op/reference/oracle score contracts.
+7. Produces local diagnostics for author feedback.
+
+Commit the trained models, manifests, and scripts—not generated calibration
+files. Trusted CI independently generates or restores the production lock and
+evidence bundle, verifies its digest, and mounts it read-only in Taiga. Do not
+edit measured anchors or copy results into `test_file.py`.
+Floor values are not measured from baselines: each is a reviewed semantic
+choice captured by `FloorAnchor` and `AnchorRationale`. Use exact versioned
+metric formulas rather than relying on ambiguous names such as “SRE” or “F1”.
+
+The scaffold uses the Tier-A `ContinuousTask.model()` adapter. For legacy
+`submission.csv` migration, read
+`docs/CONTINUOUS_EVALUATION.md`; never call `TASK.score(metrics)` from
+production.

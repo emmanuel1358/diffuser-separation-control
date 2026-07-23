@@ -1,0 +1,263 @@
+{
+  "alignerr_cli_version": "0.1.0",
+  "base_image_ref": "lbx-tasks-base-mlenvs-gpu:runtime-ml-core-py313-local",
+  "built_at": "2026-07-21T07:09:12.344819+00:00",
+  "duration_seconds": 4.507303124759346,
+  "ground_truth_result": {
+    "calibration": {
+      "cache_key": "1e9275745173886e930d9d1fddc853b0e78e9a8decb1a7cd3bd58488bf4e6a49",
+      "evaluation_plan_sha256": "46d3f3f36924dd559bb38c6ad224f8679cd4dc7f60edfaaf1a4c23151dcd82fd",
+      "evidence_path": ".alignerr/calibration.evidence.json",
+      "inputs": {
+        "base_image": "lbx-tasks-base-mlenvs-gpu:runtime-ml-core-py313-local",
+        "data_generation": "02a11439bf1f7870f490fb757ba19a137c97f211d002c3616dd1673132b75f30",
+        "dockerfile": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "environment": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "grader": "59c4603345c8419438e029659fbdcb98099e6d961561e9c83405e75bc8374e57",
+        "image": "sha256:cf0b09b082a81261e57a2fa31708dc6f6f27b7191d7bc63fc6a6cc35a1664f02",
+        "naive_strategy": "036cb9852f8e2c54e59b5f9f07dbfd3e5aa439f3eee38c9ff9d4eccc4973529e",
+        "private_data": "7edd545d4777ec9d21763cb59e30e939fd4bf5c7c6ffbaeacba59dea8fb91db1",
+        "public_data": "75e19cccb239738c2e44a3cb1727681737d12dc45f60c525f33cd19865e9e507",
+        "reference_strategy": "7f170e2e708572a69b9909cf6da896e18bba058fcceb5151f2e05ed23e3a6d78",
+        "task_config": "3c061b3319b3d1d9c5fd10e9e7312fa8f6fd62e2024fa76e82fcb0a06bc22b75",
+        "task_spec": "9c4d170f50f192421acbe0b1b8968676288cea1dfee70f8744c1f6d2a0c8bcd5"
+      },
+      "lock_path": "calibration.lock.json",
+      "lock_sha256": "a4064ec209069d3763480d83a04b3a37365988b9aed3820639db32bba507f745",
+      "naive_metrics": {
+        "label": 0.0,
+        "t1": 1.0272583603548098,
+        "t2": 0.9929290067655225
+      },
+      "qualification": {
+        "degenerate_scores": {
+          "constant-mean": 0.0,
+          "constant-median": 0.0,
+          "constant-negative": 0.0,
+          "constant-positive": 0.0,
+          "jittered-constant": 0.0,
+          "row-index": 0.0,
+          "shuffled-truth": 0.0
+        },
+        "naive_progress": 0.002474847632067112,
+        "naive_quality_progress": 0.002474847632067112,
+        "naive_score": 0.0013010968390804048,
+        "naive_score_range": {
+          "exclusive_min": 1e-06,
+          "inclusive_max": 0.1
+        },
+        "null_score": 0.0,
+        "oracle_score": 1.0,
+        "reference_score": 0.5
+      },
+      "reference_metrics": {
+        "label": 1.0,
+        "t1": 0.0403940857113124,
+        "t2": 0.09942865270958572
+      },
+      "schema_version": "3.0",
+      "task_spec_sha256": "9c4d170f50f192421acbe0b1b8968676288cea1dfee70f8744c1f6d2a0c8bcd5"
+    },
+    "details_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/mle-tabular-classification-problem-dir-1784617728/verifier/reward-details.json",
+    "graded_at": "2026-07-21T07:09:50.937017+00:00",
+    "metadata": {
+      "aggregate_progress": 0.9510620415526856,
+      "calibration_lock_sha256": "a4064ec209069d3763480d83a04b3a37365988b9aed3820639db32bba507f745",
+      "evaluation": {
+        "attested": false,
+        "challenge_count": 5997,
+        "decisions": {
+          "label": {
+            "accepted": true,
+            "reason": "information_certificate_passed"
+          },
+          "t1": {
+            "accepted": true,
+            "reason": "information_certificate_passed"
+          },
+          "t2": {
+            "accepted": true,
+            "reason": "information_certificate_passed"
+          }
+        },
+        "family_alpha": 0.01,
+        "plan_sha256": "46d3f3f36924dd559bb38c6ad224f8679cd4dc7f60edfaaf1a4c23151dcd82fd",
+        "protocol": "iid-permutation-holm.v1",
+        "schema_version": "continuous-evaluation-receipt.v1",
+        "seed_commitment": "672657a0266289a6b13b3392db0d71494ea90efa77c9c5f864ad332819cdbd4a"
+      },
+      "headline_score": 0.5,
+      "pre_grade_cleanup": {
+        "killed_processes": 0,
+        "removed_nonregular": 0,
+        "removed_symlinks": 0
+      },
+      "reported_final_score": 0.5,
+      "return_shape": "rubric_grade",
+      "rubric_breakdown": [
+        {
+          "actual": null,
+          "criterion": "t1_progress",
+          "criterion_id": "t1_progress",
+          "description": "t1_progress",
+          "expected": null,
+          "grading_type": "unknown",
+          "id": "t1_progress",
+          "label": "t1_progress",
+          "passed": true,
+          "reasoning": "",
+          "score": 0.9596059142886876,
+          "weight": 0.35
+        },
+        {
+          "actual": null,
+          "criterion": "t2_progress",
+          "criterion_id": "t2_progress",
+          "description": "t2_progress",
+          "expected": null,
+          "grading_type": "unknown",
+          "id": "t2_progress",
+          "label": "t2_progress",
+          "passed": true,
+          "reasoning": "",
+          "score": 0.9005713472904143,
+          "weight": 0.35
+        },
+        {
+          "actual": null,
+          "criterion": "label_progress",
+          "criterion_id": "label_progress",
+          "description": "label_progress",
+          "expected": null,
+          "grading_type": "unknown",
+          "id": "label_progress",
+          "label": "label_progress",
+          "passed": true,
+          "reasoning": "",
+          "score": 1.0,
+          "weight": 0.3
+        }
+      ],
+      "rubric_weights": {
+        "label_progress": 0.3,
+        "t1_progress": 0.35,
+        "t2_progress": 0.35
+      },
+      "scoring_mode": "weighted",
+      "security_tier": "sealed_challenge",
+      "serialized_grade": {
+        "penalties": null,
+        "score": 0.5,
+        "scoring_mode": "weighted",
+        "structured_subscores": [
+          {
+            "criterion_id": "t1_progress",
+            "description": "t1_progress",
+            "grading_criteria": "t1_progress",
+            "id": "t1_progress",
+            "label": "t1_progress",
+            "max_score": 1.0,
+            "name": "t1_progress",
+            "reasoning": "",
+            "score": 0.9596059142886876,
+            "weight": 0.35
+          },
+          {
+            "criterion_id": "t2_progress",
+            "description": "t2_progress",
+            "grading_criteria": "t2_progress",
+            "id": "t2_progress",
+            "label": "t2_progress",
+            "max_score": 1.0,
+            "name": "t2_progress",
+            "reasoning": "",
+            "score": 0.9005713472904143,
+            "weight": 0.35
+          },
+          {
+            "criterion_id": "label_progress",
+            "description": "label_progress",
+            "grading_criteria": "label_progress",
+            "id": "label_progress",
+            "label": "label_progress",
+            "max_score": 1.0,
+            "name": "label_progress",
+            "reasoning": "",
+            "score": 1.0,
+            "weight": 0.3
+          }
+        ],
+        "subscores": {
+          "label_progress": 1.0,
+          "t1_progress": 0.9596059142886876,
+          "t2_progress": 0.9005713472904143
+        },
+        "weights": {
+          "label_progress": 0.3,
+          "t1_progress": 0.35,
+          "t2_progress": 0.35
+        }
+      },
+      "task_spec_sha256": "9c4d170f50f192421acbe0b1b8968676288cea1dfee70f8744c1f6d2a0c8bcd5",
+      "weighted_subscore_total": 0.9510620415526856,
+      "weighted_total": 0.9510620415526856
+    },
+    "reward_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/mle-tabular-classification-problem-dir-1784617728/verifier/reward.json",
+    "run_dir": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/mle-tabular-classification-problem-dir-1784617728",
+    "runtime": "solution",
+    "score": 0.5,
+    "structured_subscores": [
+      {
+        "criterion_id": "t1_progress",
+        "description": "t1_progress",
+        "grading_criteria": "t1_progress",
+        "id": "t1_progress",
+        "label": "t1_progress",
+        "max_score": 1.0,
+        "name": "t1_progress",
+        "reasoning": "",
+        "score": 0.9596059142886876,
+        "weight": 0.35
+      },
+      {
+        "criterion_id": "t2_progress",
+        "description": "t2_progress",
+        "grading_criteria": "t2_progress",
+        "id": "t2_progress",
+        "label": "t2_progress",
+        "max_score": 1.0,
+        "name": "t2_progress",
+        "reasoning": "",
+        "score": 0.9005713472904143,
+        "weight": 0.35
+      },
+      {
+        "criterion_id": "label_progress",
+        "description": "label_progress",
+        "grading_criteria": "label_progress",
+        "id": "label_progress",
+        "label": "label_progress",
+        "max_score": 1.0,
+        "name": "label_progress",
+        "reasoning": "",
+        "score": 1.0,
+        "weight": 0.3
+      }
+    ],
+    "subscores": {
+      "label_progress": 1.0,
+      "t1_progress": 0.9596059142886876,
+      "t2_progress": 0.9005713472904143
+    },
+    "trivial_baseline_score": 0.0,
+    "weights": {
+      "label_progress": 0.3,
+      "t1_progress": 0.35,
+      "t2_progress": 0.35
+    }
+  },
+  "image_digest": "sha256:cf0b09b082a81261e57a2fa31708dc6f6f27b7191d7bc63fc6a6cc35a1664f02",
+  "platform": "linux/amd64",
+  "schema_version": "1.0",
+  "task_dir_sha256": "03abdf3f19932b127871652fd8db022aa9d1ea96c4bbacb4bfa1029177dd49b7"
+}

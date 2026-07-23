@@ -2,9 +2,10 @@
 
 Replace this with the instructions the agent should follow.
 
-The public data files are under `/data/`. Write predictions for every held-out
-row to `/tmp/output/submission.csv` with a header row and the columns your grader
-expects.
+The public training data is under `/data/`. Write `/tmp/output/predictor.py`
+defining `load_predictor()` and an object with `predict(rows)`. The grader
+commits the artifact and evaluates it on private challenge rows; document the
+required input fields and returned target lists here.
 
 Name any specific Python libraries or command-line tools the agent should use
 directly in these instructions.

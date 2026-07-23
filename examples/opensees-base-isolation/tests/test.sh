@@ -23,6 +23,7 @@ for f in \
   data/graded_case_sampling_policy.json \
   data/isolation_starter.json \
   scorer/compute_score.py \
+  scorer/evaluation.plan.json \
   scorer/data/hidden_cases.json \
   solution/solve.sh \
   solution/oracle_search.py \
@@ -113,10 +114,11 @@ PY
 
 ${PYTHON_BIN} - <<'PY'
 import importlib.util, json, os, pathlib, sys, tempfile
+from grading import AgentFault, GraderFault
 
 problem = pathlib.Path(os.environ["PROBLEM_DIR"])
 
-# compute_score imports only the stdlib at module scope -> safe to import on host.
+# The declarative scorer imports the shared grading package and stays host-loadable.
 spec = importlib.util.spec_from_file_location("compute_score", problem / "scorer" / "compute_score.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -129,8 +131,8 @@ assert abs(sum(weights.values()) - 1.0) < 1e-9, "normalized weights must sum to 
 # Agent-caused failures raise AgentFault (runtime keeps a clean 0.0), no solver needed.
 def expect_agent_fault(ws, msg):
     try:
-        module.compute_score(ws, private=problem / "scorer" / "data")
-    except module.AgentFault:
+        module.TASK.grade(workspace=ws, private=problem / "scorer" / "data")
+    except AgentFault:
         return
     raise AssertionError(msg)
 
@@ -140,8 +142,14 @@ with tempfile.TemporaryDirectory() as tmp:
     (ws / "isolation_design.json").write_text(
         json.dumps({"isolation_system": {"Qd_kip": 320.0, "Kd_kip_per_in": 20.0, "Dy_in": 0.6}})
     )
-    result = module.compute_score(ws, private=problem / "scorer" / "data")
-    assert "score" in result, "valid design should be scored directly without solver evidence"
+    try:
+        result = module.TASK.grade(workspace=ws, private=problem / "scorer" / "data")
+    except GraderFault as exc:
+        if "openseespy" not in str(exc).lower():
+            raise
+        print("skipping valid-design solver grade: OpenSeesPy unavailable on host")
+    else:
+        assert 0.0 <= result.score() <= 1.0, "valid design should be scored directly"
 
 # Design validation guards.
 assert module.validate_design({"isolation_system": {"Qd_kip": 320.0, "Kd_kip_per_in": 20.0, "Dy_in": 0.6}})["errors"] == []

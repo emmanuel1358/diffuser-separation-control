@@ -18,12 +18,28 @@ IGNORED_HASH_PARTS = {".git", ".alignerr", "__pycache__", ".taiga_submit.json"}
 # prose, NOTICE/LICENSE) never reaches the scorer or the built image, so editing
 # it must NOT stale the build proof (which would force a pointless full
 # rebuild+regrade that yields the identical score).
-GRADING_INPUT_DIRS = ("solution", "scorer", "data_generation", "environment")
+GRADING_INPUT_DIRS = (
+    "solution",
+    "scorer",
+    "data_generation",
+    "data-generation",
+    "baselines",
+    "environment",
+)
 GRADING_INPUT_FILES = ("task.toml",)
 
 # ML_Envs-mode grading-/image-affecting inputs (no task.toml / scorer/).
-MLENVS_GRADING_INPUT_DIRS = ("data", "reference_solution")
-MLENVS_GRADING_INPUT_FILES = ("metadata.json", "test_file.py")
+MLENVS_GRADING_INPUT_DIRS = (
+    "data",
+    "data-generation",
+    "reference_solution",
+    "baselines",
+)
+MLENVS_GRADING_INPUT_FILES = (
+    "metadata.json",
+    "test_file.py",
+    "calibration.lock.json",
+)
 
 
 def load_task_toml(problem_dir: Path) -> TaskToml:
@@ -104,8 +120,9 @@ def grading_inputs_sha256(problem_dir: Path) -> str:
     ``data_generation/`` / ``environment/``; docs and local state are excluded.
     ``environment/`` is in scope because ``verify_build_proof`` does not separately
     check ``image_digest``, so a Dockerfile edit must stale the proof. ML_Envs-mode
-    tasks scope to ``metadata.json`` + ``test_file.py`` + ``data/`` +
-    ``reference_solution/`` (see ``MLENVS_GRADING_INPUT_*``).
+    tasks scope to ``metadata.json`` + ``test_file.py`` +
+    ``calibration.lock.json`` + ``data/`` + ``data-generation/`` +
+    ``reference_solution/`` + ``baselines/`` (see ``MLENVS_GRADING_INPUT_*``).
     """
     from alignerr_plugin import mlenvs
 

@@ -33,6 +33,7 @@ from alignerr_plugin.schemas import (
     RunnerConfig,
     TaskToml,
 )
+from grading.evaluation.plan import canonical_plan_sha256
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -141,6 +142,7 @@ def _write_mlenvs_ml_task(
     (problem_dir / "prompt.md").write_text(prompt)
     (problem_dir / "test_file.py").write_text("def compute_score():\n    return 0.0\n")
     return problem_dir
+
 
 # ── Helpers ───────────────────────────────────────────────────────
 
@@ -336,7 +338,9 @@ def test_export_tpu_task_rejects_unsupported_resource_request(
         derive_taiga_resources(problem_dir)
 
 
-def test_export_accelerator_notice_appends_despite_authored_guidance(tmp_path: Path) -> None:
+def test_export_accelerator_notice_appends_despite_authored_guidance(
+    tmp_path: Path,
+) -> None:
     problem_dir = _write_mlenvs_ml_task(
         tmp_path / "mle-with-guidance",
         prompt="Use the GPU and keep long runs in tmux. Write /tmp/output/submission.csv.\n",
@@ -438,11 +442,12 @@ def test_export_preloaded_files_without_prompt_mount_notice(
     assert "mounted read-only" not in prompt
     assert "do not attempt to download or modify" not in prompt
     assert "preloaded_files" not in prompt
-    assert "/data" not in prompt
     assert "/mcp_server/data" not in prompt
 
 
-def test_export_cfd_solver_availability_as_enabled_taiga_hint(template_examples: Path) -> None:
+def test_export_cfd_solver_availability_as_enabled_taiga_hint(
+    template_examples: Path,
+) -> None:
     p = build_job_payload(
         template_examples / "openfoam-hydrofoil-flap",
         image_ref="gcr.io/example/img@sha256:abc",
@@ -472,6 +477,13 @@ def test_export_structures_solver_availability_as_enabled_taiga_hint(
         "enabled": True,
     }
     assert "hints" not in problem["extra_fields"]
+    assert problem["extra_fields"]["evaluation_plan"]["plan_sha256"]
+    assert problem["extra_fields"]["rubric_evaluation"] == {
+        "required": True,
+        "security_tier": "sealed_rescore",
+        "attestation_required": True,
+        "trace_required": True,
+    }
 
 
 @pytest.mark.parametrize(
@@ -570,6 +582,8 @@ def test_build_job_payload_default_shape(template_examples: Path) -> None:
     shim = problem["extra_fields"]["test_file"]
     assert "/runtime/grading/src" in shim
     assert "/mcp_server/grader/compute_score.py" in shim
+    assert "RubricTask" in shim
+    assert "_task.grade(" in shim
     assert 'sys.path.insert(0, "/mcp_server")' not in shim
     # The shim forwards the agent transcript (injected as a TRANSCRIPT global)
     # instead of the old hardcoded empty trajectory, so transcript-based
@@ -667,12 +681,169 @@ def test_build_job_payload_includes_redacted_ground_truth_evidence(
     assert "structured_subscores" not in flat_evidence
 
 
-def test_build_job_payload_omits_ground_truth_evidence_without_proof(tmp_path: Path) -> None:
+def test_build_job_payload_omits_ground_truth_evidence_without_proof(
+    tmp_path: Path,
+) -> None:
     problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-no-proof")
     p = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
 
     problem = p["problems_metadata"]["problem_set"]["problems"][0]
     assert "ground_truth_evidence" not in problem["extra_fields"]
+    assert problem["extra_fields"]["continuous_evaluation"]["required"] is True
+    assert "calibration" not in problem["extra_fields"]
+
+
+def test_trusted_export_rejects_continuous_task_without_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-missing-evidence")
+    monkeypatch.setenv("LBX_REQUIRE_TRUSTED_CONTINUOUS_EVALUATION", "1")
+
+    with pytest.raises(ValueError, match="requires trusted calibration"):
+        build_job_payload(
+            problem_dir,
+            image_ref="gcr.io/example/img@sha256:abc",
+        )
+
+
+def test_build_job_payload_includes_calibration_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-calibration")
+    trusted_dir = tmp_path / "trusted-calibration"
+    trusted_dir.mkdir()
+    lock = {
+        "schema_version": "3.0",
+        "policy": "continuous-pwl-v3",
+        "task_spec_sha256": "a" * 64,
+        "evaluation_plan_sha256": "b" * 64,
+        "evaluation_plan": {"security_tier": "sealed_rescore"},
+        "inputs": {},
+        "qualification": {},
+    }
+    lock_path = trusted_dir / "calibration.lock.json"
+    lock_path.write_text(json.dumps(lock, sort_keys=True) + "\n")
+    trusted_dir.joinpath("calibration.evidence.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "continuous-calibration-evidence.v1",
+                "cache_key": "c" * 64,
+                "lock_sha256": sha256_file(lock_path),
+                "task_spec_sha256": "a" * 64,
+                "evaluation_plan_sha256": "b" * 64,
+                "security_tier": "sealed_rescore",
+                "inputs": {},
+                "qualification": {},
+            }
+        )
+        + "\n"
+    )
+    monkeypatch.setenv("LBX_TRUSTED_CALIBRATION_DIR", str(trusted_dir))
+
+    payload = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
+    evidence = payload["problems_metadata"]["problem_set"]["problems"][0][
+        "extra_fields"
+    ]["calibration"]
+    continuous = payload["problems_metadata"]["problem_set"]["problems"][0][
+        "extra_fields"
+    ]["continuous_evaluation"]
+
+    assert evidence == {
+        "schema_version": 1,
+        "lock_sha256": sha256_file(lock_path),
+        "task_spec_sha256": "a" * 64,
+        "evaluation_plan_sha256": "b" * 64,
+        "security_tier": "sealed_rescore",
+        "policy": "continuous-pwl-v3",
+        "requires_trusted_mount": True,
+    }
+    assert continuous == {
+        "required": True,
+        "security_tier": "sealed_rescore",
+        "attestation_required": True,
+        "trace_required": True,
+    }
+
+    local_payload = build_job_payload(problem_dir, image_ref="LOCAL_IMAGE")
+    assert (
+        local_payload["problems_metadata"]["problem_set"]["problems"][0][
+            "extra_fields"
+        ]["calibration"]["requires_trusted_mount"]
+        is False
+    )
+    local_continuous = local_payload["problems_metadata"]["problem_set"]["problems"][0][
+        "extra_fields"
+    ]["continuous_evaluation"]
+    assert local_continuous["attestation_required"] is False
+    assert local_continuous["trace_required"] is False
+
+
+def test_build_job_payload_ignores_orphan_lock_for_non_continuous_task(
+    tmp_path: Path,
+) -> None:
+    problem_dir = _write_native_ml_task(tmp_path / "non-continuous-orphan-lock")
+    task_toml = problem_dir / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text().replace(
+            'reward_type = "continuous_scoring_function"',
+            'reward_type = "multi_deterministic_rubrics"',
+        )
+    )
+    problem_dir.joinpath("calibration.lock.json").write_text("{}\n")
+
+    payload = build_job_payload(
+        problem_dir,
+        image_ref="LOCAL_IMAGE",
+    )
+    extra_fields = payload["problems_metadata"]["problem_set"]["problems"][0][
+        "extra_fields"
+    ]
+
+    assert "calibration" not in extra_fields
+
+
+def test_build_job_payload_rejects_stale_lock_for_continuous_task(
+    tmp_path: Path,
+) -> None:
+    problem_dir = _write_native_ml_task(tmp_path / "continuous-stale-lock")
+    problem_dir.joinpath("calibration.lock.json").write_text("{}\n")
+
+    with pytest.raises(
+        ValueError, match="trusted continuous calibration evidence is missing or stale"
+    ):
+        build_job_payload(
+            problem_dir,
+            image_ref="gcr.io/example/img@sha256:abc",
+        )
+
+
+def test_build_job_payload_includes_native_evaluation_plan(tmp_path: Path) -> None:
+    problem_dir = _write_native_ml_task(tmp_path / "native-evaluation")
+    scorer = problem_dir / "scorer"
+    scorer.mkdir()
+    plan = {
+        "schema_version": "continuous-evaluation-plan.v1",
+        "security_tier": "sealed_challenge",
+    }
+    plan["plan_sha256"] = canonical_plan_sha256(plan)
+    plan_path = scorer / "evaluation.plan.json"
+    plan_path.write_text(json.dumps(plan, sort_keys=True) + "\n")
+
+    payload = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
+    evidence = payload["problems_metadata"]["problem_set"]["problems"][0][
+        "extra_fields"
+    ]["evaluation_plan"]
+
+    assert evidence == {
+        "schema_version": 1,
+        "path": "evaluation.plan.json",
+        "sha256": sha256_file(plan_path),
+        "plan_sha256": plan["plan_sha256"],
+        "security_tier": "sealed_challenge",
+        "requires_trusted_mount": True,
+    }
 
 
 def test_build_job_payload_uses_reward_type_for_continuous_ground_truth(

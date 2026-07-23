@@ -55,7 +55,9 @@ def test_resolve_reference_execution_explicit_and_auto() -> None:
     in_container = _problem(ground_truth=GroundTruthSpec(in_container=True))
     assert resolve_reference_execution(in_container) == "container"
 
-    gpu = _problem(metadata={"environment": {"required_resources": "12vcpu+100gib+h100/2"}})
+    gpu = _problem(
+        metadata={"environment": {"required_resources": "12vcpu+100gib+h100/2"}}
+    )
     assert resolve_reference_execution(gpu) == "container"
 
     ml = _problem(metadata={"difficulty": {"task_type": "ml"}})
@@ -126,14 +128,36 @@ def test_private_truth_task_host_upgrades_but_prove_unaffected(tmp_path: Path) -
 
 
 def test_resolve_reference_proof_mode() -> None:
-    assert resolve_reference_proof_mode(_problem(reference=ReferenceSpec(proof_mode="execute"))) == "execute"
-    assert resolve_reference_proof_mode(_problem(reference=ReferenceSpec(proof_mode="artifact"))) == "artifact"
-    assert resolve_reference_proof_mode(_problem(metadata={"difficulty": {"task_type": "ml"}})) == "execute"
-    assert resolve_reference_proof_mode(_problem(metadata={"difficulty": {"task_type": "mujoco"}})) == "artifact"
+    assert (
+        resolve_reference_proof_mode(
+            _problem(reference=ReferenceSpec(proof_mode="execute"))
+        )
+        == "execute"
+    )
+    assert (
+        resolve_reference_proof_mode(
+            _problem(reference=ReferenceSpec(proof_mode="artifact"))
+        )
+        == "artifact"
+    )
+    assert (
+        resolve_reference_proof_mode(
+            _problem(metadata={"difficulty": {"task_type": "ml"}})
+        )
+        == "execute"
+    )
+    assert (
+        resolve_reference_proof_mode(
+            _problem(metadata={"difficulty": {"task_type": "mujoco"}})
+        )
+        == "artifact"
+    )
 
 
 def test_reference_cache_and_entrypoint() -> None:
-    problem = _problem(reference=ReferenceSpec(cache_dir="custom/cache", entrypoint="train.sh"))
+    problem = _problem(
+        reference=ReferenceSpec(cache_dir="custom/cache", entrypoint="train.sh")
+    )
     assert reference_cache_path(problem) == "custom/cache"
     assert solution_script_rel(problem, solution_dir="solution") == "solution/train.sh"
 
@@ -156,7 +180,9 @@ def test_container_script_skips_env_server_on_skip_solve() -> None:
 def test_run_reference_harness_writes_manifest(monkeypatch, tmp_path: Path) -> None:
     problem_dir = tmp_path / "problem"
     (problem_dir / "solution").mkdir(parents=True)
-    (problem_dir / "solution" / "solve.sh").write_text("mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n")
+    (problem_dir / "solution" / "solve.sh").write_text(
+        "mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n"
+    )
 
     def fake_grade(_problem, _workspace, output_dir, _transcript):
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -183,7 +209,9 @@ def test_run_reference_harness_writes_manifest(monkeypatch, tmp_path: Path) -> N
     assert payload["mode"] == "iterate"
     assert payload["execution"] == "host"
     assert payload["score"] == 0.75
-    assert (problem_dir / ".alignerr" / "reference_cache" / "output" / "result.txt").exists()
+    assert (
+        problem_dir / ".alignerr" / "reference_cache" / "output" / "result.txt"
+    ).exists()
 
 
 def test_skip_solve_grades_cache(monkeypatch, tmp_path: Path) -> None:
@@ -209,7 +237,9 @@ def test_skip_solve_grades_cache(monkeypatch, tmp_path: Path) -> None:
         reference=ReferenceSpec(execution="host"),
     )
 
-    result = run_reference_harness(problem, run_dir_base=tmp_path / "runs", skip_solve=True)
+    result = run_reference_harness(
+        problem, run_dir_base=tmp_path / "runs", skip_solve=True
+    )
 
     assert result.score == 0.42
     assert (result.workspace / "result.txt").read_text() == "cached\n"
@@ -277,7 +307,9 @@ def test_effective_skip_solve_helpers(tmp_path: Path) -> None:
 def test_no_grade_leaves_score_unset(monkeypatch, tmp_path: Path) -> None:
     problem_dir = tmp_path / "problem"
     (problem_dir / "solution").mkdir(parents=True)
-    (problem_dir / "solution" / "solve.sh").write_text("mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n")
+    (problem_dir / "solution" / "solve.sh").write_text(
+        "mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n"
+    )
 
     monkeypatch.setattr(reference_module, "grade_workspace", lambda *_args: 0.99)
     problem = HarnessProblem(
@@ -289,10 +321,16 @@ def test_no_grade_leaves_score_unset(monkeypatch, tmp_path: Path) -> None:
         reference=ReferenceSpec(execution="host"),
     )
 
-    result = run_reference_harness(problem, run_dir_base=tmp_path / "runs", no_grade=True)
+    result = run_reference_harness(
+        problem, run_dir_base=tmp_path / "runs", no_grade=True
+    )
 
     assert result.score is None
-    manifest = json.loads((problem_dir / ".alignerr" / "reference_run" / "latest" / "manifest.json").read_text())
+    manifest = json.loads(
+        (
+            problem_dir / ".alignerr" / "reference_run" / "latest" / "manifest.json"
+        ).read_text()
+    )
     assert manifest["no_grade"] is True
     assert manifest["score"] is None
 
@@ -323,14 +361,18 @@ def test_container_solve_script_runs_env_server_as_root_then_solve_as_agent() ->
 
 
 def test_container_solve_command_can_disable_network_isolation() -> None:
-    cmd = _docker_solve_command("img:tag", Path("/src"), Path("/cache"), "echo hi", network_isolated=False)
+    cmd = _docker_solve_command(
+        "img:tag", Path("/src"), Path("/cache"), "echo hi", network_isolated=False
+    )
     assert "--network" not in cmd
 
 
 def test_container_grade_command_runs_root_with_host_scorer_mount(tmp_path) -> None:
     scorer_dir = tmp_path / "scorer"
     scorer_dir.mkdir()
-    cmd = _docker_grade_command("img:tag", Path("/cache"), scorer_dir, Path("/out"), "echo grade")
+    cmd = _docker_grade_command(
+        "img:tag", Path("/cache"), scorer_dir, Path("/out"), "echo grade"
+    )
     # Grade runs as root (no --user drop) so it can read the root-only truth...
     assert "--user" not in cmd
     # ...and with no network (like the solve phase and Taiga), so a grader or
@@ -350,9 +392,28 @@ def test_container_grade_command_skips_grader_mount_for_mlenvs(tmp_path) -> None
     # non-existent host path would shadow the baked grader with an empty dir, so
     # the grader mount must be omitted and the baked grader used.
     missing_scorer = tmp_path / "scorer"  # never created
-    cmd = _docker_grade_command("img:tag", Path("/cache"), missing_scorer, Path("/out"), "echo grade")
+    cmd = _docker_grade_command(
+        "img:tag", Path("/cache"), missing_scorer, Path("/out"), "echo grade"
+    )
     assert not any("/mcp_server/grader" in part for part in cmd)
     assert any(part == "/cache:/tmp/output" for part in cmd)
+
+
+def test_container_grade_command_mounts_generated_calibration_lock(tmp_path) -> None:
+    lock = tmp_path / "calibration.lock.json"
+    lock.write_text("{}\n")
+    cmd = _docker_grade_command(
+        "img:tag",
+        Path("/cache"),
+        tmp_path / "missing-scorer",
+        Path("/out"),
+        "echo grade",
+        calibration_lock=lock,
+    )
+    assert any(
+        part == f"{lock}:/mcp_server/calibration/calibration.lock.json:ro"
+        for part in cmd
+    )
 
 
 def test_run_streaming_tees_and_captures(capsys) -> None:
@@ -387,7 +448,9 @@ def test_collect_host_info_reports_hardware() -> None:
 def test_manifest_records_host_hardware(monkeypatch, tmp_path: Path) -> None:
     problem_dir = tmp_path / "problem"
     (problem_dir / "solution").mkdir(parents=True)
-    (problem_dir / "solution" / "solve.sh").write_text("mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n")
+    (problem_dir / "solution" / "solve.sh").write_text(
+        "mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n"
+    )
 
     monkeypatch.setattr(reference_module, "grade_workspace", lambda *_a: 1.0)
     problem = HarnessProblem(
@@ -400,19 +463,27 @@ def test_manifest_records_host_hardware(monkeypatch, tmp_path: Path) -> None:
     )
 
     run_reference_harness(problem, run_dir_base=tmp_path / "runs")
-    manifest = json.loads((problem_dir / ".alignerr" / "reference_run" / "latest" / "manifest.json").read_text())
+    manifest = json.loads(
+        (
+            problem_dir / ".alignerr" / "reference_run" / "latest" / "manifest.json"
+        ).read_text()
+    )
     assert "host" in manifest
     assert "platform" in manifest["host"]
     assert "gpus" in manifest["host"]
 
 
-def test_host_run_warns_and_marks_manifest_no_isolation(monkeypatch, capsys, tmp_path: Path) -> None:
+def test_host_run_warns_and_marks_manifest_no_isolation(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
     """A non-prove host run prints the no-isolation warning and the manifest
     records execution=host with an explicit no-isolation / not-Taiga-faithful /
     not-proof-authoritative marker (HAR-3)."""
     problem_dir = tmp_path / "problem"
     (problem_dir / "solution").mkdir(parents=True)
-    (problem_dir / "solution" / "solve.sh").write_text("mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n")
+    (problem_dir / "solution" / "solve.sh").write_text(
+        "mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n"
+    )
     monkeypatch.setattr(reference_module, "grade_workspace", lambda *_a: 1.0)
     problem = HarnessProblem(
         id="demo",
@@ -429,7 +500,11 @@ def test_host_run_warns_and_marks_manifest_no_isolation(monkeypatch, capsys, tmp
     assert "HOST path" in out
     assert "NOT Taiga-faithful" in out
 
-    manifest = json.loads((problem_dir / ".alignerr" / "reference_run" / "latest" / "manifest.json").read_text())
+    manifest = json.loads(
+        (
+            problem_dir / ".alignerr" / "reference_run" / "latest" / "manifest.json"
+        ).read_text()
+    )
     assert manifest["execution"] == "host"
     assert manifest["isolation"] == "none"
     assert manifest["taiga_faithful"] is False

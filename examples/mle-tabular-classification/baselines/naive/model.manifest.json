@@ -1,0 +1,17 @@
+{
+  "artifacts": [
+    {
+      "path": "model.json",
+      "sha256": "c08653710d8c0c7dc741f921bafaf80dfd271a60d2bf5e66f613f5fd73b2c4ae"
+    }
+  ],
+  "inference_entrypoint": "solution.py",
+  "public_training_data": {
+    "path": "../../data/public/train.parquet",
+    "sha256": "5ebe0fde4c63d16fe81d5c46a308ec69c864f36fb4fa5e50001d76641d64124d"
+  },
+  "role": "naive",
+  "schema_version": "1.0",
+  "seed": 20260417,
+  "training_entrypoint": "train.py"
+}

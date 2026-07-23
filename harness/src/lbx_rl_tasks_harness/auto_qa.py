@@ -488,6 +488,7 @@ def _task_bundle(problem_dir: Path) -> str:
         "task.toml",
         "metadata.json",
         "scorer/compute_score.py",
+        "scorer/evaluation.plan.json",
         "solution/solve.sh",
         "baselines/naive.sh",
         "README.md",
@@ -554,7 +555,9 @@ def _looks_secret(rel: Path) -> bool:
     return False
 
 
-def _normalize_autoqa(parsed: dict[str, Any], expected_checks: list[str]) -> dict[str, Any]:
+def _normalize_autoqa(
+    parsed: dict[str, Any], expected_checks: list[str]
+) -> dict[str, Any]:
     parsed["overall_assessment"] = _normalize_choice(
         parsed.get("overall_assessment"),
         {"pass", "needs_changes", "fail"},
@@ -601,7 +604,9 @@ def _normalize_string_list(value: Any) -> list[str]:
     return [str(item) for item in value if str(item).strip()]
 
 
-def _normalize_checks(raw_checks: Any, expected_checks: list[str]) -> list[dict[str, str]]:
+def _normalize_checks(
+    raw_checks: Any, expected_checks: list[str]
+) -> list[dict[str, str]]:
     return normalize_review_checks(
         raw_checks,
         expected_checks,

@@ -113,12 +113,15 @@ def _effective_timeouts(task_toml: TaskToml) -> tuple[int, int, int, int | None]
         timeouts.max_episode_sec,
     )
 
+
 # Default base tag. `base/build_and_push.sh` computes the drift-hashed tag and
 # the deploy/export sets LBX_RL_TASKS_BASE_IMAGE_TAG to it; this committed
 # literal is the fallback. Keep this a plain ``os.environ.get(..., "literal")``
 # assignment: the mothership sync workflow parses and re-pins it per repo, so the
 # format must not change.
-BASE_IMAGE_TAG = os.environ.get("LBX_RL_TASKS_BASE_IMAGE_TAG", "runtime-ml-core-py313-1b75cb075439")
+BASE_IMAGE_TAG = os.environ.get(
+    "LBX_RL_TASKS_BASE_IMAGE_TAG", "runtime-ml-core-py313-1b75cb075439"
+)
 # The cpu flavor can be pinned independently of the shared gpu/cpu tag; the
 # mothership sync re-pins this assignment per repo (same format contract as
 # BASE_IMAGE_TAG above).
@@ -126,17 +129,33 @@ CPU_BASE_IMAGE_TAG = os.environ.get("LBX_RL_TASKS_CPU_BASE_IMAGE_TAG", BASE_IMAG
 
 CPU_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base"
 GPU_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-gpu"
-GPU_OPENROAD_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-gpu-openroad"
-GPU_BLACKWELL_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-gpu-blackwell"
-CUDA_GRAPHICS_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-cuda-graphics"
+GPU_OPENROAD_BASE_IMAGE = (
+    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-gpu-openroad"
+)
+GPU_BLACKWELL_BASE_IMAGE = (
+    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-gpu-blackwell"
+)
+CUDA_GRAPHICS_BASE_IMAGE = (
+    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-cuda-graphics"
+)
 TPU_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-tpu"
 # mlenvs-specific registry images (not shared with the native flavors).
-MLENVS_SLIM_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-slim"
-MLENVS_GPU_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-gpu"
-MLENVS_CUDA_GRAPHICS_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-cuda-graphics"
-MLENVS_TPU_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-tpu"
+MLENVS_SLIM_BASE_IMAGE = (
+    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-slim"
+)
+MLENVS_GPU_BASE_IMAGE = (
+    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-gpu"
+)
+MLENVS_CUDA_GRAPHICS_BASE_IMAGE = (
+    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-cuda-graphics"
+)
+MLENVS_TPU_BASE_IMAGE = (
+    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-tpu"
+)
 # Blackwell overlays (local-only; not deployable on Taiga).
-MLENVS_GPU_BLACKWELL_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-gpu-blackwell"
+MLENVS_GPU_BLACKWELL_BASE_IMAGE = (
+    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-gpu-blackwell"
+)
 MLENVS_CUDA_GRAPHICS_BLACKWELL_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-cuda-graphics-blackwell"
 
 
@@ -144,16 +163,23 @@ def _tpu_base_image_tag() -> str:
     # tpu uses a distinct tag prefix (py3.12). Set via env at deploy
     # (build_and_push.sh publishes the drift-hashed tpu tag); the committed
     # fallback mirrors the cpu/gpu registry-style pin (not a "-local" dev tag).
-    return os.environ.get("LBX_RL_TASKS_TPU_BASE_IMAGE_TAG", "runtime-ml-tpu-py312-1b75cb075439")
+    return os.environ.get(
+        "LBX_RL_TASKS_TPU_BASE_IMAGE_TAG", "runtime-ml-tpu-py312-1b75cb075439"
+    )
 
 
 def _mlenvs_slim_base_image_tag() -> str:
-    return os.environ.get("LBX_RL_TASKS_MLENVS_SLIM_BASE_IMAGE_TAG", "runtime-mlenvs-slim-py312-1b75cb075439")
+    return os.environ.get(
+        "LBX_RL_TASKS_MLENVS_SLIM_BASE_IMAGE_TAG",
+        "runtime-mlenvs-slim-py312-1b75cb075439",
+    )
 
 
 def _mlenvs_base_image_tag() -> str:
     # mlenvs bases share a py3.12 tag prefix; the image suffix disambiguates.
-    return os.environ.get("LBX_RL_TASKS_MLENVS_BASE_IMAGE_TAG", "runtime-mlenvs-py312-1b75cb075439")
+    return os.environ.get(
+        "LBX_RL_TASKS_MLENVS_BASE_IMAGE_TAG", "runtime-mlenvs-py312-1b75cb075439"
+    )
 
 
 def _mlenvs_blackwell_base_image_tag() -> str:
@@ -223,7 +249,9 @@ def _derive_resources_from_toml(task_toml: TaskToml) -> dict[str, str]:
     env = task_toml.environment
     runner = task_toml.runner
     required = validate_required_resources(env.required_resources)
-    flavor = resolve_base_flavor_for_resource(getattr(env, "base_flavor", "auto"), required)
+    flavor = resolve_base_flavor_for_resource(
+        getattr(env, "base_flavor", "auto"), required
+    )
     base_image, base_tag = _base_image_and_tag(flavor)
 
     return {
@@ -299,8 +327,14 @@ def _task_classification_metadata(task_toml: TaskToml) -> dict[str, Any]:
 
 
 def _taiga_hints(task_toml: TaskToml) -> list[dict[str, Any]]:
-    solver_availability_hint = _task_type_hint(str(task_toml.difficulty.task_type)).strip()
-    hints = [{"message": solver_availability_hint, "enabled": True}] if solver_availability_hint else []
+    solver_availability_hint = _task_type_hint(
+        str(task_toml.difficulty.task_type)
+    ).strip()
+    hints = (
+        [{"message": solver_availability_hint, "enabled": True}]
+        if solver_availability_hint
+        else []
+    )
     hints.extend(
         {
             "message": hint.text,
@@ -332,6 +366,10 @@ def _problem_set_name(task_toml: TaskToml) -> str:
 
 
 _GROUND_TRUTH_PROOF_PATH = Path(".alignerr") / "build_proof.json"
+_CALIBRATION_EVIDENCE_PATH = Path(".alignerr") / "calibration.evidence.json"
+_TRUSTED_CALIBRATION_DIR_ENV = "LBX_TRUSTED_CALIBRATION_DIR"
+_REQUIRE_TRUSTED_CONTINUOUS_ENV = "LBX_REQUIRE_TRUSTED_CONTINUOUS_EVALUATION"
+_CALIBRATION_EVIDENCE_SCHEMA = "continuous-calibration-evidence.v1"
 _GROUND_TRUTH_ARTIFACT_FIELDS = (
     "path",
     "logical_path",
@@ -381,7 +419,9 @@ def _redacted_review_artifacts(raw_artifacts: Any) -> list[dict[str, Any]]:
     return artifacts
 
 
-def _ground_truth_evidence(problem_dir: Path, task_toml: TaskToml) -> dict[str, Any] | None:
+def _ground_truth_evidence(
+    problem_dir: Path, task_toml: TaskToml
+) -> dict[str, Any] | None:
     """Return a compact, non-secret ground-truth proof summary for Taiga."""
     proof_path = problem_dir / _GROUND_TRUTH_PROOF_PATH
     if not proof_path.exists():
@@ -432,6 +472,76 @@ def _ground_truth_evidence(problem_dir: Path, task_toml: TaskToml) -> dict[str, 
     return evidence
 
 
+def _calibration_evidence(problem_dir: Path) -> dict[str, Any] | None:
+    """Return a non-secret calibration identity for runtime verification."""
+    trusted_root = os.environ.get(_TRUSTED_CALIBRATION_DIR_ENV)
+    if trusted_root:
+        calibration_root = Path(trusted_root)
+        lock_path = calibration_root / "calibration.lock.json"
+        evidence_path = calibration_root / "calibration.evidence.json"
+        trusted = True
+    else:
+        lock_path = problem_dir / "calibration.lock.json"
+        evidence_path = problem_dir / _CALIBRATION_EVIDENCE_PATH
+        trusted = False
+    if not lock_path.is_file() or not evidence_path.is_file():
+        return None
+    try:
+        lock = json.loads(lock_path.read_text())
+        calibration = json.loads(evidence_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    lock_sha = sha256_file(lock_path)
+    if (
+        not isinstance(calibration, dict)
+        or calibration.get("schema_version") != _CALIBRATION_EVIDENCE_SCHEMA
+        or calibration.get("lock_sha256") != lock_sha
+        or calibration.get("task_spec_sha256") != lock.get("task_spec_sha256")
+        or calibration.get("evaluation_plan_sha256")
+        != lock.get("evaluation_plan_sha256")
+        or calibration.get("security_tier")
+        != (lock.get("evaluation_plan") or {}).get("security_tier")
+        or calibration.get("inputs") != lock.get("inputs")
+        or calibration.get("qualification") != lock.get("qualification")
+    ):
+        return None
+    return {
+        "schema_version": 1,
+        "lock_sha256": lock_sha,
+        "task_spec_sha256": lock.get("task_spec_sha256"),
+        "evaluation_plan_sha256": lock.get("evaluation_plan_sha256"),
+        "security_tier": (lock.get("evaluation_plan") or {}).get("security_tier"),
+        "policy": lock.get("policy"),
+        "_trusted": trusted,
+    }
+
+
+def _evaluation_plan_evidence(problem_dir: Path) -> dict[str, Any] | None:
+    """Return identity for native policy/custom sealed evaluation plans."""
+    from grading.evaluation.plan import validate_serialized_plan
+
+    path = problem_dir / "scorer" / "evaluation.plan.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        plan_sha = validate_serialized_plan(payload)
+    except ValueError:
+        return None
+    return {
+        "schema_version": 1,
+        "path": "evaluation.plan.json",
+        "sha256": sha256_file(path),
+        "plan_sha256": plan_sha,
+        "security_tier": payload.get("security_tier"),
+    }
+
+
 def test_file_shim() -> str:
     """Return the Boreal shim that invokes the image-baked task scorer."""
     return """import importlib.util
@@ -449,11 +559,23 @@ if _spec is None or _spec.loader is None:
     raise ImportError(f"cannot import {_grader_path}")
 _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
-_compute_score = _module.compute_score
-_takes_args = bool(inspect.signature(_compute_score).parameters)
+_task = getattr(_module, "TASK", None)
+_compute_score = getattr(_module, "compute_score", None)
+_takes_args = bool(inspect.signature(_compute_score).parameters) if callable(_compute_score) else False
 
 
 def compute_score():
+    # Declarative rubric tasks are invoked directly. Authors do not own a
+    # top-level exception/normalization boundary.
+    from grading.evaluation import RubricTask
+    if isinstance(_task, RubricTask):
+        return _task.grade(
+            workspace=pathlib.Path("/tmp/output"),
+            trajectory=globals().get("TRANSCRIPT") or [],
+            private=pathlib.Path("/mcp_server/data"),
+        )
+    if not callable(_compute_score):
+        raise RuntimeError("grader defines neither TASK=RubricTask(...) nor compute_score()")
     # ML_Envs-mode graders define a no-arg compute_score() that reads the baked
     # /tmp/output and /mcp_server/data paths directly; call it with no args.
     if not _takes_args:
@@ -525,8 +647,12 @@ def _build_problem_entry(
     # LOCAL-harness knob and is intentionally NOT forwarded to Taiga -- pinning a
     # GPU task to firecracker would ship it under the wrong sandbox. An explicit
     # override still wins.
-    container_runtime = (overrides or {}).get("container_runtime") or _taiga_container_runtime(required_resources)
-    enable_anthropic_api = (overrides or {}).get("enable_anthropic_api", runner.enable_anthropic_api)
+    container_runtime = (overrides or {}).get(
+        "container_runtime"
+    ) or _taiga_container_runtime(required_resources)
+    enable_anthropic_api = (overrides or {}).get(
+        "enable_anthropic_api", runner.enable_anthropic_api
+    )
     outputs = _taiga_outputs(task_toml)
     task_metadata = dict(task_toml.metadata) if task_toml.metadata else {}
     if outputs:
@@ -544,6 +670,80 @@ def _build_problem_entry(
     ground_truth_evidence = _ground_truth_evidence(problem_dir, task_toml)
     if ground_truth_evidence is not None:
         extra_fields["ground_truth_evidence"] = ground_truth_evidence
+    is_continuous = (
+        str(task_toml.difficulty.reward_type) == "continuous_scoring_function"
+    )
+    is_rubric = str(task_toml.difficulty.reward_type) == "multi_deterministic_rubrics"
+    calibration_evidence = _calibration_evidence(problem_dir) if is_continuous else None
+    calibration_is_trusted = bool(
+        calibration_evidence and calibration_evidence.pop("_trusted", False)
+    )
+    if (
+        is_continuous
+        and image_ref != "LOCAL_IMAGE"
+        and (
+            (
+                (problem_dir / "calibration.lock.json").is_file()
+                and calibration_evidence is None
+            )
+            or (calibration_evidence is not None and not calibration_is_trusted)
+            or (
+                os.environ.get(_TRUSTED_CALIBRATION_DIR_ENV)
+                and calibration_evidence is None
+            )
+        )
+    ):
+        raise ValueError(
+            "trusted continuous calibration evidence is missing or stale; trusted "
+            "CI must regenerate the lock/evidence bundle before export"
+        )
+    if calibration_evidence is not None:
+        # Local harness containers may use the baked author lock for faithful
+        # iteration. Submitted Taiga versions must overlay it with the
+        # trusted-CI promoted mount, which hides the image fallback marker.
+        calibration_evidence["requires_trusted_mount"] = image_ref != "LOCAL_IMAGE"
+        extra_fields["calibration"] = calibration_evidence
+    evaluation_plan_evidence = (
+        _evaluation_plan_evidence(problem_dir) if (is_continuous or is_rubric) else None
+    )
+    if (
+        is_continuous
+        and image_ref != "LOCAL_IMAGE"
+        and os.environ.get(_REQUIRE_TRUSTED_CONTINUOUS_ENV) == "1"
+        and calibration_evidence is None
+        and evaluation_plan_evidence is None
+    ):
+        raise ValueError(
+            "continuous Taiga export requires trusted calibration or evaluation "
+            "plan evidence"
+        )
+    if evaluation_plan_evidence is not None:
+        evaluation_plan_evidence["requires_trusted_mount"] = image_ref != "LOCAL_IMAGE"
+        extra_fields["evaluation_plan"] = evaluation_plan_evidence
+    if is_rubric and image_ref != "LOCAL_IMAGE" and evaluation_plan_evidence is None:
+        raise ValueError(
+            "declarative rubric Taiga export requires scorer/evaluation.plan.json"
+        )
+    if is_continuous:
+        security_tier = (calibration_evidence or {}).get("security_tier") or (
+            evaluation_plan_evidence or {}
+        ).get("security_tier")
+        extra_fields["continuous_evaluation"] = {
+            "required": True,
+            "security_tier": security_tier,
+            "attestation_required": image_ref != "LOCAL_IMAGE",
+            "trace_required": image_ref != "LOCAL_IMAGE"
+            and security_tier in {"sealed_challenge", "sealed_rescore"},
+        }
+    elif is_rubric:
+        security_tier = (evaluation_plan_evidence or {}).get("security_tier")
+        extra_fields["rubric_evaluation"] = {
+            "required": True,
+            "security_tier": security_tier,
+            "attestation_required": image_ref != "LOCAL_IMAGE",
+            "trace_required": image_ref != "LOCAL_IMAGE"
+            and security_tier in {"sealed_challenge", "sealed_rescore"},
+        }
 
     metadata = _task_classification_metadata(task_toml)
     metadata["base_image"] = {
@@ -636,7 +836,9 @@ def _job_level_fields(
         payload["max_timeout_seconds"] = max_episode_sec
 
     if runner.serialize_restore_test_interval:
-        payload["serialize_restore_test_interval"] = runner.serialize_restore_test_interval
+        payload["serialize_restore_test_interval"] = (
+            runner.serialize_restore_test_interval
+        )
     if runner.checkpoint_ttl:
         payload["checkpoint_ttl"] = runner.checkpoint_ttl
     if environment_id:
@@ -716,7 +918,8 @@ def build_batch_job_payload(
         pid = task_id(pd)
         if pid not in image_refs:
             raise ValueError(
-                f"image_refs missing entry for problem {pid!r}; supply " "the digest-pinned per-task image."
+                f"image_refs missing entry for problem {pid!r}; supply "
+                "the digest-pinned per-task image."
             )
         entries.append(
             _build_problem_entry(
@@ -744,7 +947,9 @@ def build_batch_job_payload(
             _max_required_resources([e["required_resources"] for e in entries]),
         )
     )
-    shared_runtime = (overrides or {}).get("container_runtime") or _taiga_container_runtime(shared_resources)
+    shared_runtime = (overrides or {}).get(
+        "container_runtime"
+    ) or _taiga_container_runtime(shared_resources)
 
     return {
         "name": f"rl_batch_{int(time.time())}",

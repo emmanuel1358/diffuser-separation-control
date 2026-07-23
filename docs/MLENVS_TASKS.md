@@ -12,12 +12,14 @@ Canonical example: [`examples/mle-tabular-classification/`](../examples/mle-tabu
 problems/<task_id>/
 ├── metadata.json          # minimal config (section 2)
 ├── prompt.md              # agent-facing prompt (no anchors, no internals)
-├── test_file.py           # no-arg compute_score() (section 3)
+├── test_file.py           # declarative grading.evaluation TASK (section 3)
+├── calibration.lock.json  # ignored local cache; CI generates production lock
+├── .alignerr/calibration.evidence.json # ignored local cache identity
 ├── data/
 │   ├── public/            # agent-visible  -> /data/
 │   └── private/           # root-only truth -> /mcp_server/data/
-├── reference_solution/    # solution.py + captured outputs + results.txt
-├── baselines/             # >=1 naive baseline whose output scores below the reference
+├── reference_solution/    # committed model + train.py + solution.py + manifest
+├── baselines/naive/       # weak committed model + reproducible recipe
 └── data-generation/       # provenance for the data
 ```
 
@@ -68,31 +70,54 @@ Optional keys (defaults shown):
 
 `docker-base` + the resource tier pick the ML_Envs-specific base flavor (`mlenvs-gpu` / `mlenvs-cuda-graphics` / `mlenvs-tpu`) — rebuilt on ML_Envs's H100-validated pins and **not shared** with the native verticals. A `+graphics` resource tier routes to `mlenvs-cuda-graphics`; a TPU tier requires `docker-base = "tpu"`.
 
-## 3. `test_file.py`
+## 3. `test_file.py` and generated calibration
 
-`compute_score()` takes **no arguments** and reads the baked runtime paths:
+New ML tasks use the sealed challenge API described in
+[`CONTINUOUS_EVALUATION.md`](CONTINUOUS_EVALUATION.md). The agent submits a
+queryable predictor and the grader selects private rows after commitment:
 
 ```python
-from pathlib import Path
+from grading.evaluation import (
+    AnchorRationale,
+    ContinuousTask,
+    FloorAnchor,
+    GeneratedCalibration,
+    PopulationSRETarget,
+    PrivateTableChallenge,
+    PythonPredictor,
+)
 
-from grading import calibration
-from grading.faults import AgentFault
-from grading.helpers import load_submission_or_fault
+TASK = ContinuousTask.model(
+    artifact=PythonPredictor("predictor.py"),
+    challenge=PrivateTableChallenge(
+        "challenge.parquet",
+        feature_columns=["feature_1", "feature_2"],
+        sample_size=256,
+    ),
+    targets=[
+        PopulationSRETarget.lower(
+            "pred",
+            truth_column="target",
+            weight=1.0,
+            floor=FloorAnchor(
+                value=1.0,
+                rationale=AnchorRationale(
+                    kind="theoretical",
+                    summary=(
+                        "A constant prediction at the population mean has "
+                        "population-standardized RMSE exactly one."
+                    ),
+                ),
+            ),
+            perfect=0.0,
+        )
+    ],
+    calibration=GeneratedCalibration("calibration.lock.json"),
+    naive="baselines/naive",
+)
 
-SUBMISSION_DIR = Path("/tmp/output")     # agent's submission
-PRIVATE_DATA = Path("/mcp_server/data")  # root-only held-out truth (data/private/)
-
-
-def compute_score() -> float:
-    truth = _load_truth(PRIVATE_DATA)                    # author data: propagate on failure
-    try:
-        sub = load_submission_or_fault(SUBMISSION_DIR / "submission.csv",
-                                       required_columns=["id", "pred"])
-    except AgentFault:
-        raise                                            # agent fault -> kept 0.0
-    rmse = _metric(sub, truth)
-    x = calibration.progress_lower_better(rmse, floor=1.0, perfect=0.0)
-    return calibration.PiecewiseLinearCurve.from_reference(X_REF).score(x)
+def compute_score():
+    return TASK.compute_score()
 ```
 
 Rules:
@@ -100,14 +125,40 @@ Rules:
 - **Return a float in `[0, 1]`** (a score dict with `score` + `subscores` is also accepted; the headline `score` is authoritative).
 - **Never raise for author/infra faults** — let them propagate so the runner discards the attempt (`env_internal_failure`). `raise AgentFault` only for agent-controlled failures (missing/malformed submission, wrong row count); those are kept as a clean 0.0.
 - **Read agent artifacts only through the sanctioned loaders** — `grading.helpers` (`load_submission_or_fault` CSV, `load_submission_npz_or_fault` .npz/.npy, `load_submission_h5_or_fault` HDF5, `run_submitted_executable`, `load_submitted_model`), `grading.policy_eval` (`run_seeds` / `aggregate`), `grading.env_loading` (`load_env_module`), `grading.kfold` (`score_kfold_cv`) — never by hand and never `exec`/`pickle` of agent code in the (root) grader. A bare `except OSError` does **not** stop a symlink to the held-out truth (which the agent can re-plant after the pre-grade scrub) — the read *succeeds* and scores the truth as the submission. Neither does an `lstat` + `S_ISREG` check: it is check-then-use on the path, and a uid-1000 process that survives a mid-grade `run_submitted_executable` / `run_policy` races it. If no loader fits, open the descriptor yourself with `os.open(path, os.O_RDONLY | os.O_NOFOLLOW)` (a symlink leaf fails atomically at open) and read *that* fd — never re-open the path.
-- **Calibrate with `FLOOR / REF / PERFECT` + `PiecewiseLinearCurve`** (`grading.calibration`). `ExponentialCurve` is deprecated and rejected. `FLOOR` = worst plausible raw metric (not a baseline's measured value); `REF` (the reference's metric) -> 0.5; `PERFECT` = the optimum.
+- **Run ground truth locally only when you need calibration feedback.** The
+  framework measures committed reference/naive models, writes an ignored
+  development lock/evidence bundle, and replays no-op/reference/oracle
+  contracts. Trusted CI independently generates or restores the production
+  bundle and mounts it read-only in Taiga. Do not edit or commit generated
+  calibration values.
+- **Floors are reviewed semantic choices, not baseline measurements.** Every
+  floor carries an `AnchorRationale`; baselines only prove weak genuine work
+  remains above floor and below reference.
+- **Metric names are not formulas.** Use exact versioned definitions such as
+  `sre.rmse_over_population_std.v1`; documentation and the generated lock expose
+  denominator, `ddof`, threshold, label, and averaging conventions.
+- **Never call `TASK.score(metrics)` from production.** It is calibration-only.
+  Legacy static tasks temporarily call `TASK.grade(submission, truth)`; follow
+  the version-by-version migration guide in `CONTINUOUS_EVALUATION.md`.
 
 The image bakes `test_file.py` as the grader; the no-arg signature and the `grading.*` helper import surface are handled by the grader runtime.
 
 ## 4. Reference + baselines (calibration gate)
 
-- `reference_solution/` — the reference (`solution.py` + its captured output + `results.txt`). It must score `0.5 ± 0.05`.
-- `baselines/<name>/` — naive solutions (constant / mean predictor, ...) whose committed outputs score clearly below the reference. This is the **learnability gate**: a constant guess must not match the expert.
+- `reference_solution/` — committed trained model, `train.py`, inference
+  `solution.py`, and `model.manifest.json`. It must score `0.5 ± 0.05`.
+- `baselines/naive/` — committed weak but input-dependent model plus the same
+  reproducibility surface. It must earn a small positive score below the
+  reference; constant/mean strategies remain null probes at zero.
+- Generated submissions and `results.txt` are not committed.
+
+Finalize in one command:
+
+```bash
+uv run lbx-rl-harness run \
+  --runtime ground-truth \
+  --problem-dir problems/<task_id>
+```
 
 ## 5. Licensing
 
@@ -160,9 +211,24 @@ Mechanics: `scripts/sync_mount.sh` resolves each repo's immutable commit sha (a 
 
 `pack_hf_resource.py` reads it from the env, so both paths work with no code change.
 
-## Data mounts (`dataset` tasks)
+## Public payloads and data mounts
 
-For `ml_task_type = "dataset"`, `sync_mount.sh` also packs `data/public` and `data/private` into content-addressed squashfs and mounts them read-only — `data/public -> /data` (agent-visible) and `data/private -> /mcp_server/data` (root-only, since `/mcp_server` is baked mode `0700`). This mirrors ML_Envs's `pack_squashfs.sh`. `env` / `hybrid` / `sim_policy` tasks bake their data instead. The task image also bakes the data so **local** harness runs work; at **deploy** the squashfs overrides that layer and dedups across task versions.
+For every `ml_task_type`, `sync_mount.sh` exposes `data/public -> /data` in
+Taiga's payload inventory. Public trees up to 256 files and 1 GiB are uploaded
+as explicit regular `preloaded_files`; when a tree is larger, regular files
+named verbatim in `prompt.md` are still exposed as payload-only copies under
+`/lbx-public-files`, while the complete canonical tree remains at `/data`. This
+lets Taiga Data Quality resolve logical filenames such as `column_mapping.json`
+instead of seeing only an opaque image or squashfs. Root-side setup re-owns
+both public locations and changes them to `0444`/`0555`, preserving the
+immutable public-data contract.
+
+For `ml_task_type = "dataset"`, a public tree too large for bounded expansion
+falls back to a content-addressed read-only squashfs, and `data/private` is
+always mounted read-only behind the baked `0700` `/mcp_server` boundary.
+`env`, `hybrid`, and `sim_policy` retain their baked data so environment startup
+semantics do not change; their explicit public entries are identical
+QA-visible overlays. The baked copy also keeps local harness runs working.
 
 ## References
 

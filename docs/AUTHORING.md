@@ -11,7 +11,9 @@ uv run lbx-rl-harness --help # confirm the local harness is installed
 
 The `uv sync` installs:
 
-- the shared `grading` library (your `compute_score.py` will `from grading import RubricBuilder`),
+- the shared `grading` library (continuous scorers use `compute_score`;
+  rubric tasks declare `TASK = RubricTask(...)` — see
+  [`docs/RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md)),
 - the `grader_runner` (provides `/runtime/run_grader.py` for Harbor),
 - the `alignerr_plugin` package with task validation/export helpers,
 - the `lbx-rl-template` CLI used by CI for local validation and Boreal/Taiga metadata export.
@@ -66,20 +68,25 @@ uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id
 ```
 
 The **reference** command is for day-to-day iteration (solve + grade, persistent
-cache, no build-proof refresh). **Ground-truth** is the PR gate: it updates
-`.alignerr/build_proof.json` with `ground_truth_result`.
+cache). **Ground-truth** is an optional local preflight that produces ignored
+development evidence. Trusted CI runs the authoritative PR gate.
 
 The ground-truth runtime checks the reference solution without calling an LLM.
-It creates or overwrites `problems/<task_id>/.alignerr/build_proof.json` and,
-for rendered tasks, `.alignerr/ground_truth/` reviewer artifacts. Commit those
-files before opening or updating a PR in your assigned fork. When the fork PR
-opens or updates, the template repo dispatches trusted CI in
+It creates or overwrites local generated evidence and, for rendered tasks,
+`.alignerr/ground_truth/` reviewer artifacts. Commit task source, reproducible
+reference/baseline assets, and reviewed render artifacts—not generated
+calibration locks or proofs. When the fork PR opens or updates, the template
+repo dispatches trusted CI in
 `lbx-rl-tasks-iso-mothership`, but the template PR stays the author-facing
 surface. The template workflow posts a handoff comment, and mothership posts the
 `trusted-ci/grade` check, dashboard link, diagnostics, and later Taiga/Boreal
 feedback comments back on the same fork PR. Authors and labelers do not need to
 open mothership to see pipeline status. See
 [`GROUND_TRUTH.md`](GROUND_TRUTH.md) for the oracle and reviewer video contract.
+
+Migrating an older task onto sealed continuous calibration, declarative
+`RubricTask`, or sealed `evaluation.plan.json`? Start with
+[`TASK_MIGRATION.md`](TASK_MIGRATION.md).
 
 For MuJoCo tasks, add the `run_qa`, `run_adversarial`, or
 `run_mujoco_adversarial` label when you want the non-blocking adversarial
@@ -174,13 +181,16 @@ Prometheus starter. Trusted CI still runs the same CFD/structures checks before
 delivery: solver-agnostic prompt checks, grader QA, solver-backed oracle
 validation, local agent score gates, Auto QA, and build-proof validation. Only
 the final delivery job changes from Taiga submission to the Prometheus Agent
-Service runner. The Prometheus result must include target reward metrics, and
-CFD/structures submissions fail if the Prometheus target average score is above
-`0.5` or target reward standard deviation is below `0.1` across the required
-attempts, or if the trajectory trainability auditor does not pass. The full
-`submit-prometheus` workflow must pass before an eval row is accepted or a
-non-eval row moves into review. Submitting a non-passing non-eval row for review
-violates fair practices and may remove the tasker from the project.
+Service runner. For Prometheus CFD/structures, `trusted-ci/grade` waits on Submit Prometheus and
+fails when the Prometheus target average is missing or above `0.5`. Standard
+deviation and the trainability audit are diagnostic context, not approval gates.
+Eval rows are accepted once trusted CI is green; Boreal QA is non-blocking for
+eval. Non-eval rows also need Boreal required QA complete with no unresolved
+critical findings before review (warnings/info are fine; Boreal average is not
+a blocker). Self-iterate on clear criticals for non-eval; submit for coaching
+when stuck, or for acceptance when gates pass, and name which Boreal surface is
+latest. Submitting a non-passing non-eval row for review violates fair practices
+and may remove the tasker from the project.
 
 Prometheus Harbor exports require agent/verifier user separation in
 ``task.toml``: ``[agent].user = "agent"`` (non-root uid 1000) and
@@ -226,10 +236,21 @@ Do not bake large datasets or model weights into the task image (bloat, no
 cross-task dedup, network + token at every build). They are mounted read-only at
 deploy time instead.
 
-For `ml` tasks the raw dataset is mounted **automatically**: trusted CI packs
-`data/` -> `/data` and `scorer/data/` -> `/mcp_server/data` into
-content-addressed squashfs and mounts them, so just commit those dirs as usual --
-nothing to declare.
+For every task type, trusted CI makes the conventional public `data/` tree
+visible in Taiga's payload inventory. Trees up to 256 files and 1 GiB are
+uploaded as explicit regular files; for larger trees, files named verbatim in
+`instruction.md` are still uploaded as payload-only copies under
+`/lbx-public-files` while the complete canonical tree remains at `/data`. This
+lets Taiga Data Quality resolve prompt references such as `/data/mesh.json` for
+ML, MuJoCo, CFD, structures, and future task types. Root-side setup restores
+immutable `0444`/`0555` permissions on both locations before the agent starts.
+
+For `ml` tasks the full raw dataset is also mounted **automatically** when
+needed: trusted CI packs `data/` -> `/data` and `scorer/data/` ->
+`/mcp_server/data` into content-addressed squashfs and mounts them, so just
+commit those dirs as usual -- nothing to declare. Other task types retain their
+baked public tree; the explicit payload files are an identical QA-visible
+overlay, not a build-input replacement.
 
 Declare `[[preloaded_files]]` only for *extra* mounts (Hugging Face weights or
 trees outside the conventional dirs):
@@ -414,7 +435,7 @@ cannot. Do not call LLM providers from `compute_score.py`.
 | --- | --- |
 | `float` in `[0, 1]` | ML_Envs-style continuous metric (RMSE/F1, anchor-mapped). Single number, no per-criterion breakdown. |
 | `dict {score, subscores, weights, metadata}` | Custom anchor-mapped headline + diagnostic per-target rows in Boreal UI. The headline is `dict["score"]`, NOT a recomputed weighted average. |
-| `RubricBuilder.grade().to_dict()` | Weighted deterministic criteria + optional penalties. The natural shape when "did this pass?" is decomposable into code-checkable checks. |
+| `TASK = RubricTask(...)` | Mandatory declarative protocol for `multi_deterministic_rubrics`; shared APIs own loading, faults, aggregation, and traces. |
 
 ### Bare float (simplest, ML_Envs migration)
 
@@ -456,29 +477,30 @@ original ML_Envs headline math and also expose diagnostic target
 progress values. This is still not a rubric: the subscores are
 continuous metrics, not pass/fail criteria.
 
-### RubricBuilder (typed deterministic criteria + penalties)
+### RubricTask (mandatory deterministic rubric protocol)
 
 ```python
-from pathlib import Path
-from grading import RubricBuilder, helpers   # baked into lbx-tasks-base
+from grading.evaluation import JsonArtifact, RubricCriterion, RubricTask
 
-def compute_score(workspace: Path, trajectory, private: Path):
-    rb = RubricBuilder(workspace=workspace, trajectory=trajectory, private=private)
+def evaluate(context):
+    return {"answer_present": bool(context.candidate)}
 
-    @rb.criterion(id="answer_present", weight=1.0,
-                  description="answer.txt exists and is non-empty")
-    def _():
-        return helpers.file_exists(workspace / "answer.txt", non_empty=True)
-
-    @rb.penalty(id="wrote_outside", value=-0.3)
-    def _():
-        return any((workspace / p).exists() for p in ["/etc/passwd"])
-
-    return rb.grade().to_dict()
+TASK = RubricTask(
+    artifact=JsonArtifact("answer.json"),
+    criteria=(
+        RubricCriterion(
+            "answer_present",
+            description="answer.json exists and is non-empty",
+            required=True,
+        ),
+    ),
+    evaluate=evaluate,
+)
 ```
 
-See [`examples/mujoco-pendulum`](../examples/mujoco-pendulum/) for a
-deterministic-only RubricBuilder.
+Do not define `compute_score()` for rubric tasks. See
+[`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md) and
+[`examples/mujoco-pendulum`](../examples/mujoco-pendulum/).
 
 Do not use LLM judges in `compute_score.py`. Rubrics must be deterministic:
 same submitted files, same hidden fixtures, same fixed seeds, same score.
@@ -517,7 +539,7 @@ Defaults are sensible — leave the section out and the exporter uses them.
 
 The full author guide is at [`docs/GRADING.md`](GRADING.md). Highlights:
 
-- API reference for `RubricBuilder`, `helpers`
+- API reference for `RubricTask` ([`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md)), `helpers`
 - Decision tree for picking a return shape
 - How `Grade.to_dict()` flows to Boreal UI and Harbor `reward.json`
 - Customer RL training flow (reading `reward.json` in your trainer)
@@ -531,12 +553,13 @@ on one task directory under `problems/<task_id>/`.
 ```bash
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
 git status --short
-git add problems/<task_id> problems/<task_id>/.alignerr/build_proof.json problems/<task_id>/.alignerr/ground_truth/
+git add problems/<task_id>
 ```
 
-Do not open the PR until the generated `build_proof.json` is committed. If
-you edit task files after generating the proof, rerun the ground-truth verifier
-so the proof hash matches the final task contents.
+You may open the PR without generated lock/proof files. Trusted CI checks out
+the immutable PR revision, restores or generates authoritative evidence, and
+uses that exact artifact for Taiga submission. Rerun local ground truth only
+when you want feedback before pushing.
 
 Trusted CI runs automatically on every fork PR open or update. The expensive
 agent harness, rubric QA, Auto QA, and `trusted-ci/grade` check all run in
@@ -549,7 +572,7 @@ ground-truth verifier, and push to the same fork PR. Each push reruns trusted CI
 
 ```bash
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
-git add problems/<task_id> problems/<task_id>/.alignerr/build_proof.json problems/<task_id>/.alignerr/ground_truth/
+git add problems/<task_id>
 git commit -m "Address review feedback"
 git push
 ```

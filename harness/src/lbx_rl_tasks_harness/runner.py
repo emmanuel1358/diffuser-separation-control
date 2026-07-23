@@ -13,6 +13,10 @@ from alignerr_plugin.utils import read_json, write_json
 from alignerr_plugin.validators.task.validator import TaskValidator
 
 from lbx_rl_tasks_harness.auto_qa import run_auto_qa_check
+from lbx_rl_tasks_harness.calibration import (
+    load_continuous_task,
+    run_ml_calibrated_ground_truth,
+)
 from lbx_rl_tasks_harness.grading import grade_workspace
 from lbx_rl_tasks_harness.ground_truth import (
     commit_render_outputs,
@@ -48,6 +52,27 @@ def _prepare_run_dir(base: Path, problem: HarnessProblem) -> Path:
     ).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
+
+
+def _ensure_rubric_evaluation_plan(problem: HarnessProblem) -> None:
+    """Refresh sealed evaluation.plan.json for declarative rubric tasks."""
+    source = problem.source_problem_dir
+    if source is None:
+        return
+    reward_type = str(
+        (problem.metadata.get("difficulty") or {}).get("reward_type") or ""
+    ).strip()
+    if reward_type != "multi_deterministic_rubrics":
+        return
+    from grading.evaluation.plan import refresh_evaluation_plan
+
+    result = refresh_evaluation_plan(source)
+    if result.status == "unavailable":
+        raise RuntimeError(
+            result.message or f"evaluation plan sync failed: {result.status}"
+        )
+    if result.wrote:
+        print(f"[harness] {result.message}")
 
 
 def _write_manifest(
@@ -182,6 +207,7 @@ def _update_build_proof_result(
     review_artifacts: list[dict[str, Any]] | None = None,
     result_key: str = "harness_result",
     trivial_baseline_score: float | None = None,
+    calibration: dict[str, Any] | None = None,
 ) -> None:
     if problem.source_problem_dir is None:
         return
@@ -196,6 +222,7 @@ def _update_build_proof_result(
         review_artifacts=review_artifacts,
         result_key=result_key,
         trivial_baseline_score=trivial_baseline_score,
+        calibration=calibration,
     )
 
 
@@ -314,6 +341,7 @@ def run_reference_harness(
     solution_dir: str = "solution",
 ) -> HarnessResult:
     """Author iteration loop: run reference solve/grade with optional cache."""
+    _ensure_rubric_evaluation_plan(problem)
     run_dir = _prepare_run_dir(run_dir_base, problem)
     workspace = run_dir / "workspace"
     verifier_dir = run_dir / "verifier"
@@ -356,7 +384,10 @@ def run_harness(
     model: str | None = None,
     max_steps: int | None = None,
     flavor: str = "auto",
+    calibration_check: bool = False,
 ) -> HarnessResult:
+    if runtime == "solution":
+        _ensure_rubric_evaluation_plan(problem)
     run_dir = _prepare_run_dir(run_dir_base, problem)
     workspace = run_dir / ("app" if problem.source_format == "harbor" else "workspace")
     verifier_dir = run_dir / (
@@ -374,30 +405,68 @@ def run_harness(
         if runtime == "solution"
         else []
     )
-    if runtime == "solution":
+    if calibration_check and runtime != "solution":
+        raise ValueError("calibration_check is only valid for ground-truth/solution")
+    if runtime == "solution" and not calibration_check:
         _ensure_current_build_proof(problem)
 
+    calibration_summary: dict[str, Any] | None = None
+    calibrated_trivial_score: float | None = None
     if runtime == "solution":
         render_required = render_expected(
             problem.metadata.get("difficulty", {}).get("task_type"),
             problem.ground_truth.render_outputs,
         )
-        ref_result = run_reference(
-            problem,
-            workspace,
-            verifier_dir,
-            transcript,
-            options=ReferenceRunOptions(
-                mode="prove",
-                render=render_required and bool(problem.ground_truth.render_command),
-                write_manifest=False,
-            ),
-            run_dir=run_dir,
-        )
-        if ref_result.score is None:
-            raise RuntimeError("ground-truth reference run did not produce a score")
-        score = ref_result.score
-        grade_payload = ref_result.grade_payload or {"score": score}
+        calibrated_task = load_continuous_task(problem)
+        if calibrated_task is not None:
+            calibrated = run_ml_calibrated_ground_truth(
+                problem,
+                run_dir=run_dir,
+                workspace=workspace,
+                verifier_dir=verifier_dir,
+                transcript_path=transcript,
+                check=calibration_check,
+            )
+            score = calibrated.score
+            grade_payload = calibrated.grade_payload
+            calibrated_trivial_score = calibrated.trivial_baseline_score
+            calibration_summary = {
+                "schema_version": calibrated.lock.payload["schema_version"],
+                "lock_path": str(
+                    calibrated.lock_path.relative_to(problem.source_problem_dir)
+                ),
+                "evidence_path": str(
+                    calibrated.evidence_path.relative_to(problem.source_problem_dir)
+                ),
+                "cache_key": calibrated.cache_key,
+                "lock_sha256": calibrated.lock.sha256,
+                "task_spec_sha256": calibrated.lock.payload["task_spec_sha256"],
+                "evaluation_plan_sha256": calibrated.lock.payload[
+                    "evaluation_plan_sha256"
+                ],
+                "inputs": calibrated.input_digests,
+                "reference_metrics": calibrated.reference_metrics,
+                "naive_metrics": calibrated.naive_metrics,
+                "qualification": calibrated.lock.payload["qualification"],
+            }
+        else:
+            ref_result = run_reference(
+                problem,
+                workspace,
+                verifier_dir,
+                transcript,
+                options=ReferenceRunOptions(
+                    mode="prove",
+                    render=render_required
+                    and bool(problem.ground_truth.render_command),
+                    write_manifest=False,
+                ),
+                run_dir=run_dir,
+            )
+            if ref_result.score is None:
+                raise RuntimeError("ground-truth reference run did not produce a score")
+            score = ref_result.score
+            grade_payload = ref_result.grade_payload or {"score": score}
         reward_path = verifier_dir / "reward.json"
         details_path = verifier_dir / "reward-details.json"
         if not reward_path.exists():
@@ -423,7 +492,12 @@ def run_harness(
         score = _score_from_mcp_grade(grade_payload)
         _write_reward_outputs(verifier_dir, grade_payload, score)
         _write_manifest(
-            run_dir, problem, runtime, score, model=manifest_model, flavor_requested=flavor
+            run_dir,
+            problem,
+            runtime,
+            score,
+            model=manifest_model,
+            flavor_requested=flavor,
         )
         rubric_quality = _run_rubric_quality_check(
             problem, grade_payload=grade_payload, model=rubric_model
@@ -465,11 +539,10 @@ def run_harness(
         # no-op-probed on the host, so grade an empty submission in the task
         # image here, enforce the anchor for continuous scoring functions, and
         # record the score in the build proof for the task validator.
-        trivial_baseline_score: float | None = None
-        if in_container_gt:
-            trivial_baseline_score = _grade_noop_baseline_in_container(
-                problem, run_dir
-            )
+        trivial_baseline_score = calibrated_trivial_score
+        if in_container_gt and trivial_baseline_score is None:
+            trivial_baseline_score = _grade_noop_baseline_in_container(problem, run_dir)
+        if trivial_baseline_score is not None:
             require_zero_anchored_noop(
                 trivial_baseline_score,
                 reward_type=str(difficulty.get("reward_type") or ""),
@@ -505,17 +578,19 @@ def run_harness(
             review_artifacts=review_artifacts,
             flavor_requested=flavor,
         )
-        _update_build_proof_result(
-            problem,
-            runtime=runtime,
-            grade_payload=grade_payload,
-            run_dir=run_dir,
-            reward_path=verifier_dir / "reward.json",
-            details_path=verifier_dir / "reward-details.json",
-            review_artifacts=review_artifacts,
-            result_key="ground_truth_result",
-            trivial_baseline_score=trivial_baseline_score,
-        )
+        if not calibration_check:
+            _update_build_proof_result(
+                problem,
+                runtime=runtime,
+                grade_payload=grade_payload,
+                run_dir=run_dir,
+                reward_path=verifier_dir / "reward.json",
+                details_path=verifier_dir / "reward-details.json",
+                review_artifacts=review_artifacts,
+                result_key="ground_truth_result",
+                trivial_baseline_score=trivial_baseline_score,
+                calibration=calibration_summary,
+            )
         return HarnessResult(
             problem_id=problem.id,
             source_format=problem.source_format,

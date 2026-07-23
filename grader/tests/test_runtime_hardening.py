@@ -9,13 +9,26 @@ from pathlib import Path
 from grading import runtime_hardening
 from grading.runtime_hardening import (
     _holds_nvidia_fd,
+    classify_failure,
     kill_nvproxy_fd_holders,
     prepare_grader_cache,
     lock_down_grader_private,
+    lock_down_public_readonly,
     pre_grade_cleanup,
     scrub_escaping_symlinks,
     scrub_nonregular_files,
 )
+
+
+def test_classify_failure_distinguishes_noninfra_and_signal_failures() -> None:
+    ordinary = classify_failure(1, "Traceback: OverflowError")
+    assert ordinary.is_infra is False
+
+    killed = classify_failure(137, "")
+    assert killed.is_infra is True
+
+    oom = classify_failure(1, "MemoryError: out of memory")
+    assert oom.is_infra is True
 
 
 def test_scrub_escaping_symlinks_removes_private_redirect(tmp_path: Path) -> None:
@@ -82,6 +95,24 @@ def test_lock_down_grader_private_removes_group_other_bits(tmp_path: Path) -> No
 
     assert stat.S_IMODE(private.stat().st_mode) & 0o077 == 0
     assert stat.S_IMODE(secret.stat().st_mode) & 0o077 == 0
+
+
+def test_lock_down_public_readonly_preserves_agent_reads(tmp_path: Path) -> None:
+    public = tmp_path / "data"
+    nested = public / "nested"
+    nested.mkdir(parents=True)
+    train = nested / "train.parquet"
+    train.write_bytes(b"data")
+    os.chmod(public, 0o777)
+    os.chmod(nested, 0o777)
+    os.chmod(train, 0o666)
+
+    changed = lock_down_public_readonly(public)
+
+    assert changed == 3
+    assert stat.S_IMODE(public.stat().st_mode) == 0o555
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o555
+    assert stat.S_IMODE(train.stat().st_mode) == 0o444
 
 
 def _make_proc_with_fd(root: Path, pid: int, targets: list[str]) -> None:

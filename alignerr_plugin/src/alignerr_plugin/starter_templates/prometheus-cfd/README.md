@@ -14,9 +14,10 @@ After creating a task, update:
 
 - `instruction.md` with the flow problem and the exact `/tmp/output/...` artifact.
 - `task.toml` with resources, timeouts, the `cfd` `domain`, and required outputs.
-- `scorer/compute_score.py` with task-specific hidden evaluation. Read the
-  agent submission through a guarded loader (`except OSError: raise AgentFault(...)`);
-  run the solver against held-out conditions and score deterministically.
+- `scorer/compute_score.py` with `TASK = RubricTask(...)` and pure hidden
+  evaluation. Declare `JsonArtifact`; run solvers through
+  `context.run_solver(...)`. Do not hand-write loaders or exception handling.
+- `scorer/evaluation.plan.json`: sealed plan refreshed from `TASK` by harness reference/ground-truth (commit; never hand-edit).
 - `data/` with public assets (case templates, schemas, probes).
 - `scorer/data/` with private hidden conditions / target specifications.
 - `solution/solve.sh` with the reference (oracle) design.
@@ -33,12 +34,12 @@ Notes:
 - Harbor/Prometheus runs the agent as uid 1000 (`[agent].user = "agent"`) and the
   verifier as root (`[verifier].user = "root"`) so private scorer data under
   `/mcp_server/data` stays out of the agent sandbox.
-- Do not submit the task for review until the full Prometheus workflow passes:
-  `submit-prometheus` must pass with average target score `<= 0.5`, target score
-  standard deviation `>= 0.1`, required attempts present, and a passing
-  trainability auditor score. Only then should a non-eval row move into review.
-  Submitting a non-passing row for review violates fair practices and may remove
-  the tasker from the project.
+- Review readiness: green `trusted-ci/grade` (Prometheus average `<= 0.5`
+  included), Boreal required QA complete on the LBx Validation comment or
+  dashboard, and no unresolved critical findings. Warnings/info are fine;
+  Boreal average is not a blocker. Self-iterate on clear criticals; submit for
+  coaching when stuck or acceptance when gates pass, and name which Boreal
+  surface is latest.
 - Submit a new, original problem. Problems already submitted to the original CFD
   or structures projects, or previously submitted to Boreal, must not be
   resubmitted to Prometheus. Those submissions will be rejected, count as

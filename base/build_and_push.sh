@@ -65,7 +65,7 @@ import sys
 sys.path.insert(0, 'alignerr_plugin/src')
 from alignerr_plugin.base_image import BASE_FLAVORS
 f = BASE_FLAVORS['$1']
-print(f.image_suffix, f.dockerfile, f.tag_prefix)
+print(f'{f.image_suffix}|{f.dockerfile}|{f.tag_prefix}')
 "
 }
 
@@ -77,13 +77,15 @@ from alignerr_plugin.base_image import BASE_FLAVORS
 f = BASE_FLAVORS['$1']
 if f.parent:
     p = BASE_FLAVORS[f.parent]
-    print(p.image_suffix, p.tag_prefix)
+    print(f'{p.image_suffix}|{p.tag_prefix}')
+else:
+    print('|')
 "
 }
 
 IFS=',' read -ra FLAVOR_LIST <<< "$FLAVORS"
 for flavor in "${FLAVOR_LIST[@]}"; do
-  read -r suffix dockerfile tag_prefix <<< "$(flavor_meta "$flavor")"
+  IFS='|' read -r suffix dockerfile tag_prefix <<< "$(flavor_meta "$flavor")"
   image="${REGISTRY}/lbx-tasks-base${suffix}"
   tag="${tag_prefix}-${DRIFT_HASH}"
   ref="${image}:${tag}"
@@ -94,7 +96,7 @@ for flavor in "${FLAVOR_LIST[@]}"; do
   # Parent-chained flavors FROM a sibling base via ARG BASE_IMAGE/BASE_TAG; pass
   # the parent flavor's suffix + tag_prefix. Flavors with no parent skip these.
   parent_build_args=()
-  read -r parent_suffix parent_tag_prefix <<< "$(parent_meta "$flavor")"
+  IFS='|' read -r parent_suffix parent_tag_prefix <<< "$(parent_meta "$flavor")"
   if [[ -n "${parent_suffix:-}" ]]; then
     parent_build_args=(
       --build-arg "BASE_IMAGE=${REGISTRY}/lbx-tasks-base${parent_suffix}"
@@ -102,15 +104,22 @@ for flavor in "${FLAVOR_LIST[@]}"; do
     )
   fi
 
-  docker buildx build \
-    --platform "$PLATFORM" \
-    --file "${REPO_ROOT}/${dockerfile}" \
-    --tag "$ref" \
-    "${parent_build_args[@]}" \
-    --label "lbx.base.flavor=${flavor}" \
-    --label "lbx.base.drift_hash=${DRIFT_HASH}" \
-    "$load_or_push" \
+  build_cmd=(
+    docker buildx build
+    --platform "$PLATFORM"
+    --file "${REPO_ROOT}/${dockerfile}"
+    --tag "$ref"
+  )
+  if [[ "${#parent_build_args[@]}" -gt 0 ]]; then
+    build_cmd+=("${parent_build_args[@]}")
+  fi
+  build_cmd+=(
+    --label "lbx.base.flavor=${flavor}"
+    --label "lbx.base.drift_hash=${DRIFT_HASH}"
+    "$load_or_push"
     "$REPO_ROOT"
+  )
+  "${build_cmd[@]}"
   echo ":: done ${ref}"
 done
 

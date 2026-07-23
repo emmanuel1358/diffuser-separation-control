@@ -27,7 +27,8 @@ At a high level, the workflow is:
 1. Write the task prompt in `instruction.md`.
 2. Put any public files the model may inspect in `data/`.
 3. Put hidden grading fixtures in `scorer/data/`.
-4. Write a deterministic grader in `scorer/compute_score.py`.
+4. Declare a deterministic `RubricTask` in `scorer/compute_score.py` and
+   let harness reference/ground-truth refresh sealed `scorer/evaluation.plan.json` from `TASK` (commit it; never hand-edit).
 5. Write an oracle solution in `solution/solve.sh`.
 6. Run the local harness to prove the oracle scores `1.0`.
 7. Run a model attempt, then use the PR Boreal report to confirm the task is
@@ -143,7 +144,9 @@ The main files are:
 - `environment/Dockerfile`: installs task dependencies and copies public/private
   files into the container.
 - `data/`: public files available to the model at `/data`.
-- `scorer/compute_score.py`: deterministic grading code.
+- `scorer/compute_score.py`: declarative criteria and pure domain evaluation;
+  `JsonArtifact`/`TrustedJson` own submission and fixture error handling.
+- `scorer/evaluation.plan.json`: hash-bound rubric protocol identity.
 - `scorer/data/`: private files available only to the grader.
 - `solution/solve.sh`: the oracle answer. It must produce a score of `1.0`.
 - `solution/render.sh`: optional reviewer artifact generation.
@@ -311,8 +314,8 @@ domain tags are: `seismic_retrofit`, `structural_mechanics`,
 `in_container = true` is important for OpenSees tasks because the scorer and
 oracle depend on packages installed in the task image (`openseespy`, `numpy`, and
 other solver dependencies). The local harness therefore runs the oracle solve and
-grader inside the built task image and commits the build proof from that
-environment.
+grader inside the built task image for feedback; trusted CI generates the
+authoritative build proof from the immutable PR revision.
 
 ### Grader and Reward
 
@@ -322,9 +325,9 @@ The deterministic scorer is:
 examples/opensees-base-isolation/scorer/compute_score.py
 ```
 
-It reads `isolation_design.json`, validates the design schema, runs deterministic
-solver-backed response-history analyses on the hidden records, and returns a
-score dictionary.
+`JsonArtifact` reads and validates `isolation_design.json`; `TrustedJson` loads
+the private records. Pure domain evaluation runs deterministic solver-backed
+response-history analyses and returns only declared criterion values.
 
 The reward is based on worst-case hidden-record performance for:
 
@@ -471,7 +474,9 @@ Before opening or updating a task PR, check:
 - Public files in `data/` contain everything the model needs, but not hidden
   answers.
 - Private fixtures live under `scorer/data/`.
-- `scorer/compute_score.py` is deterministic and returns a score in `[0, 1]`.
+- `scorer/compute_score.py` declares `TASK = RubricTask(...)`, contains no
+  author-owned `compute_score`, raw candidate reads, or failure payloads, and
+  has a matching `scorer/evaluation.plan.json`.
 - `solution/solve.sh` produces the required files and scores `1.0`.
 - Rendering works if `[ground_truth].render_outputs` is declared.
 - Local ground-truth validation passes:
@@ -502,7 +507,7 @@ uv run lbx-rl-harness run \
   treating the task as review-ready. Findings often appear 1.5-3 hours after the
   PR dispatch; if the section is still missing after about 3 hours, check the
   mothership `poll-taiga-runs.yml` workflow or re-run the poller.
-- `.alignerr/build_proof.json` is committed after the final task edits.
+- Trusted CI generates `.alignerr/build_proof.json` from the final PR revision.
 - `.alignerr/ground_truth/` artifacts are committed when the task declares them.
 - `.env.local`, `.harness-runs/`, API keys, and other secrets are not committed.
 

@@ -40,33 +40,29 @@ Required: `ml_task_type` (`dataset`|`env`|`hybrid`|`sim_policy`), `required_reso
 ## `test_file.py` (no-arg grader)
 
 ```python
-from pathlib import Path
-from grading import calibration
-from grading.faults import AgentFault
-from grading.helpers import load_submission_or_fault
+from grading.evaluation import ContinuousTask, PrivateTableChallenge, PythonPredictor
 
-SUBMISSION_DIR = Path("/tmp/output")
-PRIVATE_DATA = Path("/mcp_server/data")
+TASK = ContinuousTask.model(
+    artifact=PythonPredictor("predictor.py"),
+    challenge=PrivateTableChallenge(
+        "challenge.parquet", feature_columns=["x1", "x2"], sample_size=256
+    ),
+    targets=[...],
+)
 
-def compute_score() -> float:
-    truth = _load_truth(PRIVATE_DATA)                 # author data: propagate on failure (discard)
-    try:
-        sub = load_submission_or_fault(SUBMISSION_DIR / "submission.csv",
-                                       required_columns=["id", "pred"])
-    except AgentFault:
-        raise                                         # agent fault -> kept 0.0
-    x = calibration.progress_lower_better(_metric(sub, truth), floor=1.0, perfect=0.0)
-    return calibration.PiecewiseLinearCurve.from_reference(X_REF).score(x)
+def compute_score():
+    return TASK.compute_score()
 ```
 
-- **No arguments**; read `/tmp/output` + `/mcp_server/data` directly. Return a float in `[0,1]` (or a `{score, subscores}` dict).
+- Follow `docs/CONTINUOUS_EVALUATION.md`; new tasks use queryable Tier-A artifacts.
+- **No arguments** remains valid for metadata-mode graders.
 - `raise AgentFault` for agent faults (kept 0.0); let author/infra faults propagate (discarded). No broad `except: return 0.0`; no exec/pickle of agent artifacts in the grader.
 - Read agent output only via the sanctioned loaders (all flat): `grading.helpers` (`load_submission_or_fault` CSV, `run_submitted_executable`, `load_submission_h5_or_fault`, `load_submitted_model`), `grading.policy_eval` (`run_seeds`/`aggregate` for sim_policy), `grading.env_loading` (`load_env_module`), `grading.kfold` (`score_kfold_cv`); `env_server.policy_loader.load_submitted_policy` for env/hybrid.
-- Calibrate with `FLOOR/REF/PERFECT` + `PiecewiseLinearCurve` (`grading.calibration`). `ExponentialCurve` is deprecated/rejected. `FLOOR` = worst plausible raw metric (not a baseline's value); `REF` -> 0.5.
+- Use registered targets, reviewed `FloorAnchor`s, and generated lock schema v3. Never call `TASK.score(metrics)` from production.
 
 ## Paradigms (`ml_task_type`)
 
-- `dataset` — static held-out data; agent writes a submission file.
+- `dataset` — agent submits a queryable predictor evaluated on private challenge rows.
 - `sim_policy` — agent submits `policy.py`, graded over held-out seeds (`grading.policy_eval.run_seeds` + `aggregate`, `failed_fill` = each key's FLOOR).
 - `env`/`hybrid` — hidden env over `/tmp/env.sock`; ship `data/private/env.py` (`make_env`) + public `data/public/env_client.py`. If the env is built on a pip simulator, put it in `env_dependencies` (NOT `dependencies`) so it installs root-only at `/mcp_server/env_deps` and the agent can't `import` it to bypass the RPC. See `hidden-env-tasks` skill / `docs/HIDDEN_ENV.md`.
 

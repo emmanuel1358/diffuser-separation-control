@@ -21,10 +21,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+import re
+import stat
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 PRELOADED_MANIFEST_PATH = Path(".alignerr") / "preloaded_files.json"
+RESERVED_TRUSTED_MOUNT_PATHS = frozenset({"/mcp_server/calibration"})
+QA_VISIBLE_PUBLIC_MAX_FILES = 256
+QA_VISIBLE_PUBLIC_MAX_BYTES = 1024 * 1024 * 1024
+_PROMPT_FILE_LEFT_BOUNDARY = r"A-Za-z0-9_.-"
+_PROMPT_FILE_RIGHT_CONTINUATION = r"(?:[A-Za-z0-9_/-]|\.[A-Za-z0-9_])"
 
 
 def content_address(path: Path) -> str:
@@ -55,6 +62,103 @@ def remote_squashfs_name(task_id: str, entry_name: str, address: str) -> str:
     return f"{task_id}/{entry_name}-{address}.squashfs"
 
 
+def _prompt_mentions_file(prompt: str, aliases: tuple[str, ...]) -> bool:
+    """Match a file alias as a path token, never inside a longer filename."""
+    return any(
+        re.search(
+            rf"(?<![{_PROMPT_FILE_LEFT_BOUNDARY}])"
+            rf"{re.escape(alias)}"
+            rf"(?!{_PROMPT_FILE_RIGHT_CONTINUATION})",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        is not None
+        for alias in aliases
+    )
+
+
+def qa_visible_public_file_selection(
+    source: Path,
+    mount_path: str,
+    *,
+    prompt_text: str = "",
+) -> tuple[list[tuple[str, str]] | None, bool]:
+    """Select explicit Taiga payload files and report if they cover the tree.
+
+    Taiga Data Quality can inspect regular ``preloaded_files`` entries but sees a
+    squashfs mount as one opaque payload file. Small regular trees are expanded
+    in full. For a large or mixed tree, regular files named verbatim in the
+    prompt are still expanded so QA can resolve the task's public-file contract.
+    The boolean is true only when the selected files replace the complete tree;
+    callers must retain the canonical baked/squashfs tree for partial selections.
+    """
+    source = Path(source)
+    if not source.is_dir():
+        return None, False
+    root = PurePosixPath(mount_path)
+    files: list[tuple[str, str, int]] = []
+    total_bytes = 0
+    has_nonregular = False
+    for path in sorted(source.rglob("*")):
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode) or path.name == ".gitkeep":
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            has_nonregular = True
+            continue
+        relative = path.relative_to(source).as_posix()
+        total_bytes += int(info.st_size)
+        files.append((relative, str(root / relative), int(info.st_size)))
+
+    if not files:
+        return None, False
+    if (
+        not has_nonregular
+        and len(files) <= QA_VISIBLE_PUBLIC_MAX_FILES
+        and total_bytes <= QA_VISIBLE_PUBLIC_MAX_BYTES
+    ):
+        return (
+            [(relative, local_path) for relative, local_path, _size in files],
+            True,
+        )
+
+    referenced = [
+        (relative, local_path, size)
+        for relative, local_path, size in files
+        if prompt_text
+        and _prompt_mentions_file(
+            prompt_text,
+            (relative, PurePosixPath(relative).name, local_path),
+        )
+    ]
+    if (
+        not referenced
+        or len(referenced) > QA_VISIBLE_PUBLIC_MAX_FILES
+        or sum(size for _relative, _local_path, size in referenced)
+        > QA_VISIBLE_PUBLIC_MAX_BYTES
+    ):
+        return None, False
+    return (
+        [(relative, local_path) for relative, local_path, _size in referenced],
+        False,
+    )
+
+
+def qa_visible_public_files(
+    source: Path,
+    mount_path: str,
+    *,
+    prompt_text: str = "",
+) -> list[tuple[str, str]] | None:
+    """Return the bounded QA-visible file list without completeness metadata."""
+    files, _complete = qa_visible_public_file_selection(
+        source,
+        mount_path,
+        prompt_text=prompt_text,
+    )
+    return files
+
+
 # Conventional dataset dirs auto-mounted (read-only) by trusted CI for known
 # task types, so the raw dataset is mounted at deploy time instead of baked into
 # the per-task image. Each entry is (source-relative-to-problem-dir, mount_path).
@@ -76,7 +180,9 @@ def _tree_has_content(path: Path) -> bool:
     return any(p.is_file() and p.name != ".gitkeep" for p in path.rglob("*"))
 
 
-def auto_mount_entries(problem_dir: Path, task_type: str, *, hidden_env: str = "") -> list[tuple[str, str]]:
+def auto_mount_entries(
+    problem_dir: Path, task_type: str, *, hidden_env: str = ""
+) -> list[tuple[str, str]]:
     """Implicit conventional mounts for a task type (e.g. ``ml``).
 
     Returns ``[(source_rel, mount_path), ...]`` for each conventional dataset dir
@@ -108,13 +214,44 @@ def auto_mount_entries(problem_dir: Path, task_type: str, *, hidden_env: str = "
     ]
 
 
-def manifest_entry(remote_path: str, local_path: str, *, read_only: bool = True) -> dict[str, Any]:
+def manifest_entry(
+    remote_path: str, local_path: str, *, read_only: bool = True
+) -> dict[str, Any]:
     """One Boreal/Taiga ``preloaded_files`` entry."""
     return {
         "remote_path": remote_path,
         "local_path": local_path,
         "is_read_only": bool(read_only),
     }
+
+
+def merge_manifest_entries(
+    existing: list[dict[str, Any]],
+    additions: list[dict[str, Any]],
+    *,
+    trusted: bool = False,
+) -> list[dict[str, Any]]:
+    """Merge mounts by local path, protecting framework-owned destinations."""
+
+    merged = {
+        str(entry.get("local_path")): dict(entry)
+        for entry in existing
+        if isinstance(entry, dict) and entry.get("local_path")
+    }
+    for entry in additions:
+        local_path = str(entry.get("local_path") or "")
+        if not local_path:
+            raise ValueError("preloaded entry local_path must be non-empty")
+        if local_path in RESERVED_TRUSTED_MOUNT_PATHS and not trusted:
+            raise ValueError(
+                f"preloaded mount path {local_path!r} is reserved for trusted CI"
+            )
+        if local_path in RESERVED_TRUSTED_MOUNT_PATHS and not bool(
+            entry.get("is_read_only", True)
+        ):
+            raise ValueError(f"trusted mount {local_path!r} must be read-only")
+        merged[local_path] = dict(entry)
+    return [merged[path] for path in sorted(merged)]
 
 
 def load_preloaded_manifest(problem_dir: Path) -> list[dict[str, Any]]:
@@ -133,7 +270,9 @@ def load_preloaded_manifest(problem_dir: Path) -> list[dict[str, Any]]:
 
 def render_preloaded_notice(manifest: list[dict[str, Any]]) -> str:
     """QA-only NOTICE.md text for source archives that omit mounted payloads."""
-    mounts = [str(entry.get("local_path")) for entry in manifest if entry.get("local_path")]
+    mounts = [
+        str(entry.get("local_path")) for entry in manifest if entry.get("local_path")
+    ]
     if not mounts:
         return ""
     lines = [
@@ -156,7 +295,8 @@ def render_preloaded_notice(manifest: list[dict[str, Any]]) -> str:
     lines.extend(
         [
             "",
-            "The full mount metadata remains on the problem entry under " "`preloaded_files`.",
+            "The full mount metadata remains on the problem entry under "
+            "`preloaded_files`.",
         ]
     )
     return "\n".join(lines) + "\n"

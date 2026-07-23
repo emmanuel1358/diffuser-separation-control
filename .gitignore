@@ -5,13 +5,21 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 
-# Keep submitted build proofs, but ignore local build byproducts.
+# Problem calibration evidence is local scratch state. Trusted CI regenerates
+# and promotes the authoritative lock/evidence bundle for Taiga.
+problems/**/calibration.lock.json
+
+# Ignore local build byproducts. Existing tracked proofs remain reviewable, but
+# new continuous tasks do not need to commit generated calibration evidence.
 problems/**/.alignerr/*
 !problems/**/.alignerr/
-!problems/**/.alignerr/build_proof.json
 !problems/**/.alignerr/ground_truth/
 !problems/**/.alignerr/ground_truth/**
 examples/**/.alignerr/
+!examples/mle-tabular-classification/.alignerr/
+examples/mle-tabular-classification/.alignerr/*
+!examples/mle-tabular-classification/.alignerr/build_proof.json
+!examples/mle-tabular-classification/.alignerr/calibration.evidence.json
 !examples/mujoco-pendulum/.alignerr/
 examples/mujoco-pendulum/.alignerr/*
 !examples/mujoco-pendulum/.alignerr/build_proof.json

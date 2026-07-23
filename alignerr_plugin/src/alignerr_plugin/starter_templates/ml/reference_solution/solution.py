@@ -1,8 +1,8 @@
-"""Reference solution: train on the public data and write a submission.
+"""Reference solution: package a trained queryable predictor.
 
 The expert reference whose metric anchors the 0.5 score (REF in test_file.py).
-It must run inside the task image and produce /tmp/output/submission.csv. Keep it
-a strong, domain-aware solution, not a shortcut that games the scorer. Iterate:
+It must produce /tmp/output/predictor.py plus any sibling model artifacts. Keep
+it a strong, domain-aware solution, not a shortcut that games the scorer.
 
     uv run lbx-rl-tasks-harness reference --problem-dir problems/<task_id>
 """
@@ -17,8 +17,8 @@ OUTPUT = Path("/tmp/output")
 
 def main() -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    # TODO: load PUBLIC_DATA, train, and write predictions for every held-out row
-    # to OUTPUT / "submission.csv" with the columns your grader requires.
+    # TODO: package your committed model and write predictor.py implementing
+    # load_predictor() -> object with predict(rows) -> target-column lists.
     raise NotImplementedError("fill in the reference solution")
 
 

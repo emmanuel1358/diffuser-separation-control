@@ -2,6 +2,13 @@
 
 ML_Envs mode reproduces the ML_Envs authoring contract almost 1:1, so porting a task from an ML_Envs repo is mostly a copy. See [`MLENVS_TASKS.md`](MLENVS_TASKS.md) for the full contract.
 
+Continuous graders must then migrate to the v3 evaluation API using
+[`CONTINUOUS_EVALUATION.md`](CONTINUOUS_EVALUATION.md). In particular, replace
+production `TASK.score(metrics)` with `TASK.grade(...)`, regenerate lock schema
+v3, and prefer a queryable `ContinuousTask.model()` challenge over a fixed
+prediction file. The umbrella migration checklist is
+[`TASK_MIGRATION.md`](TASK_MIGRATION.md).
+
 ## File mapping
 
 Drop the `_taiga` directory suffix: ML_Envs tasks live in `tasks/<name>_taiga/`, but here they are plain `problems/<name>/` directories. (A `_taiga` suffix is stripped from the task name if you leave it on, so a straight copy still deploys with a clean name — but prefer the plain directory.)

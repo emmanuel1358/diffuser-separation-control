@@ -1,0 +1,415 @@
+{
+  "alignerr_cli_version": "0.1.0",
+  "base_image_ref": "lbx-tasks-base:runtime-ml-core-py313-local",
+  "built_at": "2026-07-22T03:46:05.722695+00:00",
+  "duration_seconds": 0.8024744591675699,
+  "ground_truth_result": {
+    "details_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1784691961/verifier/reward-details.json",
+    "graded_at": "2026-07-22T03:46:30.973204+00:00",
+    "metadata": {
+      "evaluation": {
+        "attested": false,
+        "decisions": {
+          "base_shear_control": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          },
+          "floor_acceleration_control": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          },
+          "interstory_drift_control": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          },
+          "isolator_displacement_control": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          },
+          "residual_displacement_control": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          }
+        },
+        "plan_sha256": "0c729ba3c75d3eaac834d6c990cfd0d202862835b15338b21f0e9f73eee809ed",
+        "protocol": "declarative-rubric.v1",
+        "schema_version": "rubric-evaluation-receipt.v1",
+        "seed_commitment": "f675e751a438a2e07464e4e727048a5c98970e4b60eeb8e067e8d989421dbb1c",
+        "task_spec_sha256": "94e80e0095ad83e5dae08e968b03a8b44cfe78acd45a1707ff473ced13166c95"
+      },
+      "final_score_exponent": 3.8,
+      "headline_score": 1.0,
+      "metric_ratios": {
+        "peak_base_shear_coeff": 0.9982135210554436,
+        "peak_floor_acceleration_g": 0.9350320438530586,
+        "peak_interstory_drift_ratio": 0.9973695128452281,
+        "peak_isolator_disp_in": 0.9986647307087141,
+        "residual_isolator_disp_in": 0.9800723407456035
+      },
+      "moat_capacity_in": 45.0,
+      "moat_gate": 1.0,
+      "model_version": "2026-06-22.isolation-rha-v2",
+      "per_case": [
+        {
+          "analyze_return_code": 0,
+          "case_id": "h1_dbe_short",
+          "completed_steps": 2400,
+          "converged": true,
+          "peak_base_shear_coeff": 0.20676894439443325,
+          "peak_floor_acceleration_g": 0.6732230715742021,
+          "peak_interstory_drift_ratio": 0.007075379905641273,
+          "peak_isolator_disp_in": 13.988757818962558,
+          "phase_seed": 401,
+          "residual_isolator_disp_in": 5.6109494310636565,
+          "total_steps": 2400
+        },
+        {
+          "analyze_return_code": 0,
+          "case_id": "h2_strong_mid",
+          "completed_steps": 2600,
+          "converged": true,
+          "peak_base_shear_coeff": 0.19043252055175294,
+          "peak_floor_acceleration_g": 0.5364202388330698,
+          "peak_interstory_drift_ratio": 0.005492539162379802,
+          "peak_isolator_disp_in": 10.944242466463045,
+          "phase_seed": 503,
+          "residual_isolator_disp_in": 3.4993901682334068,
+          "total_steps": 2600
+        },
+        {
+          "analyze_return_code": 0,
+          "case_id": "h3_strong_midlong",
+          "completed_steps": 2600,
+          "converged": true,
+          "peak_base_shear_coeff": 0.2982812779875325,
+          "peak_floor_acceleration_g": 0.5635757455919631,
+          "peak_interstory_drift_ratio": 0.006240963793139641,
+          "peak_isolator_disp_in": 31.043329079494693,
+          "phase_seed": 601,
+          "residual_isolator_disp_in": 4.540019002198494,
+          "total_steps": 2600
+        },
+        {
+          "analyze_return_code": 0,
+          "case_id": "h4_strong_long",
+          "completed_steps": 2800,
+          "converged": true,
+          "peak_base_shear_coeff": 0.33929160043256645,
+          "peak_floor_acceleration_g": 0.6138976986540516,
+          "peak_interstory_drift_ratio": 0.008528161964650512,
+          "peak_isolator_disp_in": 38.68616189879647,
+          "phase_seed": 701,
+          "residual_isolator_disp_in": 7.289396789842073,
+          "total_steps": 2800
+        },
+        {
+          "analyze_return_code": 0,
+          "case_id": "h5_mce_corner_alt",
+          "completed_steps": 3000,
+          "converged": true,
+          "peak_base_shear_coeff": 0.36534614870629234,
+          "peak_floor_acceleration_g": 0.6384926906207011,
+          "peak_interstory_drift_ratio": 0.008627246286111223,
+          "peak_isolator_disp_in": 43.541782258899936,
+          "phase_seed": 83,
+          "residual_isolator_disp_in": 4.259361098138041,
+          "total_steps": 3000
+        },
+        {
+          "analyze_return_code": 0,
+          "case_id": "h6_mce_corner",
+          "completed_steps": 3000,
+          "converged": true,
+          "peak_base_shear_coeff": 0.3284523795248631,
+          "peak_floor_acceleration_g": 0.672453827250208,
+          "peak_interstory_drift_ratio": 0.008560100259721537,
+          "peak_isolator_disp_in": 36.66612527508813,
+          "phase_seed": 389,
+          "residual_isolator_disp_in": 8.036593194113948,
+          "total_steps": 3000
+        }
+      ],
+      "pre_grade_cleanup": {
+        "killed_processes": 0,
+        "removed_nonregular": 0,
+        "removed_symlinks": 0
+      },
+      "recentering_capacity_in": 9.0,
+      "recentering_gate": 1.0,
+      "reported_final_score": 1.0,
+      "return_shape": "rubric_grade",
+      "rubric_breakdown": [
+        {
+          "actual": 1.0,
+          "criterion": "isolator_displacement_control",
+          "criterion_id": "isolator_displacement_control",
+          "description": "isolator displacement control",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "isolator_displacement_control",
+          "label": "isolator displacement control",
+          "passed": true,
+          "reasoning": "isolator displacement control",
+          "score": 1.0,
+          "weight": 0.22
+        },
+        {
+          "actual": 1.0,
+          "criterion": "floor_acceleration_control",
+          "criterion_id": "floor_acceleration_control",
+          "description": "floor acceleration control",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "floor_acceleration_control",
+          "label": "floor acceleration control",
+          "passed": true,
+          "reasoning": "floor acceleration control",
+          "score": 1.0,
+          "weight": 0.25
+        },
+        {
+          "actual": 1.0,
+          "criterion": "interstory_drift_control",
+          "criterion_id": "interstory_drift_control",
+          "description": "interstory drift control",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "interstory_drift_control",
+          "label": "interstory drift control",
+          "passed": true,
+          "reasoning": "interstory drift control",
+          "score": 1.0,
+          "weight": 0.19
+        },
+        {
+          "actual": 1.0,
+          "criterion": "base_shear_control",
+          "criterion_id": "base_shear_control",
+          "description": "base shear control",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "base_shear_control",
+          "label": "base shear control",
+          "passed": true,
+          "reasoning": "base shear control",
+          "score": 1.0,
+          "weight": 0.18
+        },
+        {
+          "actual": 1.0,
+          "criterion": "residual_displacement_control",
+          "criterion_id": "residual_displacement_control",
+          "description": "residual displacement control",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "residual_displacement_control",
+          "label": "residual displacement control",
+          "passed": true,
+          "reasoning": "residual displacement control",
+          "score": 1.0,
+          "weight": 0.16
+        }
+      ],
+      "rubric_weights": {
+        "base shear control": 0.18,
+        "floor acceleration control": 0.25,
+        "interstory drift control": 0.19,
+        "isolator displacement control": 0.22,
+        "residual displacement control": 0.16
+      },
+      "scoring_mode": "weighted",
+      "security_tier": "sealed_rescore",
+      "serialized_grade": {
+        "penalties": null,
+        "score": 1.0,
+        "scoring_mode": "weighted",
+        "structured_subscores": [
+          {
+            "criterion_id": "isolator_displacement_control",
+            "description": "isolator displacement control",
+            "grading_criteria": "isolator displacement control",
+            "id": "isolator_displacement_control",
+            "label": "isolator displacement control",
+            "max_score": 1.0,
+            "name": "isolator displacement control",
+            "reasoning": "isolator displacement control",
+            "score": 1.0,
+            "weight": 0.22
+          },
+          {
+            "criterion_id": "floor_acceleration_control",
+            "description": "floor acceleration control",
+            "grading_criteria": "floor acceleration control",
+            "id": "floor_acceleration_control",
+            "label": "floor acceleration control",
+            "max_score": 1.0,
+            "name": "floor acceleration control",
+            "reasoning": "floor acceleration control",
+            "score": 1.0,
+            "weight": 0.25
+          },
+          {
+            "criterion_id": "interstory_drift_control",
+            "description": "interstory drift control",
+            "grading_criteria": "interstory drift control",
+            "id": "interstory_drift_control",
+            "label": "interstory drift control",
+            "max_score": 1.0,
+            "name": "interstory drift control",
+            "reasoning": "interstory drift control",
+            "score": 1.0,
+            "weight": 0.19
+          },
+          {
+            "criterion_id": "base_shear_control",
+            "description": "base shear control",
+            "grading_criteria": "base shear control",
+            "id": "base_shear_control",
+            "label": "base shear control",
+            "max_score": 1.0,
+            "name": "base shear control",
+            "reasoning": "base shear control",
+            "score": 1.0,
+            "weight": 0.18
+          },
+          {
+            "criterion_id": "residual_displacement_control",
+            "description": "residual displacement control",
+            "grading_criteria": "residual displacement control",
+            "id": "residual_displacement_control",
+            "label": "residual displacement control",
+            "max_score": 1.0,
+            "name": "residual displacement control",
+            "reasoning": "residual displacement control",
+            "score": 1.0,
+            "weight": 0.16
+          }
+        ],
+        "subscores": {
+          "base shear control": 1.0,
+          "floor acceleration control": 1.0,
+          "interstory drift control": 1.0,
+          "isolator displacement control": 1.0,
+          "residual displacement control": 1.0
+        },
+        "weights": {
+          "base shear control": 0.18,
+          "floor acceleration control": 0.25,
+          "interstory drift control": 0.19,
+          "isolator displacement control": 0.22,
+          "residual displacement control": 0.16
+        }
+      },
+      "targets": {
+        "peak_base_shear_coeff": 0.366,
+        "peak_floor_acceleration_g": 0.72,
+        "peak_interstory_drift_ratio": 0.00865,
+        "peak_isolator_disp_in": 43.6,
+        "residual_isolator_disp_in": 8.2
+      },
+      "task_spec_sha256": "94e80e0095ad83e5dae08e968b03a8b44cfe78acd45a1707ff473ced13166c95",
+      "validation": {
+        "errors": [],
+        "system": {
+          "Dy_in": 0.5,
+          "Kd_kip_per_in": 22.0,
+          "Qd_kip": 540.0
+        }
+      },
+      "weighted_subscore_total": 1.0,
+      "weighted_total": 1.0,
+      "worst_case": {
+        "peak_base_shear_coeff": 0.36534614870629234,
+        "peak_floor_acceleration_g": 0.6732230715742021,
+        "peak_interstory_drift_ratio": 0.008627246286111223,
+        "peak_isolator_disp_in": 43.541782258899936,
+        "residual_isolator_disp_in": 8.036593194113948
+      }
+    },
+    "reward_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1784691961/verifier/reward.json",
+    "run_dir": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1784691961",
+    "runtime": "solution",
+    "score": 1.0,
+    "structured_subscores": [
+      {
+        "criterion_id": "isolator_displacement_control",
+        "description": "isolator displacement control",
+        "grading_criteria": "isolator displacement control",
+        "id": "isolator_displacement_control",
+        "label": "isolator displacement control",
+        "max_score": 1.0,
+        "name": "isolator displacement control",
+        "reasoning": "isolator displacement control",
+        "score": 1.0,
+        "weight": 0.22
+      },
+      {
+        "criterion_id": "floor_acceleration_control",
+        "description": "floor acceleration control",
+        "grading_criteria": "floor acceleration control",
+        "id": "floor_acceleration_control",
+        "label": "floor acceleration control",
+        "max_score": 1.0,
+        "name": "floor acceleration control",
+        "reasoning": "floor acceleration control",
+        "score": 1.0,
+        "weight": 0.25
+      },
+      {
+        "criterion_id": "interstory_drift_control",
+        "description": "interstory drift control",
+        "grading_criteria": "interstory drift control",
+        "id": "interstory_drift_control",
+        "label": "interstory drift control",
+        "max_score": 1.0,
+        "name": "interstory drift control",
+        "reasoning": "interstory drift control",
+        "score": 1.0,
+        "weight": 0.19
+      },
+      {
+        "criterion_id": "base_shear_control",
+        "description": "base shear control",
+        "grading_criteria": "base shear control",
+        "id": "base_shear_control",
+        "label": "base shear control",
+        "max_score": 1.0,
+        "name": "base shear control",
+        "reasoning": "base shear control",
+        "score": 1.0,
+        "weight": 0.18
+      },
+      {
+        "criterion_id": "residual_displacement_control",
+        "description": "residual displacement control",
+        "grading_criteria": "residual displacement control",
+        "id": "residual_displacement_control",
+        "label": "residual displacement control",
+        "max_score": 1.0,
+        "name": "residual displacement control",
+        "reasoning": "residual displacement control",
+        "score": 1.0,
+        "weight": 0.16
+      }
+    ],
+    "subscores": {
+      "base shear control": 1.0,
+      "floor acceleration control": 1.0,
+      "interstory drift control": 1.0,
+      "isolator displacement control": 1.0,
+      "residual displacement control": 1.0
+    },
+    "trivial_baseline_score": 0.0,
+    "weights": {
+      "base shear control": 0.18,
+      "floor acceleration control": 0.25,
+      "interstory drift control": 0.19,
+      "isolator displacement control": 0.22,
+      "residual displacement control": 0.16
+    }
+  },
+  "image_digest": "sha256:f046952df1033ae7d0a514bb5022ba525f57d8cca2307203b578787f2a7efcb1",
+  "platform": "linux/amd64",
+  "schema_version": "1.0",
+  "task_dir_sha256": "6e1cb3d32260bc1646f5a2bda7312d42937935c69d479f80fb2aee253e10edcc"
+}

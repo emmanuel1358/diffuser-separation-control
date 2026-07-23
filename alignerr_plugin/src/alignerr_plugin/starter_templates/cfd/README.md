@@ -9,9 +9,10 @@ After creating a task, update:
 
 - `instruction.md` with the flow problem and the exact `/tmp/output/...` artifact.
 - `task.toml` with resources, timeouts, the `cfd` `domain`, and required outputs.
-- `scorer/compute_score.py` with task-specific hidden evaluation. Read the
-  agent submission through a guarded loader (`except OSError: raise AgentFault(...)`);
-  run the solver against held-out conditions and score deterministically.
+- `scorer/compute_score.py` with `TASK = RubricTask(...)` and pure hidden
+  evaluation. Declare `JsonArtifact`; run solvers through
+  `context.run_solver(...)`. Do not hand-write loaders or exception handling.
+- `scorer/evaluation.plan.json`: sealed plan refreshed from `TASK` by harness reference/ground-truth (commit; never hand-edit).
 - `data/` with public assets (case templates, schemas, probes).
 - `scorer/data/` with private hidden conditions / target specifications.
 - `solution/solve.sh` with the reference (oracle) design.

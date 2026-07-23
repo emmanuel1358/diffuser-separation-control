@@ -14,9 +14,10 @@ After creating a task, update:
 
 - `instruction.md` with the structural problem and the exact `/tmp/output/...` artifact.
 - `task.toml` with resources, timeouts, the `structures` `domain`, and required outputs.
-- `scorer/compute_score.py` with task-specific hidden evaluation. Read the
-  agent submission through a guarded loader (`except OSError: raise AgentFault(...)`);
-  run OpenSeesPy against held-out load cases and score deterministically.
+- `scorer/compute_score.py` with `TASK = RubricTask(...)` and pure hidden
+  evaluation. Declare `JsonArtifact`/`TrustedJson`; run trusted structural
+  analysis through `RubricContext`. Do not hand-write loaders/error handling.
+- `scorer/evaluation.plan.json`: sealed plan refreshed from `TASK` by harness reference/ground-truth (commit; never hand-edit).
 - `data/` with public assets (model summary, schema, public probe).
 - `scorer/data/` with private hidden load cases / target specifications.
 - `solution/solve.sh` with the reference (oracle) design.
@@ -31,10 +32,12 @@ Notes:
 - Passing tasks are exported to Harbor for the Prometheus Agent Service runner
   and submitted independently to Taiga. Taiga carries OpenSees availability as
   a native hint rather than changing the authored instruction.
-- The eval row is accepted only after the full Prometheus workflow passes:
-  `submit-prometheus` must pass with average target score `<= 0.5`, target score
-  standard deviation `>= 0.1`, required attempts present, and a passing
-  trainability auditor score.
+- Eval acceptance: green `trusted-ci/grade` (Prometheus average `<= 0.5`
+  included) is the only gate. Standard deviation and the trainability audit
+  are diagnostic context. Boreal QA is non-blocking for eval — use it for
+  coaching if helpful, but do not hold acceptance for Boreal findings or QA
+  completeness once trusted CI is green.
+
 - The `eval` flag is internal metadata only. It identifies eval versus non-eval
   submissions; it does not change the route.
 - The environment installs `openseespy` (pip). Add any extra deps your scorer

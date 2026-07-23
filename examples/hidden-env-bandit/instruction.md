@@ -18,8 +18,9 @@ with BanditEnv() as env:
     reward = env.pull(0)        # noisy reward for pulling arm 0
 ```
 
-Each `pull(arm)` returns a NOISY sample of that arm's hidden mean reward. Pull
-arms enough times to estimate which arm has the highest mean.
+Each `pull(arm)` returns a noisy sample. Use this training environment to develop
+and test an exploration algorithm; the grader evaluates the submitted algorithm
+on fresh hidden bandit instances selected after your artifact is committed.
 
 ## What to submit
 
@@ -29,22 +30,35 @@ Write a Python module to:
 /tmp/output/policy.py
 ```
 
-defining a `load_policy()` factory that returns an object with a `choose()`
-method returning the integer index of the arm you believe is best:
+defining a `load_policy()` factory that returns an object with:
+
+- `reset(n_arms, budget)`
+- `choose() -> int`
+- `observe(arm, reward)`
+- `recommend() -> int`
 
 ```python
 def load_policy():
     class Policy:
+        def reset(self, n_arms, budget):
+            self.n_arms = n_arms
+
         def choose(self):
-            return 3   # the arm you found to be best
+            return 0
+
+        def observe(self, arm, reward):
+            pass
+
+        def recommend(self):
+            return 0
     return Policy()
 ```
 
 ## Scoring
 
-The grader runs your submitted `policy.choose()` against the held-out bandit
-(the same hidden means you explored) and scores by how close the chosen arm's
-true mean is to the optimal: `1.0` for the best arm, down toward `0.0` for the
-worst. The env socket is closed before grading, so bake your decision into
-`policy.py` (e.g. hard-code the arm you found, or re-derive it from data you
-saved during exploration).
+The grader commits `policy.py`, derives secret challenge seeds, and gives the
+policy a fixed pull budget on each fresh bandit. Quality is the final recommended
+arm's normalized true mean. The policy must beat trusted fixed/open-loop controls
+across the paired scenarios; constant, seed-indexed, crashing, or observation-
+independent policies receive zero. Certified policies retain their continuous
+quality reward.

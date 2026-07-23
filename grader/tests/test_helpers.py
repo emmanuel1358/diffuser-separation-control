@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
 
-from grading import AgentFault
+from grading import AgentFault, GraderFault
 from grading import helpers
 
 
@@ -140,3 +141,25 @@ def test_load_submission_or_fault_rejects_extra_columns(tmp_path: Path) -> None:
             required_columns=["id", "y"],
             numeric_columns=["y"],
         )
+
+
+def test_run_trusted_solver_returns_typed_nonzero_and_timeout() -> None:
+    failed = helpers.run_trusted_solver(
+        [sys.executable, "-c", "print('bad case'); raise SystemExit(3)"],
+        timeout_s=2.0,
+    )
+    assert failed.returncode == 3
+    assert failed.ok is False
+    assert "bad case" in failed.output
+
+    timed_out = helpers.run_trusted_solver(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout_s=0.05,
+    )
+    assert timed_out.timed_out is True
+    assert timed_out.ok is False
+
+
+def test_run_trusted_solver_missing_binary_is_grader_fault() -> None:
+    with pytest.raises(GraderFault, match="could not launch trusted solver"):
+        helpers.run_trusted_solver(["/definitely/missing/solver"], timeout_s=1.0)

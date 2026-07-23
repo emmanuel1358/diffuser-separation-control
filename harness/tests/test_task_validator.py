@@ -109,7 +109,9 @@ def compute_score(workspace, trajectory, private):
 """)
 
 
-def _write_private_layout_problem(problem_dir: Path, dockerfile_text: str = _HARDENED_DOCKERFILE) -> None:
+def _write_private_layout_problem(
+    problem_dir: Path, dockerfile_text: str = _HARDENED_DOCKERFILE
+) -> None:
     _write_problem(problem_dir, task_type="ml")
     (problem_dir / "environment").mkdir()
     (problem_dir / "data").mkdir()
@@ -123,14 +125,16 @@ def test_solution_answer_key_leak_flags_shell_reading_private_data(
     problem_dir = tmp_path / "leak-shell"
     _write_problem(problem_dir, task_type="ml")
     (problem_dir / "solution" / "solve.sh").write_text(
-        "#!/usr/bin/env bash\n" "cat /mcp_server/data/labels.json > /tmp/output/result.txt\n"
+        "#!/usr/bin/env bash\n"
+        "cat /mcp_server/data/labels.json > /tmp/output/result.txt\n"
     )
 
     stage = TaskValidator()._solution_answer_key_leak(problem_dir)
 
     assert not stage.passed
     assert any(
-        issue.startswith("solution/solve.sh:2:") and "must not read the private answer key" in issue
+        issue.startswith("solution/solve.sh:2:")
+        and "must not read the private answer key" in issue
         for issue in stage.issues
     )
 
@@ -141,13 +145,18 @@ def test_solution_answer_key_leak_flags_python_literal_disk_path(
     problem_dir = tmp_path / "leak-python"
     _write_problem(problem_dir, task_type="ml")
     (problem_dir / "solution" / "foo.py").write_text(
-        "import json\n" "labels = json.load(open('scorer/data/labels.json'))\n" "print(labels)\n"
+        "import json\n"
+        "labels = json.load(open('scorer/data/labels.json'))\n"
+        "print(labels)\n"
     )
 
     stage = TaskValidator()._solution_answer_key_leak(problem_dir)
 
     assert not stage.passed
-    assert any(issue.startswith("solution/foo.py:2:") and "scorer/data" in issue for issue in stage.issues)
+    assert any(
+        issue.startswith("solution/foo.py:2:") and "scorer/data" in issue
+        for issue in stage.issues
+    )
 
 
 def test_solution_answer_key_leak_passes_clean_reference(tmp_path: Path) -> None:
@@ -202,16 +211,71 @@ def test_validator_fails_failing_mujoco_solution(tmp_path: Path) -> None:
     assert any("ground truth solution exited" in issue for issue in stage.issues)
 
 
+def test_accelerator_ml_skips_host_reference_run(tmp_path: Path) -> None:
+    # Accelerator (H100/TPU) ML tasks grade IN-CONTAINER on the agent-service /
+    # Taiga lane. Their reference solution reads the baked container data layout
+    # (helper-resolved paths, accelerator libs) the host probe cannot reproduce,
+    # so `_compute_score_return` must SKIP the host reference run and defer to the
+    # in-container oracle grade -- not red-wall the task on a host failure. Here
+    # solve.sh exits 7 on host; the CPU sibling fails (see
+    # test_validator_fails_failing_ml_solution), the accelerator one skips.
+    # Regression: trusted-CI's `Validate task` runs THIS template validator, so
+    # without the skip a TPU ML task (adaptive_tutor_shift_prediction) red-walls
+    # with "ground truth solution exited ... FileNotFoundError: Could not find
+    # train." even though its in-container oracle scored ~0.5.
+    problem_dir = tmp_path / "ml-accel"
+    _write_problem(problem_dir, task_type="ml")
+    task_toml = problem_dir / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text().replace(
+            'required_resources = "4vcpu+16gib"',
+            'required_resources = "13vcpu+32gib+tpuv5e1x1"',
+        )
+    )
+
+    stage, meta = TaskValidator()._compute_score_return(problem_dir)
+
+    assert stage.passed, stage.issues
+    assert "reference_solution_exit" not in meta
+    assert any("in-container" in w for w in stage.warnings)
+
+
+def test_hidden_env_skips_host_reference_run(tmp_path: Path) -> None:
+    # hidden_env tasks need the env_server /tmp/env.sock that only exists
+    # in-container; the host probe cannot provision it, so skip it too.
+    problem_dir = tmp_path / "ml-hidden-env"
+    _write_problem(problem_dir, task_type="ml")
+    task_toml = problem_dir / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text().replace(
+            "[environment]\n",
+            '[environment]\nhidden_env = "env"\n',
+        )
+    )
+
+    stage, meta = TaskValidator()._compute_score_return(problem_dir)
+
+    assert stage.passed, stage.issues
+    assert "reference_solution_exit" not in meta
+    assert any("hidden_env" in w for w in stage.warnings)
+
+
 def test_validator_requires_rendering_mp4_name(tmp_path: Path) -> None:
     problem_dir = tmp_path / "mujoco-task"
     _write_problem(problem_dir, task_type="mujoco")
     task_toml = problem_dir / "task.toml"
-    task_toml.write_text(task_toml.read_text().replace("/tmp/output/rendering.mp4", "/tmp/output/preview.mp4"))
+    task_toml.write_text(
+        task_toml.read_text().replace(
+            "/tmp/output/rendering.mp4", "/tmp/output/preview.mp4"
+        )
+    )
 
     stage = TaskValidator()._ground_truth(problem_dir)
 
     assert not stage.passed
-    assert any("must be named /tmp/output/rendering.mp4" in issue for issue in stage.issues)
+    assert any(
+        "must be named /tmp/output/rendering.mp4" in issue for issue in stage.issues
+    )
 
 
 def test_validator_does_not_require_render_for_plain_ml(tmp_path: Path) -> None:
@@ -246,7 +310,9 @@ def test_validator_rejects_solver_leak_in_cfd_instruction(tmp_path: Path) -> Non
     assert any("instruction must be solver-agnostic" in issue for issue in stage.issues)
 
 
-def test_validator_allows_solver_agnostic_structures_instruction(tmp_path: Path) -> None:
+def test_validator_allows_solver_agnostic_structures_instruction(
+    tmp_path: Path,
+) -> None:
     problem_dir = tmp_path / "structures-solver-agnostic"
     _write_problem(problem_dir, task_type="structures")
     (problem_dir / "instruction.md").write_text(
@@ -776,7 +842,12 @@ def test_validator_rejects_missing_reward_type(tmp_path: Path) -> None:
     _write_problem(problem_dir, task_type="ml")
     task_toml = problem_dir / "task.toml"
     task_toml.write_text(
-        "\n".join(line for line in task_toml.read_text().splitlines() if not line.startswith("reward_type")) + "\n"
+        "\n".join(
+            line
+            for line in task_toml.read_text().splitlines()
+            if not line.startswith("reward_type")
+        )
+        + "\n"
     )
 
     stage = TaskValidator()._schema(problem_dir)
@@ -788,7 +859,9 @@ def test_validator_rejects_missing_reward_type(tmp_path: Path) -> None:
 def test_validator_uses_committed_render_artifact_proof(tmp_path: Path) -> None:
     problem_dir = tmp_path / "mujoco-task"
     _write_problem(problem_dir, task_type="mujoco")
-    (problem_dir / "solution" / "solve.sh").write_text("mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n")
+    (problem_dir / "solution" / "solve.sh").write_text(
+        "mkdir -p /tmp/output\nprintf ok > /tmp/output/result.txt\n"
+    )
     (problem_dir / "scorer" / "compute_score.py").write_text("""
 def compute_score(workspace, trajectory, private):
     return 1.0 if (workspace / "result.txt").exists() else 0.0
@@ -1118,7 +1191,9 @@ def test_private_data_layout_rejects_sensitive_public_private_duplicate(
     stage = TaskValidator()._private_data_layout(problem_dir)
 
     assert not stage.passed
-    assert any("duplicates public data byte-for-byte" in issue for issue in stage.issues)
+    assert any(
+        "duplicates public data byte-for-byte" in issue for issue in stage.issues
+    )
 
 
 def test_private_data_layout_allows_unsensitive_substring_duplicate(
@@ -1158,7 +1233,9 @@ def test_local_build_proof_runs_private_layout_and_agent_python_image_probes(
     run_calls: list[list[str]] = []
     proof_calls: list[dict[str, object]] = []
 
-    def fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        args: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
         run_calls.append(args)
         if args[:3] == ["docker", "buildx", "build"]:
             Path(args[args.index("--iidfile") + 1]).write_text("sha256:local")
@@ -1173,7 +1250,9 @@ def test_local_build_proof_runs_private_layout_and_agent_python_image_probes(
     monkeypatch.setattr(
         validator_module,
         "ensure_local_base_image",
-        lambda _repo_root, _problem_dir: LocalBaseImage("lbx-tasks-base", "local", Path("Dockerfile")),
+        lambda _repo_root, _problem_dir: LocalBaseImage(
+            "lbx-tasks-base", "local", Path("Dockerfile")
+        ),
     )
     monkeypatch.setattr(
         validator_module,
@@ -1199,7 +1278,9 @@ def test_local_build_proof_reports_private_layout_image_probe_failure(
     problem_dir = _write_build_proof_problem(tmp_path)
     proof_calls: list[dict[str, object]] = []
 
-    def fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        args: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
         if args[:3] == ["docker", "buildx", "build"]:
             Path(args[args.index("--iidfile") + 1]).write_text("sha256:local")
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -1213,7 +1294,9 @@ def test_local_build_proof_reports_private_layout_image_probe_failure(
     monkeypatch.setattr(
         validator_module,
         "ensure_local_base_image",
-        lambda _repo_root, _problem_dir: LocalBaseImage("lbx-tasks-base", "local", Path("Dockerfile")),
+        lambda _repo_root, _problem_dir: LocalBaseImage(
+            "lbx-tasks-base", "local", Path("Dockerfile")
+        ),
     )
     monkeypatch.setattr(
         validator_module,
@@ -1225,7 +1308,9 @@ def test_local_build_proof_reports_private_layout_image_probe_failure(
     stage = TaskValidator()._local_build_proof(problem_dir)
 
     assert not stage.passed
-    assert any("private data layout image probe failed" in issue for issue in stage.issues)
+    assert any(
+        "private data layout image probe failed" in issue for issue in stage.issues
+    )
     assert proof_calls == []
 
 
@@ -1235,11 +1320,16 @@ def test_local_build_proof_reports_agent_python_image_probe_failure(
     problem_dir = _write_build_proof_problem(tmp_path)
     proof_calls: list[dict[str, object]] = []
 
-    def fake_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fake_run(
+        args: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
         if args[:3] == ["docker", "buildx", "build"]:
             Path(args[args.index("--iidfile") + 1]).write_text("sha256:local")
             return subprocess.CompletedProcess(args, 0, "", "")
-        if args[:3] == ["docker", "run", "--rm"] and args[args.index("--user") + 1] == "root":
+        if (
+            args[:3] == ["docker", "run", "--rm"]
+            and args[args.index("--user") + 1] == "root"
+        ):
             return subprocess.CompletedProcess(args, 0, "", "")
         return subprocess.CompletedProcess(args, 126, "", "python: Permission denied")
 
@@ -1251,7 +1341,9 @@ def test_local_build_proof_reports_agent_python_image_probe_failure(
     monkeypatch.setattr(
         validator_module,
         "ensure_local_base_image",
-        lambda _repo_root, _problem_dir: LocalBaseImage("lbx-tasks-base", "local", Path("Dockerfile")),
+        lambda _repo_root, _problem_dir: LocalBaseImage(
+            "lbx-tasks-base", "local", Path("Dockerfile")
+        ),
     )
     monkeypatch.setattr(
         validator_module,
@@ -1385,6 +1477,36 @@ def test_agent_fault_flags_pickle_load_of_agent_artifact() -> None:
     )
     issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
     assert any("deserializes pickle" in issue for issue in issues)
+
+
+def test_agent_fault_flags_pickle_load_in_rubric_evaluate() -> None:
+    # Declarative RubricTask scorers expose evaluate() instead of compute_score();
+    # agent_fault reachability must still treat evaluate as live grading code.
+    src = (
+        "import pickle\n"
+        "\n"
+        "def evaluate(context):\n"
+        "    fh = open(context.workspace / 'model.pkl', 'rb')\n"
+        "    model = pickle.load(fh)\n"
+        "    return {'compiled': True}\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("deserializes pickle" in issue for issue in issues)
+
+
+def test_agent_fault_flags_broad_except_returning_score_in_rubric_evaluate() -> None:
+    src = (
+        "def evaluate(context):\n"
+        "    try:\n"
+        "        return _run(context)\n"
+        "    except Exception:\n"
+        "        return 0.0\n"
+        "\n"
+        "def _run(context):\n"
+        "    return {'compiled': True}\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("broad `except`" in issue for issue in issues)
 
 
 def test_agent_fault_flags_from_import_joblib_load_of_agent_artifact() -> None:
@@ -1804,7 +1926,9 @@ def test_shipped_scorers_pass_agent_fault_lint() -> None:
     assert scorers, "expected to find shipped scorer files to lint"
     offenders: dict[str, list[str]] = {}
     for path in scorers:
-        issues = validator_module._agent_fault_issues(path.relative_to(repo_root).as_posix(), path.read_text())
+        issues = validator_module._agent_fault_issues(
+            path.relative_to(repo_root).as_posix(), path.read_text()
+        )
         if issues:
             offenders[path.relative_to(repo_root).as_posix()] = issues
     assert not offenders, f"shipped scorers fail the agent_fault lint: {offenders}"
@@ -1898,7 +2022,9 @@ def compute_score(workspace, trajectory, private):
 
     assert not stage.passed
     assert meta["noop_score"] == 1.0
-    assert any("no-op" in issue and "max_trivial_score" in issue for issue in stage.issues)
+    assert any(
+        "no-op" in issue and "max_trivial_score" in issue for issue in stage.issues
+    )
 
 
 def test_no_op_gate_passes_when_empty_scores_zero(tmp_path: Path) -> None:
@@ -2118,7 +2244,10 @@ def compute_score(workspace, trajectory, private):
     stage, _meta = TaskValidator()._compute_score_return(problem_dir)
 
     assert not stage.passed
-    assert any("continuous_scoring_function" in issue and "0.5" in issue for issue in stage.issues)
+    assert any(
+        "continuous_scoring_function" in issue and "0.5" in issue
+        for issue in stage.issues
+    )
 
 
 _CONTINUOUS_SCORER = """
@@ -2313,7 +2442,9 @@ def test_grade_workspace_counts_agentfault_as_zero() -> None:
     params = ["workspace", "trajectory", "private"]
     # Default: an AgentFault submission is skipped (None) ...
     assert (
-        validator_module._grade_workspace_score(Path("."), Path("."), scorer, params, lambda value: value, _Dummy)
+        validator_module._grade_workspace_score(
+            Path("."), Path("."), scorer, params, lambda value: value, _Dummy
+        )
         is None
     )
     # ... but the learnability gate counts it as a real 0.0 anchor.
@@ -2351,7 +2482,9 @@ def test_grade_workspace_counts_agentfault_as_zero() -> None:
     )
 
 
-def test_calibration_skips_baseline_check_for_deterministic_tasks(tmp_path: Path) -> None:
+def test_calibration_skips_baseline_check_for_deterministic_tasks(
+    tmp_path: Path,
+) -> None:
     # Deterministic rubric task with a high-scoring baseline is not gated on
     # learnability (the baseline triad is a continuous-scoring concept).
     problem_dir = tmp_path / "cal-det"
@@ -2427,7 +2560,9 @@ def test_sanctioned_curve_stage_rejects_exponential_curve(tmp_path: Path) -> Non
     assert any("deprecated exponential" in i for i in stage.issues)
 
 
-def test_sanctioned_curve_stage_allows_piecewise_and_ignores_comment(tmp_path: Path) -> None:
+def test_sanctioned_curve_stage_allows_piecewise_and_ignores_comment(
+    tmp_path: Path,
+) -> None:
     # AST-based (not substring): a comment mentioning ExponentialCurve must NOT
     # trip the gate, and the sanctioned PiecewiseLinearCurve passes.
     problem_dir = tmp_path / "pwl-task"
@@ -2494,7 +2629,9 @@ def test_starter_dockerfiles_harden_private_roots(template_name: str) -> None:
     )
     text = dockerfile.read_text()
 
-    assert "COPY --chown=root:root ${PROBLEM_DIR}/scorer/data/ /mcp_server/data/" in text
+    assert (
+        "COPY --chown=root:root ${PROBLEM_DIR}/scorer/data/ /mcp_server/data/" in text
+    )
     assert "COPY --chown=root:root ${PROBLEM_DIR}/scorer/ /mcp_server/grader/" in text
     assert "rm -rf /mcp_server/grader/data" in text
     assert "find /mcp_server/data /mcp_server/grader -type d -exec chmod 0700" in text
@@ -2507,6 +2644,11 @@ def test_mlenvs_base_dockerfile_hardens_private_roots() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     text = (repo_root / "base" / "task.mlenvs.Dockerfile").read_text()
     assert "/mcp_server/data" in text
+    assert (
+        "COPY --from=task-src /calibration-src/calibration.lock.json "
+        "/mcp_server/calibration/calibration.lock.json" in text
+    )
+    assert "/mcp_server/calibration/.author-source" in text
     assert "0700" in text or "chmod 700" in text
 
 
@@ -2528,7 +2670,10 @@ def test_mlenvs_base_dockerfile_installs_env_deps_root_only() -> None:
 
 
 def test_prompt_runtime_references_flags_base_image_dependency_guidance() -> None:
-    text = "Use the packages in the base image, including numpy and torch, to solve " "the task."
+    text = (
+        "Use the packages in the base image, including numpy and torch, to solve "
+        "the task."
+    )
     issues = validator_module._prompt_internal_env_issues(text)
     assert any("base image" in issue for issue in issues)
 
@@ -2536,7 +2681,9 @@ def test_prompt_runtime_references_flags_base_image_dependency_guidance() -> Non
 def test_prompt_runtime_references_flags_task_metadata_dependency_guidance() -> None:
     text = "Read metadata.json to discover this task's declared dependencies."
     issues = validator_module._prompt_internal_env_issues(text)
-    assert any("metadata.json" in issue or "declared dependencies" in issue for issue in issues)
+    assert any(
+        "metadata.json" in issue or "declared dependencies" in issue for issue in issues
+    )
 
 
 def test_prompt_runtime_references_allows_direct_library_guidance() -> None:
@@ -2544,8 +2691,13 @@ def test_prompt_runtime_references_allows_direct_library_guidance() -> None:
     assert validator_module._prompt_internal_env_issues(text) == []
 
 
-def test_prompt_runtime_references_allows_base_image_plus_direct_library_guidance() -> None:
-    text = "The Docker base image is already prepared for the task. Use NumPy and " "torch, which are installed."
+def test_prompt_runtime_references_allows_base_image_plus_direct_library_guidance() -> (
+    None
+):
+    text = (
+        "The Docker base image is already prepared for the task. Use NumPy and "
+        "torch, which are installed."
+    )
     assert validator_module._prompt_internal_env_issues(text) == []
 
 
@@ -2555,7 +2707,10 @@ def test_prompt_runtime_references_allows_dataset_metadata_file() -> None:
 
 
 def test_prompt_runtime_references_allows_nested_dataset_metadata_file() -> None:
-    text = "The installed libraries are listed in the dataset manifest at " "/data/dataset/metadata.json."
+    text = (
+        "The installed libraries are listed in the dataset manifest at "
+        "/data/dataset/metadata.json."
+    )
     assert validator_module._prompt_internal_env_issues(text) == []
 
 
@@ -2603,7 +2758,10 @@ def test_scorer_determinism_allows_seeded_rng() -> None:
         "    rng = np.random.default_rng(0)\n"
         "    return float(rng.random())\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_allows_clean_scorer() -> None:
@@ -2613,7 +2771,10 @@ def test_scorer_determinism_allows_clean_scorer() -> None:
         "def compute_score(workspace, trajectory, private):\n"
         "    return float(np.mean([1.0, 2.0]))\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_ignores_dead_helper() -> None:
@@ -2628,7 +2789,10 @@ def test_scorer_determinism_ignores_dead_helper() -> None:
         "def compute_score(workspace, trajectory, private):\n"
         "    return 1.0\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_seed_text_in_dead_code_does_not_suppress_live_rng() -> None:
@@ -2657,7 +2821,10 @@ def test_scorer_determinism_live_seed_suppresses_live_rng() -> None:
         "def compute_score(workspace, trajectory, private):\n"
         "    return _score_with_seed()\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_seeded_local_generator_does_not_seed_global_numpy() -> None:
@@ -2710,7 +2877,9 @@ def test_scorer_determinism_python_seed_does_not_seed_global_numpy() -> None:
     assert any("no RNG" in issue for issue in issues)
 
 
-def test_scorer_determinism_seed_in_other_reachable_helper_does_not_suppress_rng() -> None:
+def test_scorer_determinism_seed_in_other_reachable_helper_does_not_suppress_rng() -> (
+    None
+):
     src = (
         "import numpy as np\n"
         "\n"
@@ -2752,7 +2921,10 @@ def test_scorer_determinism_same_scope_unconditional_global_seed_allowed() -> No
         "    random.seed(0)\n"
         "    return float(np.random.rand()) + random.random()\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_variable_global_seed_does_not_suppress_rng() -> None:
@@ -2770,7 +2942,9 @@ def test_scorer_determinism_variable_global_seed_does_not_suppress_rng() -> None
             f"    {seed_call}\n"
             f"    return float({rng_call})\n"
         )
-        issues = validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        issues = validator_module._scorer_determinism_issues(
+            "scorer/compute_score.py", src
+        )
         assert any("no RNG" in issue for issue in issues), seed_call
 
 
@@ -2785,7 +2959,10 @@ def test_scorer_determinism_module_level_seed_suppresses_later_global_rng() -> N
         "def compute_score(workspace, trajectory, private):\n"
         "    return float(np.random.rand()) + random.random()\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_module_level_seed_after_function_still_applies() -> None:
@@ -2799,7 +2976,10 @@ def test_scorer_determinism_module_level_seed_after_function_still_applies() -> 
         "np.random.seed(0)\n"
         "random.seed(0)\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_module_level_rng_before_seed_still_flags() -> None:
@@ -2851,7 +3031,10 @@ def test_scorer_determinism_import_init_helper_seed_applies_globally() -> None:
         "def compute_score(workspace, trajectory, private):\n"
         "    return float(np.random.rand()) + random.random()\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_import_rng_before_seed_helper_still_flags() -> None:
@@ -2892,7 +3075,10 @@ def test_scorer_determinism_cross_function_seed_before_rng_allowed() -> None:
         "    _seed()\n"
         "    return _score()\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_multihop_seed_before_rng_allowed() -> None:
@@ -2909,7 +3095,10 @@ def test_scorer_determinism_multihop_seed_before_rng_allowed() -> None:
         "    _mid()\n"
         "    return float(np.random.rand())\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_cross_function_rng_before_seed_still_flags() -> None:
@@ -2946,7 +3135,10 @@ def test_scorer_determinism_conditional_import_helper_is_not_live() -> None:
         "def compute_score(workspace, trajectory, private):\n"
         "    return 1.0\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_torch_manual_seed_does_not_seed_numpy_or_random() -> None:
@@ -2988,11 +3180,18 @@ def test_scorer_determinism_unqualified_seeded_imports_allowed() -> None:
         "    py_seed(0)\n"
         "    return float(rand()) + py_random()\n"
     )
-    assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == []
+    assert (
+        validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        == []
+    )
 
 
 def test_scorer_determinism_flags_unseeded_rng_constructors() -> None:
-    for call in ("np.random.RandomState()", "np.random.default_rng()", "random.Random()"):
+    for call in (
+        "np.random.RandomState()",
+        "np.random.default_rng()",
+        "random.Random()",
+    ):
         src = (
             "import random\n"
             "import numpy as np\n"
@@ -3001,12 +3200,18 @@ def test_scorer_determinism_flags_unseeded_rng_constructors() -> None:
             f"    rng = {call}\n"
             "    return 1.0\n"
         )
-        issues = validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        issues = validator_module._scorer_determinism_issues(
+            "scorer/compute_score.py", src
+        )
         assert any("no RNG" in issue for issue in issues), call
 
 
 def test_scorer_determinism_allows_seeded_rng_constructors() -> None:
-    for call in ("np.random.RandomState(0)", "np.random.default_rng(0)", "random.Random(0)"):
+    for call in (
+        "np.random.RandomState(0)",
+        "np.random.default_rng(0)",
+        "random.Random(0)",
+    ):
         src = (
             "import random\n"
             "import numpy as np\n"
@@ -3015,7 +3220,10 @@ def test_scorer_determinism_allows_seeded_rng_constructors() -> None:
             f"    rng = {call}\n"
             "    return 1.0\n"
         )
-        assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == [], call
+        assert (
+            validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+            == []
+        ), call
 
 
 def test_scorer_determinism_flags_none_seed_rng_constructors() -> None:
@@ -3034,7 +3242,9 @@ def test_scorer_determinism_flags_none_seed_rng_constructors() -> None:
             f"    rng = {call}\n"
             "    return 1.0\n"
         )
-        issues = validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+        issues = validator_module._scorer_determinism_issues(
+            "scorer/compute_score.py", src
+        )
         assert any("no RNG" in issue for issue in issues), call
 
 
@@ -3062,16 +3272,33 @@ def test_scorer_determinism_allows_keyword_literal_rng_constructor_seed() -> Non
             f"    rng = {call}\n"
             "    return 1.0\n"
         )
-        assert validator_module._scorer_determinism_issues("scorer/compute_score.py", src) == [], call
+        assert (
+            validator_module._scorer_determinism_issues("scorer/compute_score.py", src)
+            == []
+        ), call
 
 
 def test_scorer_determinism_helper_module_ignores_dead_functions() -> None:
-    src = "import time\n" "\n" "CONSTANT = 1.0\n" "\n" "def _unused_debug_probe():\n" "    return time.time()\n"
+    src = (
+        "import time\n"
+        "\n"
+        "CONSTANT = 1.0\n"
+        "\n"
+        "def _unused_debug_probe():\n"
+        "    return time.time()\n"
+    )
     assert validator_module._scorer_determinism_issues("scorer/utils.py", src) == []
 
 
 def test_scorer_determinism_helper_module_flags_module_level_sources() -> None:
-    src = "import time\n" "\n" "STARTED_AT = time.time()\n" "\n" "def helper():\n" "    return 1.0\n"
+    src = (
+        "import time\n"
+        "\n"
+        "STARTED_AT = time.time()\n"
+        "\n"
+        "def helper():\n"
+        "    return 1.0\n"
+    )
     issues = validator_module._scorer_determinism_issues("scorer/utils.py", src)
     assert any("wall-clock" in issue for issue in issues)
 
@@ -3110,7 +3337,9 @@ def test_prompt_quality_issues_flags_ai_artifact_phrase() -> None:
 
 
 def test_prompt_quality_issues_passes_clean_prompt() -> None:
-    assert validator_module._prompt_quality_issues("instruction.md", _VALID_PROMPT) == []
+    assert (
+        validator_module._prompt_quality_issues("instruction.md", _VALID_PROMPT) == []
+    )
 
 
 def test_non_ascii_issues_locates_em_dash() -> None:
@@ -3198,7 +3427,9 @@ def test_prompt_quality_stage_fails_for_emoji(tmp_path: Path) -> None:
 def test_prompt_quality_stage_fails_for_ai_artifact(tmp_path: Path) -> None:
     problem_dir = tmp_path / "ai-artifact-prompt"
     _write_problem(problem_dir, task_type="ml")
-    (problem_dir / "instruction.md").write_text(_VALID_PROMPT + " Certainly! This is the dataset.\n")
+    (problem_dir / "instruction.md").write_text(
+        _VALID_PROMPT + " Certainly! This is the dataset.\n"
+    )
 
     stage = TaskValidator()._prompt_quality(problem_dir)
 
@@ -3209,7 +3440,9 @@ def test_prompt_quality_stage_fails_for_ai_artifact(tmp_path: Path) -> None:
 def test_prompt_quality_stage_fails_for_non_ascii_in_prompt(tmp_path: Path) -> None:
     problem_dir = tmp_path / "em-dash-prompt"
     _write_problem(problem_dir, task_type="ml")
-    (problem_dir / "instruction.md").write_text(_VALID_PROMPT + "Then \u2014 finally \u2014 submit.\n")
+    (problem_dir / "instruction.md").write_text(
+        _VALID_PROMPT + "Then \u2014 finally \u2014 submit.\n"
+    )
 
     stage = TaskValidator()._prompt_quality(problem_dir)
 
@@ -3221,13 +3454,18 @@ def test_prompt_quality_stage_fails_for_non_ascii_in_scorer(tmp_path: Path) -> N
     problem_dir = tmp_path / "non-ascii-scorer"
     _write_problem(problem_dir, task_type="ml")
     (problem_dir / "scorer" / "compute_score.py").write_text(
-        "def compute_score(workspace, trajectory, private):\n" "    # caf\u00e9 score\n" "    return 1.0\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    # caf\u00e9 score\n"
+        "    return 1.0\n"
     )
 
     stage = TaskValidator()._prompt_quality(problem_dir)
 
     assert not stage.passed
-    assert any(issue.startswith("scorer/compute_score.py:") and "non-ASCII" in issue for issue in stage.issues)
+    assert any(
+        issue.startswith("scorer/compute_score.py:") and "non-ASCII" in issue
+        for issue in stage.issues
+    )
 
 
 def test_prompt_quality_stage_fails_when_instruction_missing(tmp_path: Path) -> None:
@@ -3249,7 +3487,10 @@ def test_prompt_quality_stage_scans_readme(tmp_path: Path) -> None:
     stage = TaskValidator()._prompt_quality(problem_dir)
 
     assert not stage.passed
-    assert any(issue.startswith("README.md:") and "non-ASCII" in issue for issue in stage.issues)
+    assert any(
+        issue.startswith("README.md:") and "non-ASCII" in issue
+        for issue in stage.issues
+    )
 
 
 def test_baseline_trio_warns_when_fewer_than_three(tmp_path: Path) -> None:

@@ -79,6 +79,7 @@ def update_build_proof_result(
     review_artifacts: list[dict[str, Any]] | None = None,
     result_key: str = "harness_result",
     trivial_baseline_score: float | None = None,
+    calibration: dict[str, Any] | None = None,
 ) -> Path | None:
     """Attach the latest local harness score to an existing build proof."""
     proof_path = problem_dir / PROOF_PATH
@@ -100,6 +101,13 @@ def update_build_proof_result(
         proof[result_key]["review_artifacts"] = review_artifacts
     if trivial_baseline_score is not None:
         proof[result_key]["trivial_baseline_score"] = float(trivial_baseline_score)
+    if calibration is not None:
+        proof[result_key]["calibration"] = calibration
+        # The generated calibration lock is a grading input but is written only
+        # after the image-backed reference/naive measurements pass. Refresh the
+        # source hash here so the same atomic ground-truth transaction does not
+        # leave its newly generated lock looking stale.
+        proof["task_dir_sha256"] = grading_inputs_sha256(problem_dir)
     write_json(proof_path, proof)
     return proof_path
 

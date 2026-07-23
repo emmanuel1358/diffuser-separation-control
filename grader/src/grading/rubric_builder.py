@@ -1,13 +1,15 @@
-"""`RubricBuilder` — ergonomic decorator API for weighted criteria.
+"""`RubricBuilder` — legacy compatibility decorator API for weighted criteria.
 
-Authors call deterministic `rb.criterion(...)` predicates and optional
-`rb.penalty(...)` predicates inside their `compute_score()` and finish with
-`rb.grade()` to produce a `Grade` ready for `to_dict()`.
+.. deprecated::
+    New ``multi_deterministic_rubrics`` tasks must use
+    ``grading.evaluation.RubricTask`` (see ``docs/RUBRIC_EVALUATION.md``).
+    ``RubricBuilder`` remains only for old immutable task images that already
+    ship ``compute_score()`` returning ``rb.grade().to_dict()``. Constructing
+    ``RubricBuilder`` emits :class:`DeprecationWarning`.
 
-The "rubric definition" lives in the same Python file as the predicates —
-no parallel TOML schema, no `grading_type` indirection. Authors who need
-something exotic (custom parser, simulator rollout, hidden fixture comparison)
-just write a plain deterministic `criterion` predicate.
+Authors on legacy images call deterministic ``rb.criterion(...)`` predicates
+and optional ``rb.penalty(...)`` predicates inside ``compute_score()`` and
+finish with ``rb.grade()`` to produce a ``Grade`` ready for ``to_dict()``.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import asyncio
 import inspect
 import logging
 import re
+import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,10 +53,13 @@ class _Criterion:
 
 @dataclass
 class RubricBuilder:
-    """Author-facing rubric builder. Construct in `compute_score()`,
-    register criteria with the decorators, and call `grade()`.
+    """Legacy rubric builder for immutable ``compute_score()`` task images.
 
-    Usage::
+    .. deprecated::
+        Use ``RubricTask`` for new deterministic rubric tasks. This class is
+        retained only so already-exported Harbor/Taiga images keep grading.
+
+    Legacy usage::
 
         from grading import RubricBuilder, helpers
 
@@ -67,10 +73,6 @@ class RubricBuilder:
             @rb.criterion(id="answer_present", weight=1.0)
             def _():
                 return helpers.file_exists(workspace / "answer.txt", non_empty=True)
-
-            @rb.penalty(id="wrote_outside", value=-0.3)
-            def _():
-                return any((workspace / p).exists() for p in ["/etc/passwd"])
 
             return rb.grade().to_dict()
     """
@@ -88,8 +90,16 @@ class RubricBuilder:
     _ids_seen: set[str] = field(default_factory=set, init=False)
 
     def __post_init__(self) -> None:
+        warnings.warn(
+            "RubricBuilder is deprecated for new tasks; use "
+            "grading.evaluation.RubricTask (docs/RUBRIC_EVALUATION.md). "
+            "RubricBuilder remains only for old immutable task images.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
         if self.judge is None:
-            self.judge = LLMJudge()
+            # Avoid a second DeprecationWarning from the default judge.
+            self.judge = LLMJudge(_emit_deprecation_warning=False)
 
     # ── Registration: criterion ────────────────────────────────
 
@@ -219,7 +229,7 @@ class RubricBuilder:
         write `return rb.grade().to_dict()` from a sync `compute_score`.
         """
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(self.agrade())
         # We're already inside an event loop (e.g. the Boreal MCP server).

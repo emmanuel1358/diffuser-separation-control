@@ -1,0 +1,51 @@
+{
+  "decision_ids": [
+    "isolator_displacement_control",
+    "floor_acceleration_control",
+    "interstory_drift_control",
+    "base_shear_control",
+    "residual_displacement_control"
+  ],
+  "evidence": {
+    "aggregation": "weighted",
+    "artifact": {
+      "allow_extra_keys": false,
+      "max_bytes": 67108864,
+      "max_depth": 64,
+      "max_nodes": 100000,
+      "numeric_fields": [
+        {
+          "maximum": 650.0,
+          "minimum": 80.0,
+          "path": "isolation_system.Qd_kip",
+          "required": true
+        },
+        {
+          "maximum": 90.0,
+          "minimum": 10.0,
+          "path": "isolation_system.Kd_kip_per_in",
+          "required": true
+        },
+        {
+          "maximum": 1.5,
+          "minimum": 0.3,
+          "path": "isolation_system.Dy_in",
+          "required": true
+        }
+      ],
+      "path": "isolation_design.json",
+      "require_object": true,
+      "required_keys": [
+        "isolation_system"
+      ],
+      "type": "json-artifact.v1"
+    },
+    "type": "declarative-rubric.v1"
+  },
+  "metric_ids": [],
+  "plan_sha256": "0c729ba3c75d3eaac834d6c990cfd0d202862835b15338b21f0e9f73eee809ed",
+  "protocol": "declarative-rubric.v1",
+  "schema_version": "evaluation-plan.v2",
+  "security_tier": "sealed_rescore",
+  "task_spec_sha256": "94e80e0095ad83e5dae08e968b03a8b44cfe78acd45a1707ff473ced13166c95"
+}

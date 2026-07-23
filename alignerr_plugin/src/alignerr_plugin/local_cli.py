@@ -48,6 +48,12 @@ STAGE_HINTS: dict[str, str] = {
     "grader_sandbox": "scorer crashed under the sandbox. Make grading deterministic and self-contained.",
     "agent_fault": "Agent-fault handling is misconfigured; a crashing submission must score 0.0, not error.",
     "scorer_determinism": "compute_score is non-deterministic: same input must yield the same score.",
+    "rubric_protocol": (
+        "Declarative RubricTask contract failed. Regenerate "
+        "scorer/evaluation.plan.json via harness reference/ground-truth "
+        "(or scripts/write_evaluation_plan.py) and commit it. Trusted CI "
+        "seals the plan with an explicit refresh step before validate."
+    ),
     "outputs": "Declared [[outputs]] don't match what the grader reads. Align paths in task.toml.",
     "ground_truth": (
         "solution/solve.sh must score the reward_type target (1.0 for rubrics, "

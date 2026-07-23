@@ -6,9 +6,10 @@ description: Author non-MuJoCo numerical-solver RL tasks (task_type cfd or struc
 # Numerical-Solver Tasks
 
 Non-MuJoCo engineering tasks reuse the same scoring contract as other tasks
-(`compute_score(workspace, trajectory, private)`, artifacts to `/tmp/output`,
-enum-backed metadata, and reward-type-specific oracle targets). A numerical
-solver is the deterministic referee.
+(artifacts to `/tmp/output`, enum-backed metadata, and reward-type-specific
+oracle targets). Rubric solver tasks declare `TASK = RubricTask(...)` (see
+`docs/RUBRIC_EVALUATION.md`); continuous tasks still use `compute_score`. A
+numerical solver is the deterministic referee.
 
 References:
 - `docs/NUMERICAL_SOLVERS.md` — full engine inventory + how to invoke each.
@@ -89,5 +90,5 @@ in_container = true
 
 Iterate: `uv run lbx-rl-harness reference --problem-dir problems/<task_id>`
 
-Validate: `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>`
-(oracle must match the declared `reward_type` target and commit the build proof; commit reviewer artifacts only when declared).
+Validate locally when useful: `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>`
+(oracle must match the declared `reward_type` target; trusted CI generates the authoritative proof, while authors commit reviewer artifacts only when declared).

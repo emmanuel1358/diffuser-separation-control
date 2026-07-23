@@ -9,7 +9,7 @@ examples when authoring your own task, but put your submitted work under
 The current end-to-end examples are:
 
 - [`mujoco-pendulum`](mujoco-pendulum/): rubric-style deterministic
-  scoring with `RubricBuilder`.
+  scoring with declarative `RubricTask`.
 - [`mle-tabular-classification`](mle-tabular-classification/):
   the canonical **ML_Envs-mode** task (minimal `metadata.json` + `prompt.md` +
   no-arg `test_file.py`; continuous scoring, no rubric).
@@ -25,8 +25,8 @@ This example demonstrates:
 - A complete task directory with `task.toml`, `instruction.md`,
   `environment/Dockerfile`, `scorer/compute_score.py`, `data/`,
   `solution/`, and `baselines/`.
-- A deterministic `RubricBuilder` grader that returns
-  `rb.grade().to_dict()`.
+- A declarative `RubricTask` (`TASK`). Harness reference/ground-truth write
+  sealed `scorer/evaluation.plan.json` (commit it; never hand-edit).
 - Ten equally weighted criteria, including MuJoCo compile checks,
   structural checks, sensor checks, and rollout checks.
 - The required `/tmp/output` convention for agent-created artifacts.
@@ -43,7 +43,7 @@ The canonical **ML_Envs-mode** example — the minimal authoring contract
   directly, loads the submission via `grading.helpers`, and calibrates
   with `FLOOR/REF/PERFECT` + the sanctioned `PiecewiseLinearCurve` (reference
   scores ~0.5).
-- A `{score, subscores}` return with no `RubricBuilder`.
+- A `{score, subscores}` return with no `RubricTask`.
 
 ## How To Use This Example
 

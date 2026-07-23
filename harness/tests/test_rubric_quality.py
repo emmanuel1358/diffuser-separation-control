@@ -70,7 +70,7 @@ def test_run_rubric_quality_check_normalizes_model_json(monkeypatch, tmp_path):
         rubric_quality.RUBRIC_QUALITY_CHECKS
     )
     assert "TASK PROMPT / INSTRUCTIONS" in fake_model.prompt
-    assert "SCORER RUBRIC CRITERIA / compute_score.py" in fake_model.prompt
+    assert "DECLARATIVE RUBRIC TASK / compute_score.py" in fake_model.prompt
     assert "STANDARD RUBRIC GUIDANCE" in fake_model.prompt
     assert (
         "decide whether the rubric criteria adhere to the guidance" in fake_model.prompt

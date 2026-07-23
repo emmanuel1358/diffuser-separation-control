@@ -7,10 +7,15 @@ ARG PROBLEM_DIR
 FROM --platform=linux/amd64 python:3.12-slim AS task-src
 ARG PROBLEM_DIR
 COPY ${PROBLEM_DIR}/ /src/
-RUN mkdir -p /data-src/public /data-src/private && \
+RUN mkdir -p /data-src/public /data-src/private /calibration-src && \
     if [ -d /src/data/public ]; then cp -a /src/data/public/. /data-src/public/; fi && \
     if [ -d /src/data/private ]; then cp -a /src/data/private/. /data-src/private/; fi && \
-    if [ ! -f /src/test_file.py ]; then echo "ERROR: ML_Envs task missing test_file.py" >&2; exit 1; fi
+    if [ -f /src/calibration.lock.json ]; then \
+      cp /src/calibration.lock.json /calibration-src/calibration.lock.json; \
+    else \
+      printf '{}\n' > /calibration-src/calibration.lock.json; \
+    fi && \
+    if [ ! -f /src/test_file.py ]; then echo "ERROR: metadata-mode ML task missing test_file.py" >&2; exit 1; fi
 
 FROM ${BASE_IMAGE}:${BASE_TAG}
 
@@ -64,11 +69,13 @@ ARG HIDDEN_ENV=""
 RUN mkdir -p /task \
  && printf '[environment]\nhidden_env = "%s"\n' "$HIDDEN_ENV" > /task/task.toml
 
-RUN mkdir -p /mcp_server/data
+RUN mkdir -p /mcp_server/data /mcp_server/calibration
 COPY --from=task-src /data-src/private /mcp_server/data
-RUN chown -R root:root /mcp_server/data \
- && find /mcp_server/data -type d -exec chmod 0700 {} + \
- && find /mcp_server/data -type f -exec chmod 0600 {} +
+COPY --from=task-src /calibration-src/calibration.lock.json /mcp_server/calibration/calibration.lock.json
+RUN printf 'author-image-fallback\n' > /mcp_server/calibration/.author-source \
+ && chown -R root:root /mcp_server/data /mcp_server/calibration \
+ && find /mcp_server/data /mcp_server/calibration -type d -exec chmod 0700 {} + \
+ && find /mcp_server/data /mcp_server/calibration -type f -exec chmod 0600 {} +
 
 RUN mkdir -p /data
 COPY --from=task-src /data-src/public /data

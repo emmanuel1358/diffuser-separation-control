@@ -15,10 +15,9 @@ alongside [docs/HIDDEN_ENV.md](../../docs/HIDDEN_ENV.md).
 - `BanditEnv._env_public_methods` pins the socket surface to `reset` / `pull` /
   `n_arms`; the grader-only `best_arm` / `mean` are never reachable by the agent.
 - The agent uses the public `data/env_client.py` (baked to `/data/env_client.py`).
-- The grader (`scorer/compute_score.py`) loads the held-out env in-process with
-  `grading.load_env_module` and the agent policy with
-  `grading.load_submitted_policy`, then scores by regret. The socket is torn
-  down (`stop_env_server`) before grading.
+- The grader uses `PolicyEvaluationTask` to commit the submitted algorithm,
+  derive fresh hidden bandit seeds, run paired candidate/control scenarios, and
+  score only policies that beat fixed/open-loop controls.
 
 ## Run the reference locally
 
@@ -26,6 +25,6 @@ alongside [docs/HIDDEN_ENV.md](../../docs/HIDDEN_ENV.md).
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir examples/hidden-env-bandit
 ```
 
-The oracle (`solution/solve.sh`) explores the bandit and bakes the best arm into
-`policy.py` (scores ~1.0); the naive baseline (`baselines/naive.sh`) submits arm
-0 without exploring (scores low).
+The oracle (`solution/solve.sh`) submits a UCB learner and scores near the 0.5
+reference anchor. The naive baseline submits a fixed-arm policy and is
+certificate-gated to zero.

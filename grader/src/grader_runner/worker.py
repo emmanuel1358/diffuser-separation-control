@@ -14,9 +14,14 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from grading import Grade, normalize_compute_score_return
-from grading.faults import AgentFault
-from grading.rubric_builder import RubricBuilder
+from grader_runner.evaluate import (
+    agent_fault_grade,
+    failure_grade,
+    normalize_result_payload,
+    unclassified_failure_grade,
+)
+from grading.evaluation.rubric import RubricTask
+from grading.faults import AgentFault, GraderFault, InfrastructureFault
 
 
 def _enter_pid_namespace() -> None:
@@ -198,55 +203,6 @@ def _call_compute_score(
     return fn(**kwargs)
 
 
-def _wire_transcript_into_rubric(value: object, transcript: str) -> object:
-    if isinstance(value, RubricBuilder):
-        value.transcript = transcript
-        return value.grade()
-    return value
-
-
-def _agent_fault_grade(message: str) -> Grade:
-    return Grade(
-        subscores={"agent_fault": 0.0},
-        weights={"agent_fault": 1.0},
-        headline_score_override=0.0,
-        metadata={"return_shape": "agent_fault", "agent_fault": message},
-        criterion_logs={
-            "agent_fault": {
-                "grading_type": "agent_fault",
-                "error_type": "agent_fault",
-                "error_message": message,
-                "passed": False,
-                "reasoning": message,
-            }
-        },
-        env_internal_failure=False,
-    )
-
-
-def _failure_grade(error_type: str, message: str, tb: str = "") -> Grade:
-    metadata: dict[str, Any] = {"return_shape": "error"}
-    if tb:
-        metadata["traceback"] = tb
-    return Grade(
-        subscores={"run_grader": 0.0},
-        weights={"run_grader": 1.0},
-        headline_score_override=0.0,
-        metadata=metadata,
-        criterion_logs={
-            "run_grader": {
-                "grading_type": "runner",
-                "error_type": error_type,
-                "error_message": message,
-                "passed": False,
-                "reasoning": message,
-            }
-        },
-        env_internal_failure=True,
-        env_internal_failure_logs=[message],
-    )
-
-
 def _write_result(result_path: Path, payload: dict[str, Any]) -> None:
     result_path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
 
@@ -260,10 +216,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--private-dir", required=True, type=Path)
     parser.add_argument("--result-path", required=True, type=Path)
     parser.add_argument("--transcript", type=Path, default=None)
+    parser.add_argument("--evaluation-trace", type=Path, default=None)
     args = parser.parse_args(argv)
 
     _enter_pid_namespace()
     _harden_import_path(args.workspace)
+    os.environ["LBX_EVALUATION_PRODUCTION"] = "1"
+    if args.evaluation_trace is not None:
+        os.environ["LBX_EVALUATION_TRACE_PATH"] = str(args.evaluation_trace)
 
     try:
         grader_path = _resolve_grader_path(args.grader_dir)
@@ -271,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         _write_result(
             args.result_path,
-            _failure_grade(
+            failure_grade(
                 "grader_import_failed",
                 f"{type(exc).__name__}: {exc}",
                 traceback.format_exc(),
@@ -280,10 +240,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     fn = getattr(module, "compute_score", None)
-    if not callable(fn):
+    registered_task = getattr(module, "TASK", None)
+    rubric_task = registered_task if isinstance(registered_task, RubricTask) else None
+    if rubric_task is None and not callable(fn):
         _write_result(
             args.result_path,
-            _failure_grade(
+            failure_grade(
                 "missing_compute_score",
                 f"{grader_path} does not define a callable compute_score().",
             ).to_dict(),
@@ -292,34 +254,51 @@ def main(argv: list[str] | None = None) -> int:
 
     transcript = _read_transcript(args.transcript)
     try:
-        raw = _call_compute_score(
-            fn,
-            workspace=args.workspace,
-            trajectory=None,
-            private=args.private_dir,
-            transcript=transcript,
+        raw = (
+            rubric_task.grade(
+                workspace=args.workspace,
+                trajectory=transcript,
+                private=args.private_dir,
+            )
+            if rubric_task is not None
+            else _call_compute_score(
+                fn,
+                workspace=args.workspace,
+                trajectory=None,
+                private=args.private_dir,
+                transcript=transcript,
+            )
         )
-        raw = _wire_transcript_into_rubric(raw, transcript)
     except AgentFault as exc:
-        _write_result(args.result_path, _agent_fault_grade(str(exc)).to_dict())
+        _write_result(args.result_path, agent_fault_grade(str(exc)).to_dict())
         return 0
-    except Exception:
+    except (GraderFault, InfrastructureFault) as exc:
         _write_result(
             args.result_path,
-            _failure_grade(
-                "grader_runtime_error",
-                traceback.format_exc().splitlines()[-1],
+            failure_grade(
+                "typed_grader_failure",
+                f"{type(exc).__name__}: {exc}",
                 traceback.format_exc(),
             ).to_dict(),
         )
         return 1
+    except Exception as exc:
+        traceback.print_exc()
+        _write_result(
+            args.result_path,
+            unclassified_failure_grade(
+                f"{type(exc).__name__}: {exc}",
+                traceback.format_exc(),
+            ).to_dict(),
+        )
+        return 0
 
     try:
-        grade = normalize_compute_score_return(raw)
+        payload = normalize_result_payload(raw, transcript=transcript)
     except Exception as exc:
         _write_result(
             args.result_path,
-            _failure_grade(
+            failure_grade(
                 "grader_return_unsupported",
                 f"{type(exc).__name__}: {exc}",
                 traceback.format_exc(),
@@ -327,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    _write_result(args.result_path, grade.to_dict())
+    _write_result(args.result_path, payload)
     return 0
 
 

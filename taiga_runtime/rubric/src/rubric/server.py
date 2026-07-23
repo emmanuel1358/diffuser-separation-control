@@ -5,10 +5,13 @@ Boreal needs, without vendoring Anthropic-specific `taiga-core`.
 """
 
 import dataclasses
+import hashlib
 import json
 import math
 import os
 import pwd
+import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -21,6 +24,7 @@ from grading.runtime_hardening import (
     classify_failure,
     kill_nvproxy_fd_holders,
     lock_down_grader_private,
+    lock_down_public_readonly,
     pre_grade_cleanup,
     prepare_grader_cache,
 )
@@ -36,6 +40,10 @@ _RESULT_PATH_ENV = "RUBRIC_RESULT_PATH"
 _EVALUATE_TIMEOUT_ENV = "RUBRIC_EVALUATE_TIMEOUT_S"
 _DEFAULT_EVALUATE_TIMEOUT_S = 600.0
 _RESULT_DIR_PREFIX = "lbx-rubric-result-"
+_TRACE_DIR_PREFIX = "lbx-evaluation-trace-"
+_TRACE_OUTPUT_DIRNAME = ".lbx-evaluation"
+_TRACE_FILENAME = "evaluation-details.json"
+_TRACE_PATH_ENV = "LBX_EVALUATION_TRACE_PATH"
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -70,6 +78,116 @@ def _extra(extra_fields: Any) -> dict[str, Any]:
     return {}
 
 
+def _verify_calibration(fields: dict[str, Any]) -> bool:
+    evidence = fields.get("calibration")
+    if not isinstance(evidence, dict):
+        return False
+    expected = evidence.get("lock_sha256")
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise RuntimeError("calibration evidence is missing a full lock SHA-256")
+    path = Path("/mcp_server/calibration/calibration.lock.json")
+    if not path.is_file():
+        raise RuntimeError(f"promoted calibration lock is missing at {path}")
+    if (
+        evidence.get("requires_trusted_mount")
+        and (path.parent / ".author-source").exists()
+    ):
+        raise RuntimeError(
+            "Taiga calibration requires the trusted-CI promoted mount; "
+            "the container is still using its baked author fallback"
+        )
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            "promoted calibration lock digest mismatch: "
+            f"expected {expected}, got {actual}"
+        )
+    expected_plan = evidence.get("evaluation_plan_sha256")
+    if not isinstance(expected_plan, str) or len(expected_plan) != 64:
+        raise RuntimeError("calibration evidence is missing evaluation plan identity")
+    try:
+        lock_payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"could not parse promoted calibration lock: {exc}") from exc
+    if lock_payload.get("evaluation_plan_sha256") != expected_plan:
+        raise RuntimeError("promoted calibration evaluation plan digest mismatch")
+    expected_tier = evidence.get("security_tier")
+    actual_tier = (lock_payload.get("evaluation_plan") or {}).get("security_tier")
+    if expected_tier and actual_tier != expected_tier:
+        raise RuntimeError("promoted calibration security tier mismatch")
+    return True
+
+
+def _verify_evaluation_plan(fields: dict[str, Any]) -> bool:
+    evidence = fields.get("evaluation_plan")
+    if not isinstance(evidence, dict):
+        return False
+    expected = evidence.get("sha256")
+    filename = evidence.get("path")
+    if (
+        not isinstance(expected, str)
+        or len(expected) != 64
+        or not isinstance(filename, str)
+        or Path(filename).name != filename
+    ):
+        raise RuntimeError("evaluation plan evidence is malformed")
+    path = Path("/mcp_server/grader") / filename
+    if not path.is_file():
+        raise RuntimeError(f"sealed evaluation plan is missing at {path}")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise RuntimeError(
+            f"sealed evaluation plan digest mismatch: expected {expected}, got {actual}"
+        )
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"could not parse sealed evaluation plan: {exc}") from exc
+    try:
+        from grading.evaluation.plan import validate_serialized_plan
+
+        plan_sha = validate_serialized_plan(payload)
+    except (ImportError, ValueError) as exc:
+        raise RuntimeError(f"sealed evaluation plan is invalid: {exc}") from exc
+    if plan_sha != evidence.get("plan_sha256"):
+        raise RuntimeError("sealed evaluation plan identity mismatch")
+    if payload.get("security_tier") != evidence.get("security_tier"):
+        raise RuntimeError("sealed evaluation plan security tier mismatch")
+    return True
+
+
+def _verify_continuous_evaluation(fields: dict[str, Any]) -> bool:
+    """Verify continuous or declarative-rubric evidence for this exact call."""
+    os.environ.pop("LBX_EVALUATION_PLAN_ATTESTED", None)
+    calibration_verified = _verify_calibration(fields)
+    plan_verified = _verify_evaluation_plan(fields)
+    verified = calibration_verified or plan_verified
+
+    policies = [
+        policy
+        for policy in (
+            fields.get("continuous_evaluation"),
+            fields.get("rubric_evaluation"),
+        )
+        if isinstance(policy, dict)
+    ]
+    required = any(policy.get("required") is True for policy in policies)
+    attestation_required = any(
+        policy.get("attestation_required") is True for policy in policies
+    )
+    if (required or attestation_required) and not verified:
+        raise RuntimeError(
+            "protected evaluation requires trusted calibration or plan evidence"
+        )
+    if verified and attestation_required:
+        os.environ["LBX_EVALUATION_PLAN_ATTESTED"] = "1"
+    return verified
+
+
 @mcp.tool()
 async def setup_problem(
     problem_id: str = Field(description="The id of the problem to solve"),
@@ -81,13 +199,17 @@ async def setup_problem(
     lock_down_grader_private(
         (
             "/mcp_server/data",
+            "/mcp_server/calibration",
             "/mcp_server/grader",
             "/mcp_server/grading",
             "/mcp_server/src/rubric",
             "/runtime/grading",
         )
     )
+    lock_down_public_readonly("/data")
+    lock_down_public_readonly("/lbx-public-files")
     fields = _extra(extra_fields)
+    _verify_continuous_evaluation(fields)
     return str(
         fields.get("task_prompt")
         or fields.get("prompt")
@@ -275,8 +397,7 @@ def _resolve_agent_path(raw_path: str) -> Path:
 # {"output", "error"} JSON to stdout. Because this executes as the agent uid,
 # the kernel's 0700 fixture perms — not just the path check above — enforce
 # confinement, and any file it creates is agent-owned.
-_EDITOR_WORKER = textwrap.dedent(
-    """
+_EDITOR_WORKER = textwrap.dedent("""
     import sys
     sys.path[:] = [p for p in sys.path if p not in ("", ".")]
     import json
@@ -323,8 +444,7 @@ _EDITOR_WORKER = textwrap.dedent(
             emit(error=f"unsupported command: {command}")
     except Exception as exc:
         emit(error=f"{type(exc).__name__}: {exc}")
-    """
-)
+    """)
 
 
 @mcp.tool(name="str_replace_editor")
@@ -389,11 +509,11 @@ async def str_replace_editor(
     return ToolResult(output=result.get("output"), error=result.get("error"))
 
 
-_RUNNER = textwrap.dedent(
-    """
+_RUNNER = textwrap.dedent("""
     import sys
     sys.path[:] = [p for p in sys.path if p not in ("", ".")]
     import json, math, os, traceback
+    from pathlib import Path
 
     # Grader-only deps (/mcp_server/grading_deps) must be importable BEFORE the
     # grader's top-level imports run, so a task's ``grading_dependencies`` resolve
@@ -442,35 +562,10 @@ _RUNNER = textwrap.dedent(
             return _scalar_payload(result.get("score", 0.0), metadata)
         return _scalar_payload(result, metadata)
 
-    def _normalized_payload(result):
-        from grading import normalize_compute_score_return
+    def _normalized_payload(result, transcript=""):
+        from grader_runner.evaluate import normalize_result_payload
 
-        grade = normalize_compute_score_return(result)
-        serialized = grade.to_dict() if hasattr(grade, "to_dict") else {}
-        metadata = dict(getattr(grade, "metadata", None) or {})
-        metadata.update(dict(serialized.get("metadata") or {}))
-        if getattr(grade, "metadata", None):
-            metadata.update(
-                {
-                    key: value
-                    for key, value in dict(grade.metadata).items()
-                    if key not in metadata
-                }
-            )
-        metadata.setdefault("serialized_grade", serialized)
-        return {
-            "score": _clamp_score(
-                grade.score() if hasattr(grade, "score") else serialized.get("score", 0.0)
-            ),
-            "subscores": dict(serialized.get("subscores") or getattr(grade, "subscores", None) or {}),
-            "weights": dict(serialized.get("weights") or getattr(grade, "weights", None) or {}),
-            "structured_subscores": serialized.get("structured_subscores") or [],
-            "scoring_mode": serialized.get("scoring_mode"),
-            "penalties": serialized.get("penalties"),
-            "env_internal_failure": serialized.get("env_internal_failure"),
-            "env_internal_failure_logs": serialized.get("env_internal_failure_logs"),
-            "metadata": metadata,
-        }
+        return normalize_result_payload(result, transcript=transcript)
 
     def _write_payload(path, payload):
         if not path:
@@ -481,6 +576,7 @@ _RUNNER = textwrap.dedent(
 
     def _main():
         result_path = os.environ.pop("RUBRIC_RESULT_PATH", "")
+        os.environ["LBX_EVALUATION_PRODUCTION"] = "1"
         source = sys.stdin.read()
         # The agent transcript (if any) is staged by the server in a root-owned
         # 0600 file and its path handed over via env, so the grader/test_file can
@@ -503,15 +599,32 @@ _RUNNER = textwrap.dedent(
             "TRANSCRIPT_PATH": _transcript_path,
         }
         try:
-            from grading.faults import AgentFault
+            from grading.faults import AgentFault, GraderFault, InfrastructureFault
         except Exception:
             class AgentFault(Exception):
+                pass
+            class GraderFault(Exception):
+                pass
+            class InfrastructureFault(Exception):
                 pass
         try:
             exec(source, namespace)
             compute = namespace.get("compute_score")
+            registered_task = namespace.get("TASK")
+            try:
+                from grading.evaluation import RubricTask
+            except Exception:
+                RubricTask = ()
+            if isinstance(registered_task, RubricTask):
+                compute = lambda: registered_task.grade(
+                    workspace=Path("/tmp/output"),
+                    trajectory=_transcript,
+                    private=Path("/mcp_server/data"),
+                )
             if not callable(compute):
-                raise RuntimeError("test_file does not define compute_score()")
+                raise RuntimeError(
+                    "test_file defines neither TASK=RubricTask(...) nor compute_score()"
+                )
             try:
                 result = compute()
             except AgentFault as exc:
@@ -523,15 +636,61 @@ _RUNNER = textwrap.dedent(
                 payload["env_internal_failure_logs"] = None
                 _write_payload(result_path, payload)
                 return
-            payload = _normalized_payload(result)
+            except (GraderFault, InfrastructureFault) as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                payload = _scalar_payload(
+                    0.0,
+                    {"return_shape": "typed_grader_failure", "error": message},
+                )
+                payload["env_internal_failure"] = True
+                payload["env_internal_failure_logs"] = [message]
+                _write_payload(result_path, payload)
+                return
+            except Exception as exc:
+                # Candidate evaluation must never gain a free episode/group veto
+                # from an untyped Python exception. Keep zero, surface a critical
+                # operator alert, and let trusted CI's adversarial probes block it.
+                message = f"{type(exc).__name__}: {exc}"
+                payload = _scalar_payload(
+                    0.0,
+                    {
+                        "return_shape": "unclassified_grader_crash",
+                        "error": message,
+                        "critical_operator_alert": True,
+                    },
+                )
+                payload["env_internal_failure"] = False
+                payload["env_internal_failure_logs"] = None
+                _write_payload(result_path, payload)
+                return
+            try:
+                payload = _normalized_payload(result, _transcript)
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                payload = _scalar_payload(
+                    0.0,
+                    {"return_shape": "normalization_failure", "error": message},
+                )
+                payload["env_internal_failure"] = True
+                payload["env_internal_failure_logs"] = [message]
             _write_payload(result_path, payload)
-        except Exception:
+        except Exception as exc:
             traceback.print_exc()
-            sys.exit(1)
+            message = f"{type(exc).__name__}: {exc}"
+            payload = _scalar_payload(
+                0.0,
+                {
+                    "return_shape": "grader_import_failure",
+                    "error": message,
+                    "traceback": traceback.format_exc(),
+                },
+            )
+            payload["env_internal_failure"] = True
+            payload["env_internal_failure_logs"] = [message]
+            _write_payload(result_path, payload)
 
     _main()
-    """
-)
+    """)
 
 
 def _clamp_score(value: Any) -> float:
@@ -901,6 +1060,87 @@ def _cleanup_result_file(path: str | None) -> None:
             pass
 
 
+def _stage_evaluation_trace() -> str | None:
+    """Return a non-existent path inside a root-owned private directory."""
+    try:
+        trace_dir = Path(tempfile.mkdtemp(prefix=_TRACE_DIR_PREFIX))
+        trace_dir.chmod(0o700)
+        return str(trace_dir / _TRACE_FILENAME)
+    except OSError:
+        return None
+
+
+def _cleanup_evaluation_trace(path: str | None) -> None:
+    if not path:
+        return
+    trace_dir = Path(path).parent
+    if trace_dir.name.startswith(_TRACE_DIR_PREFIX):
+        shutil.rmtree(trace_dir, ignore_errors=True)
+
+
+def _clear_persisted_evaluation_trace() -> None:
+    destination_dir = OUTPUT_DIR / _TRACE_OUTPUT_DIRNAME
+    if destination_dir.is_symlink() or (
+        destination_dir.exists() and not destination_dir.is_dir()
+    ):
+        destination_dir.unlink()
+    elif destination_dir.exists():
+        shutil.rmtree(destination_dir)
+
+
+def _persist_evaluation_trace(path: str) -> Path:
+    """Copy a completed private trace into Taiga's extracted output tree."""
+    source = Path(path)
+    if not source.is_file():
+        raise RuntimeError("sealed evaluation did not produce a private replay trace")
+
+    destination_dir = OUTPUT_DIR / _TRACE_OUTPUT_DIRNAME
+    try:
+        _clear_persisted_evaluation_trace()
+        destination_dir.mkdir(mode=0o700)
+        destination = destination_dir / _TRACE_FILENAME
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        fd = os.open(destination, flags, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(source.read_bytes())
+            handle.flush()
+            os.fsync(handle.fileno())
+        return destination
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not persist private evaluation trace: {exc}"
+        ) from exc
+
+
+def _write_agent_fault_trace(path: str, *, nonce: str) -> None:
+    """Record replay identity when grading stops before protocol evaluation."""
+    payload = {
+        "schema_version": "continuous-evaluation-trace.v1",
+        "protocol": "agent-fault.v1",
+        "replay": {"nonce": nonce},
+        "targets": {},
+    }
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "w", closefd=True) as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _coerce_timeout(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -994,21 +1234,37 @@ def _read_result_payload(
 
 
 def _evaluate(
-    test_file_source: str, transcript: str = "", timeout_s: float | None = None
+    test_file_source: str,
+    transcript: str = "",
+    timeout_s: float | None = None,
+    *,
+    trace_required: bool = False,
 ) -> Grade:
     runner_env = prepare_grader_cache()
+    attested = runner_env.get("LBX_EVALUATION_PLAN_ATTESTED") == "1"
+    if attested:
+        runner_env.setdefault("LBX_EVALUATION_NONCE", secrets.token_hex(16))
     transcript_path = _stage_transcript(transcript)
     result_path = _stage_result_file()
+    trace_path = _stage_evaluation_trace() if attested else None
     timeout = _evaluate_timeout(timeout_s)
     if transcript_path:
         runner_env["LBX_AGENT_TRANSCRIPT_PATH"] = transcript_path
     if not result_path:
         _unlink_if_present(transcript_path)
+        _cleanup_evaluation_trace(trace_path)
         return _failure_grade({}, "could not create private rubric result file")
+    if trace_required and not trace_path:
+        _unlink_if_present(transcript_path)
+        _cleanup_result_file(result_path)
+        return _failure_grade({}, "could not create private evaluation trace sink")
     runner_env[_RESULT_PATH_ENV] = result_path
+    if trace_path:
+        runner_env[_TRACE_PATH_ENV] = trace_path
     metadata: dict[str, Any] = {}
     try:
         metadata["pre_grade_cleanup"] = pre_grade_cleanup(OUTPUT_DIR)
+        _clear_persisted_evaluation_trace()
         # Cut the agent's grade-time access to the live hidden env before the
         # grader subprocess runs (closes free reset()-seed fingerprinting, a
         # twin-env oracle, private-method probes). No-op for static tasks.
@@ -1017,8 +1273,11 @@ def _evaluate(
 
             stop_env_server()
         except Exception as exc:  # noqa: BLE001 - never block grading
-            print(f"[ENV_SERVER] stop_env_server failed: {exc}",
-                  file=sys.stderr, flush=True)
+            print(
+                f"[ENV_SERVER] stop_env_server failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
         proc = subprocess.Popen(
             [sys.executable, "-P", "-c", _RUNNER],
             cwd="/",
@@ -1051,11 +1310,25 @@ def _evaluate(
                 proc.returncode, metadata.get("stderr", "")
             )
             message = classification.reason
+            payload = _read_result_payload(result_path, metadata)
+            if payload is not None:
+                try:
+                    grade = _grade_from_payload(payload)
+                except Exception:
+                    grade = None
+                if grade is not None:
+                    grade.metadata = {**metadata, **(grade.metadata or {})}
+                    return grade
+            if not classification.is_infra:
+                metadata["critical_operator_alert"] = True
+                metadata["failure_classification"] = "unclassified_non_infra_exit"
             return _failure_grade(
                 metadata,
                 message,
-                env_internal_failure=True,
-                env_internal_failure_logs=[message],
+                env_internal_failure=classification.is_infra,
+                env_internal_failure_logs=(
+                    [message] if classification.is_infra else None
+                ),
             )
         payload = _read_result_payload(result_path, metadata)
         if payload is None:
@@ -1065,6 +1338,38 @@ def _evaluate(
                 env_internal_failure=True,
                 env_internal_failure_logs=[message],
             )
+        payload_metadata = payload.get("metadata")
+        if (
+            trace_required
+            and trace_path
+            and not Path(trace_path).exists()
+            and isinstance(payload_metadata, dict)
+            and payload_metadata.get("return_shape") == "agent_fault"
+        ):
+            try:
+                _write_agent_fault_trace(
+                    trace_path,
+                    nonce=runner_env["LBX_EVALUATION_NONCE"],
+                )
+            except OSError as exc:
+                message = f"could not record agent-fault replay trace: {exc}"
+                return _failure_grade(
+                    metadata,
+                    message,
+                    env_internal_failure=True,
+                    env_internal_failure_logs=[message],
+                )
+        if trace_path and (trace_required or Path(trace_path).is_file()):
+            try:
+                _persist_evaluation_trace(trace_path)
+            except RuntimeError as exc:
+                message = str(exc)
+                return _failure_grade(
+                    metadata,
+                    message,
+                    env_internal_failure=True,
+                    env_internal_failure_logs=[message],
+                )
         try:
             grade = _grade_from_payload(payload)
         except Exception as exc:
@@ -1080,14 +1385,18 @@ def _evaluate(
     finally:
         _unlink_if_present(transcript_path)
         _cleanup_result_file(result_path)
+        _cleanup_evaluation_trace(trace_path)
         # Best-effort: free any leftover /dev/nvidia* fd holders so the
         # end-of-container checkpoint can save. Runs after the grade is computed
         # and must never change the score or fail grading.
         try:
             kill_nvproxy_fd_holders()
         except Exception as exc:  # noqa: BLE001 - cleanup must never fail grading
-            print(f"[GRADING] nvproxy sweep failed (ignored): {exc}",
-                  file=sys.stderr, flush=True)
+            print(
+                f"[GRADING] nvproxy sweep failed (ignored): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 @mcp.tool()
@@ -1099,6 +1408,7 @@ async def grade_problem(
     """Grade by executing the image-baked grader through the test_file shim."""
     _ = problem_id
     fields = _extra(extra_fields)
+    _verify_continuous_evaluation(fields)
     test_file = fields.get("test_file")
     if not test_file:
         return Grade(
@@ -1107,7 +1417,14 @@ async def grade_problem(
             metadata={"error": "missing test_file"},
         )
     timeout_s = _coerce_timeout(fields.get("grading_timeout_seconds"))
-    return _evaluate(str(test_file), transcript=transcript or "", timeout_s=timeout_s)
+    policy = fields.get("continuous_evaluation") or fields.get("rubric_evaluation")
+    trace_required = isinstance(policy, dict) and policy.get("trace_required") is True
+    return _evaluate(
+        str(test_file),
+        transcript=transcript or "",
+        timeout_s=timeout_s,
+        trace_required=trace_required,
+    )
 
 
 def main() -> None:
@@ -1125,6 +1442,9 @@ def main() -> None:
         supervise_if_enabled()
     except Exception as exc:  # noqa: BLE001 - env server is opt-in; never block startup
         # stderr only: stdio transport owns fd 1 for JSON-RPC framing.
-        print(f"[ENV_SERVER] supervisor failed to start; continuing: {exc}",
-              file=sys.stderr, flush=True)
+        print(
+            f"[ENV_SERVER] supervisor failed to start; continuing: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
     mcp.run(transport="stdio")

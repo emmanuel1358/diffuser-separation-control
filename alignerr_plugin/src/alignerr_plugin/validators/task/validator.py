@@ -27,10 +27,15 @@ from alignerr_plugin.ground_truth import (
 )
 from alignerr_plugin.local_runtime import ensure_local_base_image
 from alignerr_plugin.proof import PROOF_PATH, verify_build_proof, write_build_proof
+from alignerr_plugin.runtime_notices import accelerator_from_required_resources
 from alignerr_plugin.schemas import StageResult, ValidationResult
 from alignerr_plugin.utils import load_metadata, load_task_toml, read_json, task_id
 
 KNOWN_TOOLS = {"browser", "terminal", "terminal_persistent", "desktop"}
+TRUSTED_CALIBRATION_DIR_ENV = "LBX_TRUSTED_CALIBRATION_DIR"
+REQUIRE_TRUSTED_CONTINUOUS_ENV = "LBX_REQUIRE_TRUSTED_CONTINUOUS_EVALUATION"
+CALIBRATION_EVIDENCE_REL = Path(".alignerr") / "calibration.evidence.json"
+CALIBRATION_EVIDENCE_SCHEMA = "continuous-calibration-evidence.v1"
 
 # Minimum length for a usable agent-facing prompt (ported from ML_Envs
 # validate_task.validate_problem_quality). Anything shorter is almost never a
@@ -123,6 +128,42 @@ def _mlenvs_task_type(problem_dir: Path) -> str:
     return data.get("ml_task_type", "") if isinstance(data, dict) else ""
 
 
+def _declares_continuous_task(source: str) -> bool:
+    """Whether source has a top-level TASK assignment, without importing it."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, (ast.Assign, ast.AnnAssign))
+        and (
+            any(
+                isinstance(target, ast.Name) and target.id == "TASK"
+                for target in node.targets
+            )
+            if isinstance(node, ast.Assign)
+            else isinstance(node.target, ast.Name) and node.target.id == "TASK"
+        )
+        for node in tree.body
+    )
+
+
+def _continuous_task_method_calls(source: str) -> set[str]:
+    """TASK.<method>() calls anywhere in the authored grader."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "TASK"
+    }
+
+
 def _string_constants(source: str) -> list[str]:
     """Every string-literal constant in ``source`` (empty on a parse error)."""
     try:
@@ -146,7 +187,7 @@ def _check_data_refs(
     for literal in _string_constants(source):
         if not literal.startswith(runtime_prefix):
             continue
-        rel = literal[len(runtime_prefix):].lstrip("/")
+        rel = literal[len(runtime_prefix) :].lstrip("/")
         if not rel or rel in seen:
             continue
         seen.add(rel)
@@ -155,6 +196,8 @@ def _check_data_refs(
                 f"test_file.py references {literal!r} but {task_dir_rel}/{rel} is missing"
             )
     return errors
+
+
 # On-disk location of the private held-out truth in the task source tree. It is
 # committed but baked root-only into the container as ``/mcp_server/data`` (see
 # `_PRIVATE_ROOTS`). A reference solution must never read it under either name.
@@ -250,7 +293,9 @@ for public_root in PUBLIC_ROOTS:
                 fail(f"public path links to private root: {path} -> {resolved}")
 """
 
-_AGENT_PYTHON_PROBE = 'command -v python && python -c "import sys; print(sys.executable)"'
+_AGENT_PYTHON_PROBE = (
+    'command -v python && python -c "import sys; print(sys.executable)"'
+)
 
 # Attribute / function names that load and execute Python from an arbitrary file
 # path. A grader must NEVER use these on the model's deliverables: the grading
@@ -387,7 +432,9 @@ class TaskValidator:
             raise ValueError("problem_data must include instance_id")
         return instance_id
 
-    def validate(self, problem_dir: Path, results_dir: Path, _project_root: Path) -> ValidationResult:
+    def validate(
+        self, problem_dir: Path, results_dir: Path, _project_root: Path
+    ) -> ValidationResult:
         """Run mandatory and presence-driven validation stages."""
         problem_id = task_id(problem_dir)
         results_dir.mkdir(parents=True, exist_ok=True)
@@ -404,6 +451,8 @@ class TaskValidator:
             "agent_fault": self._agent_fault(problem_dir),
             "scorer_determinism": self._scorer_determinism(problem_dir),
             "sanctioned_curve": self._sanctioned_curve(problem_dir),
+            "continuous_calibration": self._continuous_calibration(problem_dir),
+            "rubric_protocol": self._rubric_protocol(problem_dir),
             "outputs": self._outputs(problem_dir),
             "ground_truth": self._ground_truth(problem_dir),
             "private_data_layout": self._private_data_layout(problem_dir),
@@ -414,7 +463,9 @@ class TaskValidator:
             "conditional": self._conditional(problem_dir),
         }
 
-        status = "valid" if all(stage.passed for stage in stages.values()) else "invalid"
+        status = (
+            "valid" if all(stage.passed for stage in stages.values()) else "invalid"
+        )
         result = ValidationResult(
             problem_id=problem_id,
             benchmark="taiga_task",
@@ -526,9 +577,7 @@ class TaskValidator:
                 issues.append(f"missing required directory: {rel}/")
                 continue
             files = [
-                p
-                for p in directory.rglob("*")
-                if p.is_file() and p.name != ".DS_Store"
+                p for p in directory.rglob("*") if p.is_file() and p.name != ".DS_Store"
             ]
             if not files:
                 issues.append(f"{rel}/ must not be empty")
@@ -542,11 +591,12 @@ class TaskValidator:
                 issues.append(f"could not read test_file.py: {exc}")
 
         if source:
-            if "/tmp/output" not in source:
+            v2_task = _declares_continuous_task(source)
+            if not v2_task and "/tmp/output" not in source:
                 issues.append(
                     "test_file.py must reference /tmp/output (the agent submission dir)"
                 )
-            if "/mcp_server/data" not in source:
+            if not v2_task and "/mcp_server/data" not in source:
                 issues.append(
                     "test_file.py must reference /mcp_server/data (the held-out truth)"
                 )
@@ -562,7 +612,7 @@ class TaskValidator:
             )
             # sim_policy: the grader reads the held-out eval sim from
             # /mcp_server/data/ only; /data/ is the agent's training-sim mount.
-            if _mlenvs_task_type(problem_dir) == "sim_policy":
+            if not v2_task and _mlenvs_task_type(problem_dir) == "sim_policy":
                 bad = sorted(
                     {
                         lit
@@ -586,7 +636,9 @@ class TaskValidator:
         is_mlenvs = _is_mlenvs(problem_dir)
         repo_root = problem_dir.parent.parent
         try:
-            spec = importlib.util.spec_from_file_location("task_grader_compute_score", grader_path)
+            spec = importlib.util.spec_from_file_location(
+                "task_grader_compute_score", grader_path
+            )
             if spec is None or spec.loader is None:
                 raise ImportError(f"cannot import {grader_path}")
             module = importlib.util.module_from_spec(spec)
@@ -597,21 +649,73 @@ class TaskValidator:
                 sys.path.insert(0, str(shared_grader_src))
             spec.loader.exec_module(module)
             compute_score = getattr(module, "compute_score", None)
-            if not callable(compute_score):
+            registered_task = getattr(module, "TASK", None)
+            is_v2_continuous = False
+            is_declarative_rubric = False
+            if registered_task is not None:
+                try:
+                    from grading.evaluation import ContinuousTask, RubricTask
+
+                    is_v2_continuous = isinstance(registered_task, ContinuousTask)
+                    is_declarative_rubric = isinstance(registered_task, RubricTask)
+                except Exception:
+                    is_v2_continuous = False
+                    is_declarative_rubric = False
+            reward_type = str(
+                load_task_toml(problem_dir).difficulty.reward_type or ""
+            ).strip()
+            if (
+                reward_type == "multi_deterministic_rubrics"
+                and not is_declarative_rubric
+            ):
                 issues.append(
-                    f"{_grader_source_rel(problem_dir)} must define callable compute_score"
+                    f"{_grader_source_rel(problem_dir)} must declare "
+                    "TASK = RubricTask(...) for multi_deterministic_rubrics"
                 )
-            else:
+            if is_declarative_rubric and callable(compute_score):
+                issues.append(
+                    "declarative rubric graders must not define author-owned "
+                    "compute_score(); the shared runner invokes TASK directly"
+                )
+            if is_declarative_rubric:
+                from grading.evaluation.plan import check_evaluation_plan
+
+                sync = check_evaluation_plan(problem_dir)
+                if sync.status in {"missing", "stale", "unavailable"}:
+                    issues.append(
+                        sync.message
+                        or "declarative rubric grader must ship scorer/evaluation.plan.json"
+                    )
+                elif sync.status not in {"unchanged", "written", "not_rubric"}:
+                    # Defensive: unexpected statuses still require a sealed plan.
+                    plan_path = grader_path.parent / "evaluation.plan.json"
+                    if not plan_path.is_file():
+                        issues.append(
+                            "declarative rubric grader must ship "
+                            "scorer/evaluation.plan.json"
+                        )
+            if not callable(compute_score) and not is_declarative_rubric:
+                issues.append(
+                    f"{_grader_source_rel(problem_dir)} must define callable compute_score "
+                    "or TASK = RubricTask(...)"
+                )
+            elif callable(compute_score):
                 params = list(inspect.signature(compute_score).parameters)
                 if is_mlenvs:
                     # ML_Envs graders define a no-arg compute_score().
-                    if params:
+                    if params and not is_v2_continuous:
                         issues.append(
-                            "ML_Envs test_file.py compute_score() must take no "
+                            "metadata-mode ML test_file.py compute_score() must take no "
                             f"arguments (reads /tmp/output and /mcp_server/data); got {params}"
                         )
-                elif params[:3] != ["workspace", "trajectory", "private"]:
-                    issues.append("compute_score signature must start with workspace, trajectory, private")
+                elif not is_v2_continuous and params[:3] != [
+                    "workspace",
+                    "trajectory",
+                    "private",
+                ]:
+                    issues.append(
+                        "compute_score signature must start with workspace, trajectory, private"
+                    )
         except Exception as exc:
             issues.append(f"grader import failed: {exc}")
         finally:
@@ -641,7 +745,9 @@ class TaskValidator:
                 text = source.read_text()
             except OSError:
                 continue
-            issues.extend(_grader_sandbox_issues(source.relative_to(problem_dir).as_posix(), text))
+            issues.extend(
+                _grader_sandbox_issues(source.relative_to(problem_dir).as_posix(), text)
+            )
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
     def _agent_fault(self, problem_dir: Path) -> StageResult:
@@ -657,7 +763,9 @@ class TaskValidator:
                 text = source.read_text()
             except OSError:
                 continue
-            issues.extend(_agent_fault_issues(source.relative_to(problem_dir).as_posix(), text))
+            issues.extend(
+                _agent_fault_issues(source.relative_to(problem_dir).as_posix(), text)
+            )
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
     def _prompt_runtime_references(self, problem_dir: Path) -> StageResult:
@@ -717,10 +825,14 @@ class TaskValidator:
         # solver or its commands leaks the intended approach. No-ops for every
         # other task_type (ML_Envs-mode synthesizes task_type="ml").
         try:
-            task_type = str(load_task_toml(problem_dir).difficulty.task_type or "").lower()
+            task_type = str(
+                load_task_toml(problem_dir).difficulty.task_type or ""
+            ).lower()
         except Exception:
             task_type = ""
-        issues.extend(_instruction_solver_leak_issues(prompt_rel, prompt_text, task_type))
+        issues.extend(
+            _instruction_solver_leak_issues(prompt_rel, prompt_text, task_type)
+        )
 
         ascii_targets = [problem_dir / rel for rel in _ascii_scan_files(problem_dir)]
         ascii_targets.extend(sorted(problem_dir.glob("README*")))
@@ -755,7 +867,11 @@ class TaskValidator:
                 text = source.read_text()
             except OSError:
                 continue
-            issues.extend(_scorer_determinism_issues(source.relative_to(problem_dir).as_posix(), text))
+            issues.extend(
+                _scorer_determinism_issues(
+                    source.relative_to(problem_dir).as_posix(), text
+                )
+            )
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
     def _sanctioned_curve(self, problem_dir: Path) -> StageResult:
@@ -775,8 +891,401 @@ class TaskValidator:
             except OSError:
                 continue
             issues.extend(
-                _sanctioned_curve_issues(source.relative_to(problem_dir).as_posix(), text)
+                _sanctioned_curve_issues(
+                    source.relative_to(problem_dir).as_posix(), text
+                )
             )
+        return StageResult(passed=not issues, issues=issues, duration_ms=0)
+
+    def _continuous_calibration(self, problem_dir: Path) -> StageResult:
+        """Hard-block any continuous-scoring task without evaluation evidence."""
+        issues: list[str] = []
+        warnings: list[str] = []
+        try:
+            task_toml = load_task_toml(problem_dir)
+        except Exception:
+            return StageResult(passed=True, issues=[], duration_ms=0)
+        task_type = normalize_enum_value(task_toml.difficulty.task_type)
+        if (
+            normalize_enum_value(task_toml.difficulty.reward_type)
+            != "continuous_scoring_function"
+        ):
+            return StageResult(passed=True, issues=[], duration_ms=0)
+
+        grader_path = problem_dir / _grader_source_rel(problem_dir)
+        try:
+            grader_source = grader_path.read_text(encoding="utf-8")
+        except OSError:
+            # Dedicated import/schema stages report unreadable or invalid graders.
+            return StageResult(passed=True, issues=[], duration_ms=0)
+        if not _declares_continuous_task(grader_source):
+            issues.append(
+                "continuous-scoring grader must define a grading.evaluation TASK; "
+                "legacy unprotected graders cannot pass trusted CI"
+            )
+            return StageResult(passed=False, issues=issues, duration_ms=0)
+
+        try:
+            from grading.evaluation import (
+                PolicyEvaluationTask,
+                load_calibration_lock,
+                load_task_registration,
+            )
+            from grading.evaluation.author import load_task_module
+            from grading.evaluation.lock import canonical_json_bytes
+
+            registration = load_task_registration(grader_path)
+            if registration is None:
+                module = load_task_module(grader_path)
+                policy_registration = getattr(module, "TASK", None)
+                if isinstance(policy_registration, PolicyEvaluationTask):
+                    task_calls = _continuous_task_method_calls(grader_source)
+                    if "grade" not in task_calls:
+                        issues.append(
+                            "sealed policy TASK compute_score must call TASK.grade(...)"
+                        )
+                    plan_path = grader_path.parent / "evaluation.plan.json"
+                    try:
+                        plan_payload = json.loads(plan_path.read_text())
+                    except (OSError, json.JSONDecodeError) as exc:
+                        issues.append(
+                            f"sealed policy evaluation plan is invalid: {exc}"
+                        )
+                    else:
+                        from grading.evaluation.plan import validate_serialized_plan
+
+                        try:
+                            serialized_sha = validate_serialized_plan(plan_payload)
+                        except ValueError as exc:
+                            issues.append(
+                                f"sealed policy evaluation plan is invalid: {exc}"
+                            )
+                            serialized_sha = None
+                        if serialized_sha != policy_registration.evaluation_plan.sha256:
+                            issues.append(
+                                "sealed policy evaluation plan digest is stale"
+                            )
+                    return StageResult(
+                        passed=not issues,
+                        issues=issues,
+                        duration_ms=0,
+                    )
+        except Exception as exc:
+            issues.append(f"could not load continuous TASK registration: {exc}")
+            return StageResult(passed=False, issues=issues, duration_ms=0)
+        if registration is None:
+            issues.append("TASK must be a grading.evaluation.ContinuousTask")
+            return StageResult(passed=False, issues=issues, duration_ms=0)
+        task_calls = _continuous_task_method_calls(grader_source)
+        if "score" in task_calls:
+            issues.append(
+                "production compute_score must not call TASK.score(metrics); "
+                "that scalar-only method is calibration-only and bypasses "
+                "information evidence. Use TASK.grade(...) or TASK.compute_score(...)."
+            )
+        if registration.security_tier in {
+            "sealed_rescore",
+            "sealed_challenge",
+        } and not ({"grade", "compute_score"} & task_calls):
+            issues.append(
+                f"{registration.security_tier} TASK has no protected final-grade "
+                "call; compute_score must delegate to TASK.grade(...) or "
+                "TASK.compute_score(...)."
+            )
+
+        trusted_calibration_dir = os.environ.get(TRUSTED_CALIBRATION_DIR_ENV)
+        trusted_required = os.environ.get(REQUIRE_TRUSTED_CONTINUOUS_ENV) == "1"
+        if trusted_required and not trusted_calibration_dir:
+            issues.append(
+                "trusted CI did not stage an authoritative continuous calibration "
+                "bundle"
+            )
+            return StageResult(passed=False, issues=issues, duration_ms=0)
+        if trusted_calibration_dir:
+            calibration_root = Path(trusted_calibration_dir)
+            lock_path = calibration_root / registration.calibration.filename
+            evidence_path = calibration_root / "calibration.evidence.json"
+            evidence_source = "trusted-CI"
+        else:
+            lock_path = problem_dir / registration.calibration.filename
+            evidence_path = problem_dir / CALIBRATION_EVIDENCE_REL
+            evidence_source = "development"
+        if not lock_path.is_file():
+            message = (
+                f"{evidence_source} continuous calibration is missing generated "
+                f"{lock_path.name}; run `uv run lbx-rl-harness run --runtime "
+                "ground-truth --problem-dir <task>` for local feedback. Trusted CI "
+                "regenerates the authoritative production bundle."
+            )
+            if trusted_calibration_dir:
+                issues.append(message)
+            else:
+                warnings.append(message)
+            return StageResult(
+                passed=not issues,
+                issues=issues,
+                warnings=warnings,
+                duration_ms=0,
+            )
+        try:
+            raw_payload = json.loads(lock_path.read_text())
+            lock = load_calibration_lock(
+                lock_path, task_spec_sha256=registration.spec_sha256
+            )
+            if lock_path.read_bytes() != canonical_json_bytes(raw_payload):
+                issues.append(
+                    f"{lock_path.name} is not canonically serialized; regenerate it "
+                    "with the ML ground-truth workflow instead of editing it"
+                )
+        except Exception as exc:
+            issues.append(f"invalid generated calibration lock: {exc}")
+            return StageResult(passed=False, issues=issues, duration_ms=0)
+
+        qualification = lock.payload.get("qualification") or {}
+        expected = {
+            "null_score": 0.0,
+            "reference_score": 0.5,
+            "oracle_score": 1.0,
+        }
+        for field, target in expected.items():
+            try:
+                actual = float(qualification[field])
+            except (KeyError, TypeError, ValueError):
+                issues.append(f"calibration lock qualification is missing {field}")
+                continue
+            if abs(actual - target) > 1e-9:
+                issues.append(
+                    f"calibration lock {field} must be {target}, got {actual}"
+                )
+
+        if not evidence_path.is_file():
+            (issues if trusted_calibration_dir else warnings).append(
+                f"{evidence_source} continuous calibration is missing "
+                f"{evidence_path.name}"
+            )
+        else:
+            try:
+                calibration = read_json(evidence_path)
+                evidence_findings = issues if trusted_calibration_dir else warnings
+                if calibration.get("schema_version") != CALIBRATION_EVIDENCE_SCHEMA:
+                    evidence_findings.append(
+                        "continuous calibration evidence schema is invalid"
+                    )
+                if calibration.get("lock_sha256") != lock.sha256:
+                    evidence_findings.append(
+                        "continuous calibration evidence lock digest does not match "
+                        f"{lock_path.name}"
+                    )
+                if calibration.get("task_spec_sha256") != registration.spec_sha256:
+                    evidence_findings.append(
+                        "continuous calibration TASK digest is stale"
+                    )
+                if calibration.get("evaluation_plan_sha256") != (
+                    registration.evaluation_plan.sha256
+                ):
+                    evidence_findings.append(
+                        "continuous evaluation plan digest is stale"
+                    )
+                if calibration.get("security_tier") != registration.security_tier:
+                    evidence_findings.append(
+                        "continuous calibration security tier is stale"
+                    )
+                if calibration.get("inputs") != lock.payload.get("inputs"):
+                    evidence_findings.append(
+                        "continuous calibration input roots do not match the lock"
+                    )
+                if calibration.get("qualification") != lock.payload.get(
+                    "qualification"
+                ):
+                    evidence_findings.append(
+                        "continuous calibration qualification does not match the lock"
+                    )
+                cache_key = calibration.get("cache_key")
+                if not isinstance(cache_key, str) or len(cache_key) != 64:
+                    evidence_findings.append(
+                        "continuous calibration cache key is invalid"
+                    )
+            except Exception as exc:
+                (issues if trusted_calibration_dir else warnings).append(
+                    f"could not validate continuous calibration evidence: {exc}"
+                )
+
+        if task_type == "ml":
+            generated_names = {"results.txt", "submission.csv"}
+            for strategy_rel in (
+                "reference_solution",
+                registration.naive,
+            ):
+                strategy_dir = problem_dir / strategy_rel
+                for generated in sorted(
+                    path
+                    for path in strategy_dir.rglob("*")
+                    if path.is_file() and path.name in generated_names
+                ):
+                    issues.append(
+                        "continuous ML calibration must not commit generated "
+                        f"score/output artifact {generated.relative_to(problem_dir)}"
+                    )
+                if not (strategy_dir / "model.manifest.json").is_file():
+                    issues.append(
+                        f"continuous ML calibration strategy {strategy_rel}/ is "
+                        "missing model.manifest.json"
+                    )
+
+        return StageResult(
+            passed=not issues,
+            issues=issues,
+            warnings=warnings,
+            duration_ms=0,
+        )
+
+    def _rubric_protocol(self, problem_dir: Path) -> StageResult:
+        """Require declarative rubrics and exercise their shared artifact boundary."""
+        import tempfile
+
+        try:
+            task_toml = load_task_toml(problem_dir)
+        except Exception:
+            return StageResult(passed=True, issues=[], duration_ms=0)
+        if (
+            normalize_enum_value(task_toml.difficulty.reward_type)
+            != "multi_deterministic_rubrics"
+        ):
+            return StageResult(passed=True, issues=[], duration_ms=0)
+
+        issues: list[str] = []
+        grader_path = problem_dir / _grader_source_rel(problem_dir)
+        repo_root = Path(__file__).resolve().parents[5]
+        paths = [str(repo_root / "grader" / "src"), str(grader_path.parent)]
+        added = [path for path in paths if path not in sys.path]
+        for path in reversed(added):
+            sys.path.insert(0, path)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "task_declarative_rubric_probe", grader_path
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"cannot import {grader_path}")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            from grading.evaluation import JsonArtifact, RubricTask, TextArtifact
+            from grading.faults import AgentFault
+
+            registration = getattr(module, "TASK", None)
+            if not isinstance(registration, RubricTask):
+                return StageResult(
+                    passed=False,
+                    issues=[
+                        f"{_grader_source_rel(problem_dir)} must declare "
+                        "TASK = RubricTask(...)"
+                    ],
+                    duration_ms=0,
+                )
+            issues.extend(
+                _declarative_rubric_api_issues(
+                    _grader_source_rel(problem_dir),
+                    grader_path.read_text(encoding="utf-8"),
+                )
+            )
+
+            plan_sync = None
+            try:
+                from grading.evaluation.plan import check_evaluation_plan
+
+                plan_sync = check_evaluation_plan(problem_dir)
+            except Exception as exc:
+                issues.append(f"could not validate rubric evaluation plan: {exc}")
+            if plan_sync is not None and plan_sync.status in {
+                "missing",
+                "stale",
+                "unavailable",
+            }:
+                issues.append(
+                    plan_sync.message
+                    or "scorer/evaluation.plan.json is stale for the declared RubricTask"
+                )
+
+            probes: list[tuple[str, bytes]] = [("empty", b"")]
+            if isinstance(registration.artifact, (JsonArtifact, TextArtifact)):
+                probes.append(("invalid_utf8", b"\xff\xfe{}"))
+            if isinstance(registration.artifact, JsonArtifact):
+                probes.extend(
+                    [
+                        ("malformed_json", b"{"),
+                        ("deep_json", ("[" * 2000 + "]" * 2000).encode()),
+                    ]
+                )
+                if registration.artifact.numeric_fields:
+                    document: dict[str, Any] = {
+                        key: {} for key in registration.artifact.required_keys
+                    }
+                    for field in registration.artifact.numeric_fields:
+                        parent = document
+                        parts = field.path.split(".")
+                        for part in parts[:-1]:
+                            child = parent.get(part)
+                            if not isinstance(child, dict):
+                                child = {}
+                                parent[part] = child
+                            parent = child
+                        parent[parts[-1]] = 1
+                    first = registration.artifact.numeric_fields[0]
+                    parent = document
+                    parts = first.path.split(".")
+                    for part in parts[:-1]:
+                        parent = parent[part]
+                    parent[parts[-1]] = 10**400
+                    probes.append(
+                        (
+                            "huge_numeric_value",
+                            json.dumps(document).encode("utf-8"),
+                        )
+                    )
+
+            for label, content in probes:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    workspace = Path(temp_dir)
+                    artifact_path = workspace / registration.artifact.path
+                    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                    artifact_path.write_bytes(content)
+                    try:
+                        registration.artifact.load(workspace)
+                    except AgentFault:
+                        continue
+                    except Exception as exc:
+                        issues.append(
+                            f"rubric artifact probe {label} escaped as "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    else:
+                        issues.append(
+                            f"rubric artifact probe {label} was accepted; expected AgentFault"
+                        )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                workspace = Path(temp_dir)
+                target = workspace / "target"
+                target.write_text("agent-controlled")
+                artifact_path = workspace / registration.artifact.path
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                artifact_path.symlink_to(target)
+                try:
+                    registration.artifact.load(workspace)
+                except AgentFault:
+                    pass
+                except Exception as exc:
+                    issues.append(
+                        "rubric symlink probe escaped as "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    issues.append("rubric artifact symlink was accepted")
+        except Exception as exc:
+            issues.append(f"could not validate declarative rubric protocol: {exc}")
+        finally:
+            for path in added:
+                if path in sys.path:
+                    sys.path.remove(path)
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
     def _outputs(self, problem_dir: Path) -> StageResult:
@@ -838,7 +1347,9 @@ class TaskValidator:
                 module_rel = cfg.get("module", module_rel)
                 factory = cfg.get("factory", factory)
                 if not isinstance(module_rel, str) or not isinstance(factory, str):
-                    issues.append(f"{priv_rel}/env_config.json: 'module' and 'factory' must be strings")
+                    issues.append(
+                        f"{priv_rel}/env_config.json: 'module' and 'factory' must be strings"
+                    )
             except Exception as exc:
                 issues.append(f"{priv_rel}/env_config.json is invalid: {exc}")
 
@@ -918,26 +1429,36 @@ class TaskValidator:
             # use only). No-ops for every other task_type.
             task_type = str(task_toml.difficulty.task_type or "").lower()
             issues.extend(_oracle_solver_material_issues(problem_dir, task_type))
-            render_required = render_expected(task_toml.difficulty.task_type, ground_truth.render_outputs)
+            render_required = render_expected(
+                task_toml.difficulty.task_type, ground_truth.render_outputs
+            )
             if render_required and not (problem_dir / "solution" / "solve.sh").exists():
                 issues.append("ground truth requires solution/solve.sh")
             if render_required and not ground_truth.render_command.strip():
                 issues.append("task.toml [ground_truth].render_command is required")
             if render_required and not ground_truth.render_outputs:
-                issues.append("task.toml [ground_truth].render_outputs must declare at least one video")
+                issues.append(
+                    "task.toml [ground_truth].render_outputs must declare at least one video"
+                )
             for output in ground_truth.render_outputs:
                 if not output.required:
-                    issues.append(f"ground truth render output must be required: {output.path}")
+                    issues.append(
+                        f"ground truth render output must be required: {output.path}"
+                    )
                 rel = _output_relative_path(output.path)
                 if rel is None:
-                    issues.append(f"ground truth render output must be under /tmp/output: {output.path}")
+                    issues.append(
+                        f"ground truth render output must be under /tmp/output: {output.path}"
+                    )
                 elif rel.suffix.lower() not in VIDEO_SUFFIXES:
                     issues.append(
                         "ground truth render output must be a video file "
                         f"({', '.join(sorted(VIDEO_SUFFIXES))}): {output.path}"
                     )
                 elif rel.name != "rendering.mp4":
-                    issues.append("ground truth render output must be named /tmp/output/rendering.mp4")
+                    issues.append(
+                        "ground truth render output must be named /tmp/output/rendering.mp4"
+                    )
         except Exception as exc:
             issues.append(f"cannot validate ground truth config: {exc}")
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
@@ -976,7 +1497,7 @@ class TaskValidator:
                 passed=True,
                 issues=[],
                 warnings=[
-                    "ML_Envs build proof not rebuilt during validation by design "
+                    "metadata-mode ML build proof not rebuilt during validation by design "
                     "(iterative cached-artifact references); provenance is the "
                     "run_reference package, not a local rebuild."
                 ],
@@ -1040,7 +1561,9 @@ class TaskValidator:
                     issues=[*errors, agent_python_error],
                     duration_ms=int((time.monotonic() - start) * 1000),
                 )
-            image_digest = iidfile.read_text().strip() if iidfile.exists() else image_tag
+            image_digest = (
+                iidfile.read_text().strip() if iidfile.exists() else image_tag
+            )
             write_build_proof(
                 problem_dir,
                 image_digest=image_digest,
@@ -1056,7 +1579,9 @@ class TaskValidator:
                 duration_ms=int((time.monotonic() - start) * 1000),
             )
 
-        return StageResult(passed=True, issues=[], duration_ms=int((time.monotonic() - start) * 1000))
+        return StageResult(
+            passed=True, issues=[], duration_ms=int((time.monotonic() - start) * 1000)
+        )
 
     def _conditional(self, problem_dir: Path) -> StageResult:
         issues: list[str] = []
@@ -1070,19 +1595,31 @@ class TaskValidator:
                 text=True,
             )
             if completed.returncode != 0:
-                issues.append(f"docker compose config failed: {completed.stderr.strip()}")
+                issues.append(
+                    f"docker compose config failed: {completed.stderr.strip()}"
+                )
 
-        for task_file in ((problem_dir / "tasks").glob("*.json") if (problem_dir / "tasks").exists() else []):
+        for task_file in (
+            (problem_dir / "tasks").glob("*.json")
+            if (problem_dir / "tasks").exists()
+            else []
+        ):
             task_data = json.loads(task_file.read_text())
             unknown_tools = set(task_data.get("tools", [])) - KNOWN_TOOLS
             if unknown_tools:
-                issues.append(f"{task_file.name} uses unknown tools: {sorted(unknown_tools)}")
+                issues.append(
+                    f"{task_file.name} uses unknown tools: {sorted(unknown_tools)}"
+                )
 
         if (problem_dir / "scorer" / "data" / "envs" / "__init__.py").exists():
             # A full rollout smoke belongs in the implementation pass; this scaffold catches obvious omissions.
-            envs_text = (problem_dir / "scorer" / "data" / "envs" / "__init__.py").read_text()
+            envs_text = (
+                problem_dir / "scorer" / "data" / "envs" / "__init__.py"
+            ).read_text()
             if "make_env" not in envs_text:
-                issues.append("scorer/data/envs/__init__.py exists but does not define make_env")
+                issues.append(
+                    "scorer/data/envs/__init__.py exists but does not define make_env"
+                )
 
         issues.extend(_preloaded_files_issues(problem_dir))
 
@@ -1092,7 +1629,9 @@ class TaskValidator:
             passed=not issues, issues=issues, warnings=warnings, duration_ms=0
         )
 
-    def _compute_score_return(self, problem_dir: Path) -> tuple[StageResult, dict[str, Any]]:
+    def _compute_score_return(
+        self, problem_dir: Path
+    ) -> tuple[StageResult, dict[str, Any]]:
         """Sample-run the grader against an empty workspace + the reference
         solution (when available) and verify the return shape normalizes.
 
@@ -1150,12 +1689,31 @@ class TaskValidator:
         if _is_mlenvs(problem_dir):
             meta["return_shape"] = "bare_float"
             issues.extend(_mlenvs_trivial_baseline_issues(problem_dir, meta))
+            proof_path = problem_dir / PROOF_PATH
+            if proof_path.is_file():
+                try:
+                    proof = read_json(proof_path)
+                    result = proof.get("ground_truth_result")
+                    if isinstance(result, dict) and isinstance(
+                        result.get("score"), (int, float)
+                    ):
+                        score = float(result["score"])
+                        meta["ground_truth_score"] = score
+                        proof_task_toml = load_task_toml(problem_dir)
+                        expectation = expected_ground_truth_score(
+                            proof_task_toml.difficulty.reward_type,
+                            deterministic_epsilon=proof_task_toml.ground_truth.score_epsilon,
+                            continuous_epsilon=proof_task_toml.ground_truth.continuous_score_epsilon,
+                        )
+                        meta["ground_truth_passed"] = expectation.passed(score)
+                except Exception:
+                    pass
             return (
                 StageResult(
                     passed=not issues,
                     issues=issues,
                     warnings=[
-                        "ML_Envs grader executed in-container (build proof), not "
+                        "metadata-mode ML grader executed in-container (build proof), not "
                         "host-probed: sample/trivial-score and [0,1] checks run there."
                     ],
                     duration_ms=int((time.monotonic() - start) * 1000),
@@ -1191,6 +1749,58 @@ class TaskValidator:
                 meta,
             )
 
+        # Accelerator (H100/TPU) and hidden_env tasks are graded IN-CONTAINER on
+        # the accelerated (agent-service / Taiga) lane -- exactly the lane
+        # `reference_config._resolve_reference_execution_auto` routes them to.
+        # There the oracle runs solution/solve.sh against the baked container
+        # data layout and its grade gates the submission. The host reference run
+        # below cannot reproduce that layout: it only rewrites the literal
+        # "/data/" string, so a solution that resolves its dataset through a
+        # helper (a default-data-dir / "standard data directories" lookup, an
+        # env var, a package resource) still points at a path that does not exist
+        # on the host; it also lacks the accelerator libraries and, for
+        # hidden_env tasks, the env_server /tmp/env.sock. That makes the host
+        # probe fail spuriously (e.g. "RuntimeError: Could not locate
+        # train.parquet") and red-wall tasks whose in-container oracle scored its
+        # target. Skip it here and lean on the in-container oracle grade as the
+        # authoritative sample/[0,1]/oracle check (mirrors the ML_Envs /
+        # in_container branches above). CPU tasks still host-probe normally.
+        _env = (
+            getattr(_task_toml_for_gt, "environment", None)
+            if _task_toml_for_gt
+            else None
+        )
+        _accelerator = (
+            accelerator_from_required_resources(
+                str(getattr(_env, "required_resources", "") or "")
+            )
+            if _env is not None
+            else ""
+        )
+        _hidden_env = str(getattr(_env, "hidden_env", "") or "").strip().lower()
+        if _accelerator or _hidden_env in {"env", "hybrid"}:
+            meta["return_shape"] = "bare_float"
+            _reason = (
+                f"hidden_env={_hidden_env}"
+                if _hidden_env in {"env", "hybrid"}
+                else f"accelerator={_accelerator}"
+            )
+            return (
+                StageResult(
+                    passed=not issues,
+                    issues=issues,
+                    warnings=[
+                        "reference grader executed in-container on the accelerated "
+                        f"lane ({_reason}), not host-probed: the in-container oracle "
+                        "build-proof grade is the authoritative sample/[0,1]/oracle "
+                        "check (the host cannot stage the baked container data "
+                        "layout / accelerator libs / env_server)."
+                    ],
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                ),
+                meta,
+            )
+
         # Add the shared grading library and the task-local scorer dir to sys.path
         # so `from grading import ...` and scorer-local imports resolve.
         # File at: <repo>/alignerr_plugin/src/alignerr_plugin/validators/task/validator.py
@@ -1205,7 +1815,9 @@ class TaskValidator:
 
         module = None
         try:
-            spec = importlib.util.spec_from_file_location("task_grader_compute_score_probe", grader_source)
+            spec = importlib.util.spec_from_file_location(
+                "task_grader_compute_score_probe", grader_source
+            )
             if spec is None or spec.loader is None:
                 raise ImportError(f"cannot import {grader_source}")
             module = importlib.util.module_from_spec(spec)
@@ -1225,8 +1837,17 @@ class TaskValidator:
             )
 
         compute_score = getattr(module, "compute_score", None)
+        registered_task = getattr(module, "TASK", None)
+        try:
+            from grading.evaluation import RubricTask  # type: ignore
+        except Exception:
+            RubricTask = ()  # type: ignore[assignment,misc]
+        if isinstance(registered_task, RubricTask):
+            compute_score = registered_task.compute_score
         if not callable(compute_score):
-            issues.append("compute_score must be a callable in compute_score.py")
+            issues.append(
+                "compute_score.py must define callable compute_score or TASK=RubricTask"
+            )
             for p in added:
                 if p in sys.path:
                     sys.path.remove(p)
@@ -1246,7 +1867,9 @@ class TaskValidator:
             workspace = Path(td) / "workspace"
             workspace.mkdir()
             _gt = load_task_toml(problem_dir)
-            render_required = render_expected(_gt.difficulty.task_type, _gt.ground_truth.render_outputs)
+            render_required = render_expected(
+                _gt.difficulty.task_type, _gt.ground_truth.render_outputs
+            )
             solution = problem_dir / "solution" / "solve.sh"
             has_solution = solution.exists()
             if has_solution:
@@ -1273,7 +1896,9 @@ class TaskValidator:
                 )
                 if completed.returncode != 0:
                     meta["reference_solution_exit"] = completed.returncode
-                    meta["reference_solution_stderr_tail"] = completed.stderr.strip()[:200]
+                    meta["reference_solution_stderr_tail"] = completed.stderr.strip()[
+                        :200
+                    ]
                     issues.append(
                         f"ground truth solution exited with status {completed.returncode}: "
                         f"{completed.stderr.strip()[:200]}"
@@ -1327,7 +1952,10 @@ class TaskValidator:
                 if params[:3] == ["workspace", "trajectory", "private"]:
                     args = [workspace, None, problem_dir / "scorer" / "data"]
                 else:
-                    issues.append("compute_score signature must start with " "(workspace, trajectory, private)")
+                    issues.append(
+                        "compute_score signature must start with "
+                        "(workspace, trajectory, private)"
+                    )
                 raw = compute_score(*args, **kwargs)
                 if isinstance(raw, RubricBuilder):
                     raw = raw.grade().to_dict()
@@ -1375,7 +2003,9 @@ class TaskValidator:
             elif isinstance(raw, dict):
                 # Look for the structured_subscores marker that to_dict
                 # would have emitted -- otherwise a "score_dict" return.
-                meta["return_shape"] = "rubric_grade" if "structured_subscores" in raw else "score_dict"
+                meta["return_shape"] = (
+                    "rubric_grade" if "structured_subscores" in raw else "score_dict"
+                )
 
             if not (0.0 <= sample_score <= 1.0):
                 issues.append(
@@ -1389,10 +2019,14 @@ class TaskValidator:
                 deterministic_epsilon=_gt2.ground_truth.score_epsilon,
                 continuous_epsilon=_gt2.ground_truth.continuous_score_epsilon,
             )
-            render_required = render_expected(_gt2.difficulty.task_type, _gt2.ground_truth.render_outputs)
+            render_required = render_expected(
+                _gt2.difficulty.task_type, _gt2.ground_truth.render_outputs
+            )
             if has_solution and not expectation.passed(sample_score):
                 failed = failed_criteria(grade.to_dict())
-                detail = f" Failed criteria: {'; '.join(failed[:10])}." if failed else ""
+                detail = (
+                    f" Failed criteria: {'; '.join(failed[:10])}." if failed else ""
+                )
                 issues.append(
                     "ground truth solution for reward_type "
                     f"{expectation.reward_type!r} must score {expectation.description}, "
@@ -1481,7 +2115,9 @@ class TaskValidator:
                     if proof_artifacts is not None:
                         meta["review_artifacts"] = proof_artifacts
                     else:
-                        render_artifacts = _run_ground_truth_render_probe(problem_dir, workspace)
+                        render_artifacts = _run_ground_truth_render_probe(
+                            problem_dir, workspace
+                        )
                         meta["review_artifacts"] = render_artifacts
             except Exception as exc:
                 issues.append(f"ground truth render probe failed: {exc}")
@@ -1570,7 +2206,9 @@ def _prompt_internal_env_issues(text: str) -> list[str]:
     return issues
 
 
-def _prompt_quality_issues(rel_path: str, text: str, *, require_data_token: bool = True) -> list[str]:
+def _prompt_quality_issues(
+    rel_path: str, text: str, *, require_data_token: bool = True
+) -> list[str]:
     """Return prompt-quality findings (length, runtime tokens, AI-spam tells).
 
     Ported from ML_Envs ``validate_problem_quality``. Each message is prefixed
@@ -1583,14 +2221,22 @@ def _prompt_quality_issues(rel_path: str, text: str, *, require_data_token: bool
     """
     issues: list[str] = []
     if len(text) < _MIN_PROMPT_LENGTH:
-        issues.append(f"{rel_path}: prompt must be at least {_MIN_PROMPT_LENGTH} characters " f"(got {len(text)})")
+        issues.append(
+            f"{rel_path}: prompt must be at least {_MIN_PROMPT_LENGTH} characters "
+            f"(got {len(text)})"
+        )
     if require_data_token and "/data/" not in text:
         issues.append(f"{rel_path}: prompt must describe the data available in /data/")
     if "/tmp/output" not in text:
-        issues.append(f"{rel_path}: prompt must describe the output path in /tmp/output/")
+        issues.append(
+            f"{rel_path}: prompt must describe the output path in /tmp/output/"
+        )
     for pattern in AI_ARTIFACT_PATTERNS:
         if pattern.search(text):
-            issues.append(f"{rel_path}: prompt contains AI-artifact phrase matching " f"/{pattern.pattern}/")
+            issues.append(
+                f"{rel_path}: prompt contains AI-artifact phrase matching "
+                f"/{pattern.pattern}/"
+            )
     if EMOJI_PATTERN.search(text):
         issues.append(f"{rel_path}: prompt appears to contain emoji characters")
     return issues
@@ -1615,7 +2261,10 @@ _SOLVER_LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
-    ("OpenSees API", re.compile(r"\bops\.(model|node|element|eigen|analyze|analysis)\b")),
+    (
+        "OpenSees API",
+        re.compile(r"\bops\.(model|node|element|eigen|analyze|analysis)\b"),
+    ),
     ("solver evidence", re.compile(r"\bsolver[_ -]?evidence\b", re.IGNORECASE)),
     (
         "solver provenance",
@@ -1624,7 +2273,10 @@ _SOLVER_LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
-    ("public solver probe", re.compile(r"\bpublic[_ -]?(solver[_ -]?)?probe\b", re.IGNORECASE)),
+    (
+        "public solver probe",
+        re.compile(r"\bpublic[_ -]?(solver[_ -]?)?probe\b", re.IGNORECASE),
+    ),
     ("surrogate model", re.compile(r"\bsurrogate(?:\s+model)?\b", re.IGNORECASE)),
 )
 
@@ -1673,20 +2325,16 @@ _SOLVER_ORACLE_MATERIAL_BY_TASK = {
     },
 }
 
-_OPENFOAM_COMMAND_RE = re.compile(
-    r"""(?ixm)
+_OPENFOAM_COMMAND_RE = re.compile(r"""(?ixm)
     (?:^|[;&|]\s*)
     (?:blockMesh|checkMesh|simpleFoam|pimpleFoam|snappyHexMesh|foamRun|potentialFoam)
     (?=$|\s)
-    """
-)
+    """)
 
-_OPENFOAM_PYTHON_SUBPROCESS_RE = re.compile(
-    r"""(?ix)
+_OPENFOAM_PYTHON_SUBPROCESS_RE = re.compile(r"""(?ix)
     \bsubprocess\.(?:run|check_call|check_output|Popen)\s*\(
     [^\n#]*["'](?:blockMesh|checkMesh|simpleFoam|pimpleFoam|snappyHexMesh|foamRun|potentialFoam)["']
-    """
-)
+    """)
 
 _OPENSEES_API_CALL_RE = re.compile(
     r"(?m)^\s*(?:[A-Za-z_][\w.]*\s*=\s*)?ops\.(?:model|node|element|analyze|eigen)\s*\("
@@ -1719,7 +2367,9 @@ def _strip_full_line_shell_comments(text: str) -> str:
 
 
 def _python_sources_from_text(source: str) -> list[str]:
-    return [source] + [match.group("body") for match in _PYTHON_HEREDOC_RE.finditer(source)]
+    return [source] + [
+        match.group("body") for match in _PYTHON_HEREDOC_RE.finditer(source)
+    ]
 
 
 def _module_names_from_python(source: str) -> set[str]:
@@ -1794,10 +2444,9 @@ def _referenced_oracle_files(problem_dir: Path, seed_text: str) -> list[Path]:
                 for root in root_paths
                 if candidate.is_relative_to(root)
             )
-            unique_name_matches = (
-                name_counts.get(candidate.name) == 1
-                and _contains_executable_file_reference(text, candidate.name)
-            )
+            unique_name_matches = name_counts.get(
+                candidate.name
+            ) == 1 and _contains_executable_file_reference(text, candidate.name)
             unique_import_matches = (
                 candidate.suffix == ".py"
                 and stem_counts.get(candidate.stem) == 1
@@ -1875,7 +2524,9 @@ def _oracle_solver_material_issues(problem_dir: Path, task_type: str) -> list[st
     ]
 
 
-def _instruction_solver_leak_issues(rel_path: str, text: str, task_type: str) -> list[str]:
+def _instruction_solver_leak_issues(
+    rel_path: str, text: str, task_type: str
+) -> list[str]:
     if task_type not in {"cfd", "structures"}:
         return []
     leaks = [label for label, pattern in _SOLVER_LEAK_PATTERNS if pattern.search(text)]
@@ -1901,7 +2552,9 @@ def _non_ascii_issues(rel_path: str, text: str) -> list[str]:
         if not offending:
             continue
         rendered = ", ".join(f"{ch!r} (U+{ord(ch):04X})" for ch in offending)
-        issues.append(f"{rel_path}:{lineno}: non-ASCII character(s) not allowed: {rendered}")
+        issues.append(
+            f"{rel_path}:{lineno}: non-ASCII character(s) not allowed: {rendered}"
+        )
     return issues
 
 
@@ -1934,7 +2587,8 @@ def _grader_sandbox_issues(rel_path: str, text: str) -> list[str]:
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and (
-            node.attr in _DYNAMIC_CODE_EXEC_MARKERS or node.attr in _DYNAMIC_CODE_EXEC_ATTR_ONLY
+            node.attr in _DYNAMIC_CODE_EXEC_MARKERS
+            or node.attr in _DYNAMIC_CODE_EXEC_ATTR_ONLY
         ):
             record(node.attr, node.lineno)
         elif isinstance(node, ast.Name) and node.id in _DYNAMIC_CODE_EXEC_MARKERS:
@@ -1960,18 +2614,23 @@ def _scorer_determinism_issues(rel_path: str, text: str) -> list[str]:
     """Flag wall-clock / unseeded-RNG non-determinism in live grading code.
 
     Only analyzes code that actually runs during grading: module-level statements
-    (executed on import) plus functions reachable from ``compute_score``. Helper
-    modules that do not define ``compute_score`` are checked at module level only;
-    without cross-file call graph information, treating every helper function as
-    live creates false positives for dead utilities. Seeded RNG is allowed only
-    when the seed call is itself on the live path.
+    (executed on import) plus functions reachable from ``compute_score`` or
+    ``evaluate`` (declarative ``RubricTask``). Helper modules that define neither
+    entrypoint are checked at module level only; without cross-file call graph
+    information, treating every helper function as live creates false positives
+    for dead utilities. Seeded RNG is allowed only when the seed call is itself
+    on the live path.
     """
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return []  # the schema / import stages report parse errors
 
-    func_defs = {fn.name for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    func_defs = {
+        fn.name
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     reachable = _reachable_from_compute_score(tree)
     enclosing = _enclosing_func_name(tree)
     imports = _import_aliases(tree)
@@ -1979,7 +2638,7 @@ def _scorer_determinism_issues(rel_path: str, text: str) -> list[str]:
     import_call_lines = _module_level_call_lines(tree)
     import_reachable = set(import_call_lines)
     function_call_lines = _function_call_lines(tree)
-    has_compute_score = "compute_score" in func_defs
+    has_grader_entrypoint = bool({"compute_score", "evaluate"} & func_defs)
 
     def _live(node: ast.AST) -> bool:
         name = enclosing.get(id(node))
@@ -1987,7 +2646,7 @@ def _scorer_determinism_issues(rel_path: str, text: str) -> list[str]:
             return True  # module-level code runs when the grader imports the scorer
         if name in import_reachable:
             return True  # called by module-level initialization code
-        if has_compute_score:
+        if has_grader_entrypoint:
             return name in reachable
         return False  # helper-only module: function bodies are live only if called
 
@@ -2154,7 +2813,11 @@ def _fixed_seed_literal(node: ast.AST) -> bool:
 
 
 def _parent_map(tree: ast.AST) -> dict[int, ast.AST]:
-    return {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    return {
+        id(child): node
+        for node in ast.walk(tree)
+        for child in ast.iter_child_nodes(node)
+    }
 
 
 def _unconditional_in_scope(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
@@ -2182,20 +2845,24 @@ def _unconditional_in_scope(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
 
 
 def _reachable_from_compute_score(tree: ast.AST) -> set[str]:
-    """Names of functions transitively called from ``compute_score`` (inclusive).
+    """Names of functions transitively called from grader entrypoints (inclusive).
 
-    The runner only ever calls ``compute_score``; a guard or read inside a
-    leftover ``test_*`` / unused helper the runner never invokes is dead during
-    grading, so the lint only analyzes code on this live set (plus module-level,
-    handled by the caller). Empty when ``compute_score`` is absent.
+    Live grading entrypoints are ``compute_score`` (legacy / continuous) and
+    ``evaluate`` (declarative ``RubricTask``). A guard or read inside a leftover
+    ``test_*`` / unused helper the runner never invokes is dead during grading,
+    so the lint only analyzes code on this live set (plus module-level, handled
+    by the caller). Empty when neither entrypoint is present.
     """
     defs: dict[str, ast.AST] = {
-        fn.name: fn for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        fn.name: fn
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    if "compute_score" not in defs:
+    roots = [name for name in ("compute_score", "evaluate") if name in defs]
+    if not roots:
         return set()
     reachable: set[str] = set()
-    stack = ["compute_score"]
+    stack = list(roots)
     while stack:
         name = stack.pop()
         if name in reachable or name not in defs:
@@ -2205,7 +2872,9 @@ def _reachable_from_compute_score(tree: ast.AST) -> set[str]:
             if isinstance(node, ast.Call):
                 func = node.func
                 callee = (
-                    func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute) else None
                 )
                 if callee in defs and callee not in reachable:
                     stack.append(callee)
@@ -2216,7 +2885,9 @@ def _module_level_call_lines(tree: ast.AST) -> dict[str, int]:
     """Functions called by module-level import-time code and their call order."""
     parents = _parent_map(tree)
     defs: dict[str, ast.AST] = {
-        fn.name: fn for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        fn.name: fn
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
     root_calls: dict[str, int] = {}
     for stmt in getattr(tree, "body", []):
@@ -2226,10 +2897,14 @@ def _module_level_call_lines(tree: ast.AST) -> dict[str, int]:
             if isinstance(node, ast.Call) and _unconditional_in_scope(node, parents):
                 func = node.func
                 callee = (
-                    func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute) else None
                 )
                 if callee in defs:
-                    root_calls[callee] = min(root_calls.get(callee, node.lineno), node.lineno)
+                    root_calls[callee] = min(
+                        root_calls.get(callee, node.lineno), node.lineno
+                    )
 
     reachable: dict[str, int] = {}
     stack = list(root_calls.items())
@@ -2242,7 +2917,9 @@ def _module_level_call_lines(tree: ast.AST) -> dict[str, int]:
             if isinstance(node, ast.Call):
                 func = node.func
                 callee = (
-                    func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute) else None
                 )
                 if callee in defs and callee not in reachable:
                     stack.append((callee, root_lineno))
@@ -2252,17 +2929,27 @@ def _module_level_call_lines(tree: ast.AST) -> dict[str, int]:
 def _function_call_lines(tree: ast.AST) -> dict[str, dict[str, int]]:
     """Unconditional direct function-call line numbers within each function."""
     parents = _parent_map(tree)
-    defs = {fn.name for fn in ast.walk(tree) if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    defs = {
+        fn.name
+        for fn in ast.walk(tree)
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     calls: dict[str, dict[str, int]] = {}
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         by_callee: dict[str, int] = {}
         for node in ast.walk(fn):
-            if not isinstance(node, ast.Call) or not _unconditional_in_scope(node, parents):
+            if not isinstance(node, ast.Call) or not _unconditional_in_scope(
+                node, parents
+            ):
                 continue
             func = node.func
-            callee = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+            callee = (
+                func.id
+                if isinstance(func, ast.Name)
+                else func.attr if isinstance(func, ast.Attribute) else None
+            )
             if callee in defs:
                 by_callee[callee] = min(by_callee.get(callee, node.lineno), node.lineno)
         calls[fn.name] = by_callee
@@ -2314,21 +3001,29 @@ def _enclosing_func_name(tree: ast.AST) -> dict[int, str | None]:
     def visit(node: ast.AST, fname: str | None) -> None:
         for child in ast.iter_child_nodes(node):
             parent[id(child)] = fname
-            next_fname = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else fname
+            next_fname = (
+                child.name
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                else fname
+            )
             visit(child, next_fname)
 
     visit(tree, None)
     return parent
 
 
-def _on_live_path(node_id: int, enclosing: dict[int, str | None], reachable: set[str]) -> bool:
+def _on_live_path(
+    node_id: int, enclosing: dict[int, str | None], reachable: set[str]
+) -> bool:
     """True if the node runs at grade time: module-level (exec'd when the runner
     imports the scorer) or inside a function reachable from compute_score."""
     fname = enclosing.get(node_id)
     return fname is None or fname in reachable
 
 
-def _raises_agent_fault(tree: ast.AST, enclosing: dict[int, str | None], reachable: set[str]) -> bool:
+def _raises_agent_fault(
+    tree: ast.AST, enclosing: dict[int, str | None], reachable: set[str]
+) -> bool:
     """True if ``AgentFault`` is raised anywhere on the live grading path."""
     for node in ast.walk(tree):
         if not isinstance(node, ast.Raise) or node.exc is None:
@@ -2380,7 +3075,11 @@ def _return_is_score_like(value: ast.AST) -> bool:
     ``"score"`` key, or a call to a ``*fail*/*zero*`` helper (``return
     _failure(...)``).
     """
-    if isinstance(value, ast.Constant) and isinstance(value.value, (int, float)) and not isinstance(value.value, bool):
+    if (
+        isinstance(value, ast.Constant)
+        and isinstance(value.value, (int, float))
+        and not isinstance(value.value, bool)
+    ):
         return True
     if isinstance(value, ast.Dict):
         for key in value.keys:
@@ -2388,7 +3087,11 @@ def _return_is_score_like(value: ast.AST) -> bool:
                 return True
     if isinstance(value, ast.Call):
         func = value.func
-        name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+        name = (
+            func.id
+            if isinstance(func, ast.Name)
+            else func.attr if isinstance(func, ast.Attribute) else ""
+        )
         if _FAILURE_FUNC_RE.search(name):
             return True
     return False
@@ -2402,7 +3105,11 @@ def _handler_swallows_to_score(handler: ast.ExceptHandler) -> bool:
     has_raise = False
     for stmt in handler.body:
         for node in ast.walk(stmt):
-            if isinstance(node, ast.Return) and node.value is not None and _return_is_score_like(node.value):
+            if (
+                isinstance(node, ast.Return)
+                and node.value is not None
+                and _return_is_score_like(node.value)
+            ):
                 has_score_return = True
             elif isinstance(node, ast.Raise):
                 has_raise = True
@@ -2414,7 +3121,9 @@ def _guarded_node_ids(tree: ast.AST) -> set[int]:
     directory/permission veto (so a planted dir/FIFO won't escape as OSError)."""
     ids: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Try) and any(_handler_guards_dir_veto(handler) for handler in node.handlers):
+        if isinstance(node, ast.Try) and any(
+            _handler_guards_dir_veto(handler) for handler in node.handlers
+        ):
             for stmt in node.body:
                 for descendant in ast.walk(stmt):
                     ids.add(id(descendant))
@@ -2488,7 +3197,11 @@ def _pickle_exec_reader(
                 return f"{module}.{func.attr}"
             if func.attr == "load" and module in {"np", "numpy"}:
                 for kw in call.keywords:
-                    if kw.arg == "allow_pickle" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                    if (
+                        kw.arg == "allow_pickle"
+                        and isinstance(kw.value, ast.Constant)
+                        and kw.value.value is True
+                    ):
                         return "numpy.load(allow_pickle=True)"
         if func.attr == "read_pickle":
             return "read_pickle"
@@ -2579,7 +3292,9 @@ def _agent_writable_names(tree: ast.AST, text: str) -> set[str]:
     Module-wide fixpoint over assignments (precision over recall is acceptable;
     scorer files are small)."""
     names: set[str] = set()
-    assigns = [node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))]
+    assigns = [
+        node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
+    ]
     changed = True
     while changed:
         changed = False
@@ -2587,7 +3302,9 @@ def _agent_writable_names(tree: ast.AST, text: str) -> set[str]:
             value = assign.value
             if value is None:
                 continue
-            targets = assign.targets if isinstance(assign, ast.Assign) else [assign.target]
+            targets = (
+                assign.targets if isinstance(assign, ast.Assign) else [assign.target]
+            )
             target_names = [t.id for t in targets if isinstance(t, ast.Name)]
             if not target_names:
                 continue
@@ -2646,7 +3363,11 @@ def _expr_is_trusted(expr: ast.AST, text: str, trusted_names: set[str]) -> bool:
     if isinstance(expr, ast.Call):
         func = expr.func
         # ``base.joinpath(...)`` / ``base.resolve()`` etc.: the receiver roots it.
-        if isinstance(func, ast.Attribute) and func.attr in {"joinpath", "resolve", "absolute"}:
+        if isinstance(func, ast.Attribute) and func.attr in {
+            "joinpath",
+            "resolve",
+            "absolute",
+        }:
             return _expr_is_trusted(func.value, text, trusted_names)
         # ``Path(base)`` / ``os.path.join(base, ...)`` / ``open(base, ...)``: the
         # first positional argument roots the path.
@@ -2674,7 +3395,9 @@ def _trusted_read_names(tree: ast.AST, text: str) -> set[str]:
             for arg in positional + list(node.args.kwonlyargs):
                 if arg.arg == "private":
                     names.add(arg.arg)
-    assigns = [node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))]
+    assigns = [
+        node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
+    ]
     changed = True
     while changed:
         changed = False
@@ -2682,7 +3405,9 @@ def _trusted_read_names(tree: ast.AST, text: str) -> set[str]:
             value = assign.value
             if value is None:
                 continue
-            targets = assign.targets if isinstance(assign, ast.Assign) else [assign.target]
+            targets = (
+                assign.targets if isinstance(assign, ast.Assign) else [assign.target]
+            )
             target_names = [t.id for t in targets if isinstance(t, ast.Name)]
             if not target_names:
                 continue
@@ -2694,7 +3419,9 @@ def _trusted_read_names(tree: ast.AST, text: str) -> set[str]:
     return names
 
 
-def _trusted_open_handles(tree: ast.AST, text: str, trusted_names: set[str]) -> set[str]:
+def _trusted_open_handles(
+    tree: ast.AST, text: str, trusted_names: set[str]
+) -> set[str]:
     """``with open(<trusted>) as f:`` handles: ``f`` inherits the open's
     trustedness so a subsequent ``pickle.load(f)`` of held-out truth is not
     flagged. Only a provably-trusted context expression qualifies."""
@@ -2722,6 +3449,66 @@ def _pickle_arg_is_trusted(
     if isinstance(path_arg, ast.Name) and path_arg.id in trusted_handles:
         return True
     return _expr_is_trusted(path_arg, text, trusted_names)
+
+
+def _attribute_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _attribute_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def _declarative_rubric_api_issues(rel_path: str, text: str) -> list[str]:
+    """Reject task-owned mechanics that belong to the shared RubricTask boundary."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+    issues: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == (
+            "compute_score"
+        ):
+            issues.append(
+                f"{rel_path}:{node.lineno}: declarative rubric modules must not "
+                "define compute_score(); the shared runner invokes TASK directly"
+            )
+            continue
+        if isinstance(node, ast.Call):
+            name = _attribute_name(node.func)
+            segment = ast.get_source_segment(text, node) or ""
+            if name.startswith("subprocess."):
+                issues.append(
+                    f"{rel_path}:{node.lineno}: rubric task code must run external "
+                    "commands through context.run_solver(), not subprocess"
+                )
+            if name in {"open", "json.loads", "pickle.load", "pickle.loads"} or (
+                name.endswith((".read_text", ".read_bytes", ".open"))
+            ):
+                if (
+                    "context.workspace" in segment
+                    or "/tmp/output" in segment
+                    or "context.candidate" in segment
+                ):
+                    issues.append(
+                        f"{rel_path}:{node.lineno}: rubric task code must declare an "
+                        "artifact descriptor instead of reading/parsing candidate data"
+                    )
+            if name in {"float", "int"} and "context.candidate" in segment:
+                issues.append(
+                    f"{rel_path}:{node.lineno}: rubric task code must declare "
+                    "NumericField or use context.number(), not coerce candidate values"
+                )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            segment = ast.get_source_segment(text, node) or ""
+            if "context.candidate" in segment:
+                issues.append(
+                    f"{rel_path}:{node.lineno}: candidate-derived division must use "
+                    "context.ratio() with an explicit zero policy"
+                )
+    return issues
 
 
 def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
@@ -2769,7 +3556,9 @@ def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
                         f"discards the rollout."
                     )
 
-        if not isinstance(node, ast.Call) or not _on_live_path(id(node), enclosing, reachable):
+        if not isinstance(node, ast.Call) or not _on_live_path(
+            id(node), enclosing, reachable
+        ):
             continue
 
         pickle_reader = _pickle_exec_reader(node, module_aliases, bare_pickle_readers)
@@ -2957,7 +3746,9 @@ def _grade_workspace_score(
     except Exception as exc:
         # Match AgentFault by name across the MRO so subclasses (and AgentFault
         # imported under any path) all count, not just the exact type.
-        if agent_fault_as_zero and any(base.__name__ == "AgentFault" for base in type(exc).__mro__):
+        if agent_fault_as_zero and any(
+            base.__name__ == "AgentFault" for base in type(exc).__mro__
+        ):
             return 0.0
         return None
 
@@ -3016,7 +3807,7 @@ def baseline_trio_warnings(problem_dir: Path) -> list[str]:
     found = ", ".join(sorted(names)) if names else "none"
     return [
         f"baseline trio advisory: found {len(names)} committed baseline(s) "
-        f"({found}). ML_Envs convention is a weak-baseline trio for calibration: "
+        f"({found}). The continuous ML convention is a weak-baseline trio for calibration: "
         "naive (mean/median or majority/random), linear/logistic on raw "
         "features, and an untuned GBT on raw features. Policy/environment tasks "
         "may use analogues (random-action, no-op, weak-trained). This is "
@@ -3049,7 +3840,9 @@ def _baseline_calibration_issues(
 
     baselines_dir = problem_dir / "baselines"
     baseline_dirs = (
-        [child for child in sorted(baselines_dir.iterdir()) if child.is_dir()] if baselines_dir.is_dir() else []
+        [child for child in sorted(baselines_dir.iterdir()) if child.is_dir()]
+        if baselines_dir.is_dir()
+        else []
     )
     if not baseline_dirs:
         # Absence is a documented convention, not a hard failure: the no-op gate
@@ -3114,7 +3907,9 @@ def _extract_prompt_example_submission(
         task_toml = load_task_toml(problem_dir)
     except Exception:
         return None
-    json_outputs = [out.path for out in task_toml.outputs if out.path.lower().endswith(".json")]
+    json_outputs = [
+        out.path for out in task_toml.outputs if out.path.lower().endswith(".json")
+    ]
     if len(json_outputs) != 1:
         return None
     filename = PurePosixPath(json_outputs[0]).name
@@ -3194,7 +3989,9 @@ def _trivial_submission_scores(
     return results
 
 
-_ORACLE_NAME_RE = re.compile(r"oracle|expected|reference|canonical|answer|ground_truth|hidden", re.IGNORECASE)
+_ORACLE_NAME_RE = re.compile(
+    r"oracle|expected|reference|canonical|answer|ground_truth|hidden", re.IGNORECASE
+)
 
 
 _DEPRECATED_CURVE_NAMES = {
@@ -3314,7 +4111,11 @@ def _reward_hack_warnings(rel_path: str, text: str) -> list[str]:
             if isinstance(cmp, ast.Compare)
             for op in cmp.ops
         )
-        if has_eq and _ORACLE_NAME_RE.search(test_src) and _branch_returns_full_credit(node):
+        if (
+            has_eq
+            and _ORACLE_NAME_RE.search(test_src)
+            and _branch_returns_full_credit(node)
+        ):
             warnings.append(
                 f"{rel_path}:{node.lineno}: looks like an exact-match shortcut that "
                 f"awards full credit when the submission equals an oracle/reference "
@@ -3325,7 +4126,9 @@ def _reward_hack_warnings(rel_path: str, text: str) -> list[str]:
 
     # (2) sentiment-gated criteria.
     string_consts = [
-        node.value.lower() for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        node.value.lower()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
     ]
     blob = " ".join(string_consts)
     positive_hits = {w for w in _SENTIMENT_POSITIVE_WORDS if w in blob}
@@ -3342,7 +4145,9 @@ def _reward_hack_warnings(rel_path: str, text: str) -> list[str]:
     # (3) keyword/substring-only membership checks.
     keyword_literals: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Compare) and any(isinstance(op, ast.In) for op in node.ops):
+        if isinstance(node, ast.Compare) and any(
+            isinstance(op, ast.In) for op in node.ops
+        ):
             if isinstance(node.left, ast.Constant) and isinstance(node.left.value, str):
                 literal = node.left.value.strip()
                 if 0 < len(literal) <= 40:
@@ -3432,13 +4237,18 @@ def _validate_committed_ground_truth_result(
     # trivial_baseline_score; enforce the anti-reward-hacking ceiling here
     # (no-op must not out-score real work) and, for continuous scoring
     # functions, the strict zero anchor (no attempt must score 0).
-    issues.extend(_trivial_baseline_proof_issues(result, task_toml=task_toml, meta=meta))
+    issues.extend(
+        _trivial_baseline_proof_issues(result, task_toml=task_toml, meta=meta)
+    )
 
-    if render_expected(task_toml.difficulty.task_type, task_toml.ground_truth.render_outputs):
+    if render_expected(
+        task_toml.difficulty.task_type, task_toml.ground_truth.render_outputs
+    ):
         artifacts = _valid_committed_render_artifacts(problem_dir)
         if artifacts is None:
             issues.append(
-                "in-container ground truth render artifacts are missing, stale, or do " "not match build_proof.json"
+                "in-container ground truth render artifacts are missing, stale, or do "
+                "not match build_proof.json"
             )
         else:
             meta["review_artifacts"] = artifacts
@@ -3459,7 +4269,10 @@ def _trivial_baseline_proof_issues(
     require the field to be present and anchored to ~0.
     """
     issues: list[str] = []
-    is_continuous = normalize_enum_value(task_toml.difficulty.reward_type) == "continuous_scoring_function"
+    is_continuous = (
+        normalize_enum_value(task_toml.difficulty.reward_type)
+        == "continuous_scoring_function"
+    )
     trivial_score = ground_truth_result.get("trivial_baseline_score")
     if isinstance(trivial_score, (int, float)):
         meta["noop_score"] = float(trivial_score)
@@ -3492,7 +4305,9 @@ def _trivial_baseline_proof_issues(
     return issues
 
 
-def _mlenvs_trivial_baseline_issues(problem_dir: Path, meta: dict[str, Any]) -> list[str]:
+def _mlenvs_trivial_baseline_issues(
+    problem_dir: Path, meta: dict[str, Any]
+) -> list[str]:
     """Zero-anchor proof check for ML_Envs-mode tasks (always continuous).
 
     ML_Envs graders cannot be host-probed and their build proof is not rebuilt
@@ -3543,12 +4358,18 @@ def _dockerfile_instructions(dockerfile: Path) -> list[tuple[int, str]]:
 
 def _is_public_container_path(path: str) -> bool:
     normalized = path.rstrip("/") or "/"
-    return any(normalized == root or normalized.startswith(root + "/") for root in _PUBLIC_ROOTS)
+    return any(
+        normalized == root or normalized.startswith(root + "/")
+        for root in _PUBLIC_ROOTS
+    )
 
 
 def _is_private_container_path(path: str) -> bool:
     normalized = path.rstrip("/") or "/"
-    return any(normalized == root or normalized.startswith(root + "/") for root in _PRIVATE_ROOTS)
+    return any(
+        normalized == root or normalized.startswith(root + "/")
+        for root in _PRIVATE_ROOTS
+    )
 
 
 # Tokens whose presence anywhere in a reference-solution file means the
@@ -3565,7 +4386,9 @@ _PRIVATE_READ_HINT = (
 )
 
 
-def _private_token_in(text: str, tokens: tuple[str, ...] = _PRIVATE_READ_TOKENS) -> str | None:
+def _private_token_in(
+    text: str, tokens: tuple[str, ...] = _PRIVATE_READ_TOKENS
+) -> str | None:
     """Return the first private-root token found in ``text``, else ``None``."""
     for token in tokens:
         if token in text:
@@ -3586,7 +4409,9 @@ def _solution_shell_private_read_issues(
             continue
         token = _private_token_in(line, tokens)
         if token is not None:
-            issues.append(f"{rel_path}:{lineno}: {_PRIVATE_READ_HINT} (matched {token!r})")
+            issues.append(
+                f"{rel_path}:{lineno}: {_PRIVATE_READ_HINT} (matched {token!r})"
+            )
     return issues
 
 
@@ -3634,7 +4459,9 @@ def _solution_python_private_read_issues(
                 continue
             token = _private_token_in(line, tokens)
             if token is not None:
-                issues.append(f"{rel_path}:{lineno}: {_PRIVATE_READ_HINT} (matched {token!r})")
+                issues.append(
+                    f"{rel_path}:{lineno}: {_PRIVATE_READ_HINT} (matched {token!r})"
+                )
         return issues
 
     docstring_ids = _docstring_constant_ids(tree)
@@ -3677,7 +4504,9 @@ def _solution_private_read_issues(problem_dir: Path) -> list[str]:
     # In ML_Envs mode the on-disk private root is data/private/ (baked to the
     # /mcp_server/data container root, which is already covered). The trailing
     # slash keeps a public file named data/private_* from false-matching.
-    tokens = (*_PRIVATE_READ_TOKENS, "data/private/") if is_mlenvs else _PRIVATE_READ_TOKENS
+    tokens = (
+        (*_PRIVATE_READ_TOKENS, "data/private/") if is_mlenvs else _PRIVATE_READ_TOKENS
+    )
     issues: list[str] = []
     for path in sorted(solution_dir.rglob("*")):
         if not path.is_file():
@@ -3701,7 +4530,8 @@ def _has_private_source(source: str) -> bool:
     lower = source.lower()
     normalized = lower.replace("\\", "/").strip("/")
     if any(
-        normalized == marker.strip("/") or normalized.startswith(marker.strip("/") + "/")
+        normalized == marker.strip("/")
+        or normalized.startswith(marker.strip("/") + "/")
         for marker in _PRIVATE_DOCKER_SOURCES
         if marker.startswith("/")
     ):
@@ -3727,24 +4557,35 @@ def _dockerfile_private_layout_issues(dockerfile: Path) -> list[str]:
             if len(positional) >= 2:
                 sources = positional[:-1]
                 destination = positional[-1]
-                if _is_public_container_path(destination) and any(_has_private_source(source) for source in sources):
+                if _is_public_container_path(destination) and any(
+                    _has_private_source(source) for source in sources
+                ):
                     issues.append(
                         f"{dockerfile}:{line_number}: private scorer fixtures must "
                         f"not be copied to public/model-writable path {destination!r}"
                     )
                 if _is_private_container_path(destination):
-                    issues.extend(_copy_private_layout_flag_issues(dockerfile, line_number, flags))
+                    issues.extend(
+                        _copy_private_layout_flag_issues(dockerfile, line_number, flags)
+                    )
                     root = _matching_private_root(destination)
                     chmod_flag = flags.get("chmod")
-                    self_hardened = chmod_flag is not None and not _mode_grants_group_world(chmod_flag)
+                    self_hardened = (
+                        chmod_flag is not None
+                        and not _mode_grants_group_world(chmod_flag)
+                    )
                     if root is not None and not self_hardened:
                         needs_hardening.setdefault(root, line_number)
         if lower.startswith("run "):
             run_body = lower.removeprefix("run ").strip()
             if "chmod" in lower:
-                issues.extend(_chmod_private_layout_issues(dockerfile, line_number, run_body))
+                issues.extend(
+                    _chmod_private_layout_issues(dockerfile, line_number, run_body)
+                )
             if "chown" in lower:
-                issues.extend(_chown_private_layout_issues(dockerfile, line_number, run_body))
+                issues.extend(
+                    _chown_private_layout_issues(dockerfile, line_number, run_body)
+                )
             hardened_roots |= _private_roots_hardened_by_run(run_body)
     for root in sorted(set(needs_hardening) - hardened_roots):
         issues.append(
@@ -3808,7 +4649,11 @@ def _dockerfile_copy_parts(tokens: list[str]) -> tuple[dict[str, str], list[str]
         else:
             positional.append(token)
         index += 1
-    if len(positional) >= 2 and positional[0].startswith("[") and positional[-1].endswith("]"):
+    if (
+        len(positional) >= 2
+        and positional[0].startswith("[")
+        and positional[-1].endswith("]")
+    ):
         positional = _dockerfile_json_array_parts(positional)
     return flags, positional
 
@@ -3825,22 +4670,28 @@ def _dockerfile_json_array_parts(tokens: list[str]) -> list[str]:
     return [item for item in parsed if isinstance(item, str)]
 
 
-def _copy_private_layout_flag_issues(dockerfile: Path, line_number: int, flags: dict[str, str]) -> list[str]:
+def _copy_private_layout_flag_issues(
+    dockerfile: Path, line_number: int, flags: dict[str, str]
+) -> list[str]:
     issues: list[str] = []
     owner = flags.get("chown")
     if owner is not None and _owner_assigns_nonroot_user(owner):
         issues.append(
-            f"{dockerfile}:{line_number}: private grader/data COPY --chown must " "keep root as the owning user"
+            f"{dockerfile}:{line_number}: private grader/data COPY --chown must "
+            "keep root as the owning user"
         )
     mode_token = flags.get("chmod")
     if mode_token is not None and _mode_grants_group_world(mode_token):
         issues.append(
-            f"{dockerfile}:{line_number}: private grader/data COPY --chmod " f"{mode_token!r} grants group/world access"
+            f"{dockerfile}:{line_number}: private grader/data COPY --chmod "
+            f"{mode_token!r} grants group/world access"
         )
     return issues
 
 
-def _chmod_private_layout_issues(dockerfile: Path, line_number: int, instruction: str) -> list[str]:
+def _chmod_private_layout_issues(
+    dockerfile: Path, line_number: int, instruction: str
+) -> list[str]:
     issues: list[str] = []
     segments = instruction.replace("&&", ";").split(";")
     for segment in segments:
@@ -3854,7 +4705,9 @@ def _chmod_private_layout_issues(dockerfile: Path, line_number: int, instruction
             continue
         mode_token = rest[0]
         targets = rest[1:]
-        if _targets_include_mcp_server_root(targets) and _mode_grants_group_world(mode_token):
+        if _targets_include_mcp_server_root(targets) and _mode_grants_group_world(
+            mode_token
+        ):
             issues.append(
                 f"{dockerfile}:{line_number}: /mcp_server chmod {mode_token!r} "
                 "grants group/world traversal into grader-private mounts"
@@ -3869,10 +4722,15 @@ def _chmod_private_layout_issues(dockerfile: Path, line_number: int, instruction
 
 
 def _targets_include_mcp_server_root(targets: list[str]) -> bool:
-    return any((_clean_dockerfile_path(target).rstrip("/") or "/") == _MCP_SERVER_ROOT for target in targets)
+    return any(
+        (_clean_dockerfile_path(target).rstrip("/") or "/") == _MCP_SERVER_ROOT
+        for target in targets
+    )
 
 
-def _chown_private_layout_issues(dockerfile: Path, line_number: int, instruction: str) -> list[str]:
+def _chown_private_layout_issues(
+    dockerfile: Path, line_number: int, instruction: str
+) -> list[str]:
     issues: list[str] = []
     segments = instruction.replace("&&", ";").split(";")
     for segment in segments:
@@ -3889,12 +4747,17 @@ def _chown_private_layout_issues(dockerfile: Path, line_number: int, instruction
         if not _owner_assigns_nonroot_user(owner):
             continue
         if _targets_include_private_root(targets):
-            issues.append(f"{dockerfile}:{line_number}: private grader/data paths must " "remain root-owned")
+            issues.append(
+                f"{dockerfile}:{line_number}: private grader/data paths must "
+                "remain root-owned"
+            )
     return issues
 
 
 def _targets_include_private_root(targets: list[str]) -> bool:
-    return any(_is_private_container_path(_clean_dockerfile_path(target)) for target in targets)
+    return any(
+        _is_private_container_path(_clean_dockerfile_path(target)) for target in targets
+    )
 
 
 def _clean_dockerfile_path(path: str) -> str:
@@ -3907,7 +4770,9 @@ def _mode_grants_group_world(mode_token: str) -> bool:
     except ValueError:
         pass
     for clause in mode_token.lower().split(","):
-        operator_index = next((index for index, char in enumerate(clause) if char in "+="), None)
+        operator_index = next(
+            (index for index, char in enumerate(clause) if char in "+="), None
+        )
         if operator_index is None:
             continue
         who = clause[:operator_index] or "a"
@@ -3960,7 +4825,9 @@ def _file_digest(path: Path) -> bytes:
 
 
 def _is_sensitive_private_name(path: Path) -> bool:
-    return any(token in _SENSITIVE_PRIVATE_NAME_PARTS for token in _name_tokens(path.name))
+    return any(
+        token in _SENSITIVE_PRIVATE_NAME_PARTS for token in _name_tokens(path.name)
+    )
 
 
 def _name_tokens(name: str) -> list[str]:
@@ -4081,7 +4948,9 @@ def _run_ground_truth_render_probe(problem_dir: Path, workspace: Path) -> list[s
     for output in ground_truth.render_outputs:
         rel = _output_relative_path(output.path)
         if rel is None:
-            raise RuntimeError(f"ground truth render output must be under /tmp/output: {output.path}")
+            raise RuntimeError(
+                f"ground truth render output must be under /tmp/output: {output.path}"
+            )
         validate_video_file(workspace / rel, output.path)
         artifacts.append(output.path)
     return artifacts

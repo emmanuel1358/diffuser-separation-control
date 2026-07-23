@@ -147,6 +147,7 @@ COPY --chmod=0755 base/install-common.sh /tmp/base/install-common.sh
 RUN /tmp/base/install-common.sh
 
 @@DEPS@@@@ENV_DEPS@@@@GRADING_DEPS@@COPY --chown=root:root data/private/ /mcp_server/data/
+COPY --chown=root:root calibration.lock.json /mcp_server/calibration/calibration.lock.json
 COPY --chown=root:root test_file.py /mcp_server/grader/compute_score.py
 COPY data/public/ /workspace/data/
 RUN rm -rf /data \
@@ -160,9 +161,10 @@ COPY prompt.md /task/prompt.md
 RUN printf '[environment]\\nhidden_env = "@@HIDDEN_ENV@@"\\n' > /task/task.toml
 # Re-lock the held-out truth + grader and re-seal /mcp_server after the COPYs
 # above (install-common sealed it once; the COPYs re-added files).
-RUN chown -R root:root /mcp_server/data /mcp_server/grader \\
-    && find /mcp_server/data /mcp_server/grader -type d -exec chmod 0700 {} + \\
-    && find /mcp_server/data /mcp_server/grader -type f -exec chmod 0600 {} + \\
+RUN printf 'author-image-fallback\\n' > /mcp_server/calibration/.author-source \\
+    && chown -R root:root /mcp_server/data /mcp_server/grader /mcp_server/calibration \\
+    && find /mcp_server/data /mcp_server/grader /mcp_server/calibration -type d -exec chmod 0700 {} + \\
+    && find /mcp_server/data /mcp_server/grader /mcp_server/calibration -type f -exec chmod 0600 {} + \\
     && chmod 0700 /mcp_server \\
     && mkdir -p /workdir /tmp/output \\
     && chmod 0777 /workdir /tmp/output
@@ -429,6 +431,13 @@ def _write_self_contained_environment(problem_dir: Path, output_dir: Path) -> No
             source = problem_dir / name
             if source.exists():
                 shutil.copy2(source, environment_dir / name)
+        calibration_lock = problem_dir / "calibration.lock.json"
+        if calibration_lock.is_file():
+            shutil.copy2(calibration_lock, environment_dir / calibration_lock.name)
+        else:
+            # Legacy ML graders do not read this placeholder; keeping the file
+            # present lets one self-contained Dockerfile serve both contracts.
+            (environment_dir / "calibration.lock.json").write_text("{}\n")
         source_data = problem_dir / "data"
         destination_data = environment_dir / "data"
         if source_data.exists():

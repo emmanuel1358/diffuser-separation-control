@@ -1,41 +1,53 @@
 # Synthetic Tabular Regression + Classification
 
-You have a small tabular dataset with three continuous input features and three prediction targets. Train on the provided training rows, then produce predictions for the held-out test rows.
+You have a small tabular dataset with three continuous input features and three
+prediction targets. Train on the provided rows, then submit a queryable predictor
+that the grader can evaluate on fresh hidden rows after your artifact is committed.
 
 ## Inputs
 
 The public data files live under `/data/`:
 
 - `/data/train.parquet`: 500 rows, columns `x1`, `x2`, `x3`, `t1`, `t2`, `label`. The first three are features, and the last three are targets.
-- `/data/test.parquet`: 200 rows, columns `x1`, `x2`, `x3` only. No targets are exposed for the test set.
 - `/data/column_mapping.json`: high-level descriptions of each column. It contains no formulas and no hints about relationships between columns.
 
-The train and test sets differ in the range of `x1`: training rows have `x1` inside a narrower sub-range than test rows. The distributions of `x2` and `x3` are identical across splits. Models must generalize over `x1` to score well on the test set.
+The hidden challenge has a wider `x1` range than training. Models must generalize
+over `x1` rather than replaying a fixed output vector.
 
 ## What to produce
 
-Write predictions for every test row to:
+Write:
 
 ```text
-/tmp/output/submission.csv
+/tmp/output/predictor.py
 ```
 
-The file must have one row per input row in the same order as `/data/test.parquet`, with a header row and these columns:
+It must define `load_predictor()`, returning an object with:
 
-- `t1`: regression prediction, real-valued.
-- `t2`: regression prediction, real-valued.
-- `label`: classification prediction as integer `0` or `1`.
+```python
+predict(rows: list[dict]) -> dict[str, list]
+```
 
-Example submission header:
+Each input row contains `x1`, `x2`, and `x3`. Return equally sized lists named
+`t1`, `t2`, and `label`; labels must be `0` or `1`.
 
-```text
-t1,t2,label
+```python
+def load_predictor():
+    class Predictor:
+        def predict(self, rows):
+            return {
+                "t1": [0.0 for _ in rows],
+                "t2": [0.0 for _ in rows],
+                "label": [0 for _ in rows],
+            }
+    return Predictor()
 ```
 
 ## Constraints
 
-- Exactly 200 rows (one per test row), in test-row order.
-- `label` must be an integer `0` or `1`.
+- The predictor must not require network access.
+- Calls must be deterministic for the same rows.
+- You may place additional model files beside `predictor.py`.
 
 ## Scoring
 
@@ -45,4 +57,8 @@ Each target is scored against its own metric and anchored between a naive baseli
 - `t2`: SRE; lower is better. Perfect is `0`.
 - `label`: binary F1; higher is better. Perfect is `1`.
 
-The three per-target scores are combined into a single continuous score.
+The grader first commits your artifact, then selects a private challenge and
+calls your predictor in a sandbox. Each target must show row-level information
+under a family-wide permutation certificate; constants, perturbed constants,
+row-index outputs, and marginally shuffled outputs receive zero for that target.
+Certified targets retain their ordinary calibrated quality score.

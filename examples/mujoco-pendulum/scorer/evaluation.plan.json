@@ -1,0 +1,29 @@
+{
+  "decision_ids": [
+    "compiled",
+    "single_hinge",
+    "single_dof",
+    "moving_body_count",
+    "mass_target",
+    "com_length_target",
+    "jointpos_sensor",
+    "jointvel_sensor",
+    "stable_rollout",
+    "no_nan"
+  ],
+  "evidence": {
+    "aggregation": "weighted",
+    "artifact": {
+      "max_bytes": 4194304,
+      "path": "model.xml",
+      "type": "text-artifact.v1"
+    },
+    "type": "declarative-rubric.v1"
+  },
+  "metric_ids": [],
+  "plan_sha256": "e8ec57d75132c195571590da00bcb3a9a7683c0bfa6e7ceb797322d7025d7055",
+  "protocol": "declarative-rubric.v1",
+  "schema_version": "evaluation-plan.v2",
+  "security_tier": "sealed_rescore",
+  "task_spec_sha256": "90af7cee7948c485e9db033ca6c4453dd088f91fa7d847e68843f1be9312fde9"
+}

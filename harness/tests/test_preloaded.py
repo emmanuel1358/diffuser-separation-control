@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from alignerr_plugin import preloaded as preloaded_module
 from alignerr_plugin.preloaded import (
     PRELOADED_MANIFEST_PATH,
     auto_mount_entries,
     content_address,
     load_preloaded_manifest,
     manifest_entry,
+    merge_manifest_entries,
+    qa_visible_public_file_selection,
+    qa_visible_public_files,
     render_preloaded_notice,
     remote_squashfs_name,
 )
@@ -76,6 +81,157 @@ def test_remote_squashfs_name_is_content_addressed() -> None:
     assert name == "my-task/m1-abcd1234abcd1234.squashfs"
 
 
+def test_small_public_tree_expands_into_qa_visible_files(tmp_path: Path) -> None:
+    public = tmp_path / "public"
+    public.joinpath("nested").mkdir(parents=True)
+    public.joinpath("column_mapping.json").write_text("{}\n")
+    public.joinpath("nested", "train.parquet").write_bytes(b"parquet")
+
+    files = qa_visible_public_files(public, "/data")
+
+    assert files == [
+        ("column_mapping.json", "/data/column_mapping.json"),
+        ("nested/train.parquet", "/data/nested/train.parquet"),
+    ]
+    assert qa_visible_public_file_selection(public, "/data") == (files, True)
+
+
+def test_large_public_tree_keeps_squashfs_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    public = tmp_path / "public"
+    public.mkdir()
+    public.joinpath("a").write_bytes(b"1234")
+    monkeypatch.setattr(preloaded_module, "QA_VISIBLE_PUBLIC_MAX_BYTES", 3)
+
+    assert qa_visible_public_files(public, "/data") is None
+
+
+def test_large_public_tree_exposes_only_prompt_references(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    public = tmp_path / "public"
+    public.mkdir()
+    public.joinpath("column_mapping.json").write_text("{}\n")
+    public.joinpath("large.bin").write_bytes(b"payload")
+    monkeypatch.setattr(preloaded_module, "QA_VISIBLE_PUBLIC_MAX_FILES", 1)
+
+    files = qa_visible_public_files(
+        public,
+        "/data",
+        prompt_text="Read `/data/column_mapping.json` before training.",
+    )
+
+    assert files == [("column_mapping.json", "/data/column_mapping.json")]
+    assert qa_visible_public_file_selection(
+        public,
+        "/data",
+        prompt_text="Read `/data/column_mapping.json` before training.",
+    ) == (files, False)
+
+
+def test_large_public_tree_without_prompt_reference_uses_squashfs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    public = tmp_path / "public"
+    public.mkdir()
+    public.joinpath("a.json").write_text("{}\n")
+    public.joinpath("b.json").write_text("{}\n")
+    monkeypatch.setattr(preloaded_module, "QA_VISIBLE_PUBLIC_MAX_FILES", 1)
+
+    assert (
+        qa_visible_public_files(public, "/data", prompt_text="No files are named.")
+        is None
+    )
+
+
+def test_prompt_reference_matching_rejects_filename_substrings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    public = tmp_path / "public"
+    public.mkdir()
+    for name in ("column_mapping.json", "ng.json", "output.json", "ut.json"):
+        public.joinpath(name).write_text("{}\n")
+    monkeypatch.setattr(preloaded_module, "QA_VISIBLE_PUBLIC_MAX_FILES", 2)
+
+    files = qa_visible_public_files(
+        public,
+        "/data",
+        prompt_text="Read column_mapping.json and write output.json.",
+    )
+
+    assert files == [
+        ("column_mapping.json", "/data/column_mapping.json"),
+        ("output.json", "/data/output.json"),
+    ]
+
+
+def test_prompt_reference_matching_rejects_extension_suffixes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    public = tmp_path / "public"
+    public.mkdir()
+    public.joinpath("output.json").write_text("{}\n")
+    public.joinpath("output.json.bak").write_text("{}\n")
+    monkeypatch.setattr(preloaded_module, "QA_VISIBLE_PUBLIC_MAX_FILES", 1)
+
+    files = qa_visible_public_files(
+        public,
+        "/data",
+        prompt_text="Inspect output.json.bak.",
+    )
+
+    assert files == [("output.json.bak", "/data/output.json.bak")]
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_non_directory_public_source_uses_safe_fallback(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    source = tmp_path / kind
+    if kind == "file":
+        source.write_text("not a directory\n")
+
+    assert qa_visible_public_files(source, "/data") is None
+
+
+@pytest.mark.parametrize("with_gitkeep", [False, True])
+def test_public_source_without_payload_files_uses_squashfs(
+    tmp_path: Path,
+    with_gitkeep: bool,
+) -> None:
+    public = tmp_path / "public"
+    public.mkdir()
+    if with_gitkeep:
+        (public / ".gitkeep").touch()
+
+    assert qa_visible_public_files(public, "/data") is None
+
+
+def test_sync_mount_exposes_public_data_for_every_task_mode() -> None:
+    script = (REPO_ROOT / "scripts" / "sync_mount.sh").read_text()
+
+    assert "_upload_qa_visible_public_tree" in script
+    assert (
+        '_upload_qa_visible_public_tree "${PROBLEM_DIR}/data/public" "/data"' in script
+    )
+    assert script.index(
+        '_upload_qa_visible_public_tree "${PROBLEM_DIR}/data/public" "/data"'
+    ) < script.index('if [[ "$ml_task_type" != "dataset" ]]')
+    assert "prompt_text=prompt" in script
+    assert 'local_path="/lbx-public-files/${address}/${relative}"' in script
+    assert 'if [[ "$public_complete" != "true" ]]' in script
+    assert "['data', '', '', '/data', 'true', 'public']" in script
+    assert 'if [[ "$origin" == "public" ]]' in script
+    assert '_pack_data_tree "${PROBLEM_DIR}/data/private" "/mcp_server/data"' in script
+
+
 # ── manifest load / notice ─────────────────────────────────────────────────
 
 
@@ -86,7 +242,11 @@ def test_load_preloaded_manifest_absent_is_empty(tmp_path: Path) -> None:
 def test_load_preloaded_manifest_reads_stamped_file(tmp_path: Path) -> None:
     out = tmp_path / PRELOADED_MANIFEST_PATH
     out.parent.mkdir(parents=True)
-    out.write_text(json.dumps({"preloaded_files": [manifest_entry("t/m1-abc.squashfs", "/data/big")]}))
+    out.write_text(
+        json.dumps(
+            {"preloaded_files": [manifest_entry("t/m1-abc.squashfs", "/data/big")]}
+        )
+    )
     manifest = load_preloaded_manifest(tmp_path)
     assert manifest == [
         {
@@ -95,6 +255,80 @@ def test_load_preloaded_manifest_reads_stamped_file(tmp_path: Path) -> None:
             "is_read_only": True,
         }
     ]
+
+
+def test_reserved_calibration_mount_requires_trusted_merge() -> None:
+    entry = manifest_entry(
+        "task/calibration-sha256.squashfs", "/mcp_server/calibration"
+    )
+    with pytest.raises(ValueError, match="reserved for trusted CI"):
+        merge_manifest_entries([], [entry])
+    assert merge_manifest_entries([], [entry], trusted=True) == [entry]
+
+
+def test_stamp_script_preserves_and_updates_trusted_calibration_mount(
+    tmp_path: Path,
+) -> None:
+    problem_dir = tmp_path / "task"
+    problem_dir.mkdir()
+    script = REPO_ROOT / "scripts" / "stamp_preloaded_files.py"
+    trusted = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--problem-dir",
+            str(problem_dir),
+            "--trusted-entry",
+            "/mcp_server/calibration::task/calibration-full-sha.squashfs::true",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert trusted.returncode == 0, trusted.stderr
+    normal = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--problem-dir",
+            str(problem_dir),
+            "--entry",
+            "/data::task/data.squashfs::true",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert normal.returncode == 0, normal.stderr
+    manifest = load_preloaded_manifest(problem_dir)
+    assert {entry["local_path"] for entry in manifest} == {
+        "/data",
+        "/mcp_server/calibration",
+    }
+
+
+def test_calibration_mount_helper_refuses_author_side_promotion(tmp_path: Path) -> None:
+    problem_dir = tmp_path / "task"
+    problem_dir.mkdir()
+    lock = problem_dir / "calibration.lock.json"
+    lock.write_text("{}\n")
+    completed = subprocess.run(
+        [
+            "bash",
+            str(REPO_ROOT / "scripts" / "sync_calibration_mount.sh"),
+            str(problem_dir),
+        ],
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if key != "CALIBRATION_TRUSTED_CI"
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "CALIBRATION_TRUSTED_CI=1 is required" in completed.stderr
 
 
 def test_render_preloaded_notice_lists_paths_for_source_review() -> None:
@@ -174,7 +408,10 @@ def test_preloaded_validation_rejects_mcp_server_mount(tmp_path: Path) -> None:
 
     issues = validator_module._preloaded_files_issues(problem_dir)
 
-    assert any("mount_path '/mcp_server/data' is under /mcp_server" in issue for issue in issues)
+    assert any(
+        "mount_path '/mcp_server/data' is under /mcp_server" in issue
+        for issue in issues
+    )
 
 
 def test_preloaded_validation_rejects_hidden_env_private_source_mount(
@@ -266,7 +503,8 @@ def test_stamp_script_writes_manifest(tmp_path: Path) -> None:
     problem_dir = tmp_path / "task"
     problem_dir.mkdir()
     remote_path = (
-        "gs://anthropic-argonrl-dog-bowl-us-central1-0/biome/" "environment_files/env-123/task/m1-abc.squashfs"
+        "gs://anthropic-argonrl-dog-bowl-us-central1-0/biome/"
+        "environment_files/env-123/task/m1-abc.squashfs"
     )
     completed = subprocess.run(
         [

@@ -13,7 +13,7 @@ Worked reference: `examples/openfoam-hydrofoil-flap`.
 
 - Set `[difficulty].task_type` to the solver domain: `cfd`, `structures`,
   `circuits`, `electromagnetics`, `reacting-flow`, or `eda` (NOT `ml` — these are
-  usually deterministic `RubricBuilder` rubrics, not continuous ML metrics).
+  usually deterministic `RubricTask` rubrics, not continuous ML metrics).
   Optionally set `[difficulty].domain` to a finer free-form field
   (e.g. `aerodynamics`, `topology-optimization`, `analog-filter`).
 - In-base, import directly in `scorer/compute_score.py`: `aerosandbox`, `PySpice`

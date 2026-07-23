@@ -1,62 +1,87 @@
-"""Grader for the hidden-env bandit example.
-
-Grade-time flow (the env socket is already torn down by ``stop_env_server()``
-before this runs):
-
-1. Load the held-out env in-process via ``grading.load_env_module`` -- this is
-   the SAME ``make_env(seed=0)`` the agent explored over the socket, so it
-   carries the same hidden arm means.
-2. Load the agent's submitted ``policy.py`` in a sandboxed worker via
-   ``grading.load_submitted_policy`` (factory ``load_policy``); call
-   ``policy.choose()`` to get the arm it believes is best.
-3. Score continuously by how close the chosen arm's TRUE mean is to the optimal
-   (1.0 for the best arm, ~0 for the worst). ``best_arm`` / ``mean`` are
-   grader-only env methods (never socket-reachable), so the agent had to infer
-   the best arm by pulling, not by asking.
-"""
+"""Sealed policy challenge for the hidden bandit example."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from grading import AgentFault, load_env_module, load_submitted_policy
+from grading import AgentFault, load_env_module
+from grading.evaluation import PolicyEvaluationTask
+
+PULL_BUDGET = 64
+TASK = PolicyEvaluationTask(
+    policy_path="policy.py",
+    factory_name="load_policy",
+    scenarios=128,
+    alpha=0.01,
+    # High-quantile reference calibration keeps stochastic challenge scores
+    # inside the 0.5 +/- 0.05 ground-truth band without a steep upper segment.
+    reference_quality=0.925,
+    call_timeout_s=2.0,
+)
+
+
+def _normalized_quality(env, arm: int) -> float:
+    if not 0 <= arm < env.n_arms():
+        raise AgentFault(f"policy chose arm {arm} out of range [0, {env.n_arms()})")
+    span = env.optimal_mean() - env.worst_mean()
+    if span <= 0.0:
+        return 0.0
+    return float((env.mean(arm) - env.worst_mean()) / span)
+
+
+def _challenge_quality(env, arm: int) -> float:
+    """Expand near-optimal regret so the stochastic reference has headroom."""
+    normalized = _normalized_quality(env, arm)
+    return 1.0 - (1.0 - normalized) ** 0.25
+
+
+def _submitted_arm(value: Any, *, method: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise AgentFault(f"policy.{method}() must return an integer arm") from exc
 
 
 def compute_score(
-    workspace: Path, trajectory: list[dict[str, Any]] | None, private: Path
-) -> float:
-    _ = trajectory
-    # Held-out env (root-only /mcp_server/data/env.py). Author data: a failure to
-    # load it is infra (propagate), not the agent's fault.
-    env = load_env_module(private / "env.py").make_env(seed=0)
-    best = env.best_arm()
-    optimal = env.optimal_mean()
-    worst = env.worst_mean()
+    workspace: Path,
+    trajectory: list[dict[str, Any]] | None,
+    private: Path,
+) -> dict[str, Any]:
+    del trajectory
+    env_module = load_env_module(
+        private / "env.py",
+        trusted_roots=(private,),
+    )
 
-    # Agent submission: missing / non-regular / oversized / load-raise -> AgentFault.
-    policy = load_submitted_policy(workspace / "policy.py", timeout_s=10.0)
-    try:
-        choice = policy.choose()
-    except AgentFault:
-        raise
-    except Exception as exc:  # noqa: BLE001 - submitted-policy boundary
-        raise AgentFault(
-            f"policy.choose() failed: {type(exc).__name__}: {exc}"
-        ) from exc
-    finally:
-        policy.close()
+    def rollout(policy, seed: int) -> float:
+        env = env_module.make_env(seed=seed)
+        policy.reset(env.n_arms(), PULL_BUDGET)
+        for _ in range(PULL_BUDGET):
+            arm = _submitted_arm(policy.choose(), method="choose")
+            if not 0 <= arm < env.n_arms():
+                raise AgentFault(
+                    f"policy chose arm {arm} out of range [0, {env.n_arms()})"
+                )
+            policy.observe(arm, env.pull(arm))
+        return _challenge_quality(
+            env,
+            _submitted_arm(policy.recommend(), method="recommend"),
+        )
 
-    try:
-        choice = int(choice)
-    except (TypeError, ValueError) as exc:
-        raise AgentFault(f"policy.choose() must return an int arm; got {choice!r}") from exc
-    if not 0 <= choice < env.n_arms():
-        raise AgentFault(f"policy chose arm {choice} out of range [0, {env.n_arms()})")
+    def fixed_zero(seed: int) -> float:
+        env = env_module.make_env(seed=seed)
+        return _challenge_quality(env, 0)
 
-    if choice == best:
-        return 1.0
-    denom = optimal - worst
-    if denom <= 0:
-        return 0.0
-    return float(max(0.0, min(1.0, (env.mean(choice) - worst) / denom)))
+    def seed_indexed_open_loop(seed: int) -> float:
+        env = env_module.make_env(seed=seed)
+        return _challenge_quality(env, seed % env.n_arms())
+
+    return TASK.grade(
+        workspace=workspace,
+        rollout=rollout,
+        controls={
+            "fixed_arm_zero": fixed_zero,
+            "seed_indexed_open_loop": seed_indexed_open_loop,
+        },
+    )

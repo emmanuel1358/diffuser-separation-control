@@ -7,7 +7,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from alignerr_plugin.proof import PROOF_PATH
 from alignerr_plugin.validators.task.validator import TaskValidator
+from grading.evaluation import (
+    AnchorRationale,
+    ContinuousTask,
+    FloorAnchor,
+    GeneratedCalibration,
+    SRETarget,
+    write_calibration_lock_atomic,
+)
 
 _PROMPT = (
     "# Tabular task\n\n"
@@ -18,17 +27,17 @@ _PROMPT = (
 )
 
 _GRADER = (
-    "from pathlib import Path\n"
-    "from grading.helpers import load_submission_or_fault  # noqa: F401\n"
-    "from grading.faults import AgentFault  # noqa: F401\n\n"
-    "SUBMISSION = Path('/tmp/output')\n"
-    "PRIVATE = Path('/mcp_server/data')\n\n\n"
+    "from grading.evaluation import AnchorRationale, ContinuousTask, FloorAnchor, GeneratedCalibration, SRETarget\n"
+    "FLOOR = FloorAnchor(1.0, AnchorRationale('theoretical', 'Population-standardized RMSE has a no-skill value of one.'))\n"
+    "TASK = ContinuousTask.calibrated(targets=[SRETarget.lower('y', weight=1.0, floor=FLOOR)], calibration=GeneratedCalibration())\n\n"
     "def compute_score():\n"
-    "    return 0.5\n"
+    "    return TASK.grade(None, None)\n"
 )
 
 
-def _write_mlenvs_task(root: Path, *, grader: str = _GRADER, prompt: str = _PROMPT) -> Path:
+def _write_mlenvs_task(
+    root: Path, *, grader: str = _GRADER, prompt: str = _PROMPT
+) -> Path:
     task_dir = root / "demo-task_taiga"
     (task_dir / "data" / "public").mkdir(parents=True)
     (task_dir / "data" / "private").mkdir(parents=True)
@@ -63,8 +72,74 @@ def _validate(task_dir: Path, tmp_path: Path):
     return TaskValidator().validate(task_dir, results, task_dir.parent)
 
 
+def _write_continuous_evidence(task_dir: Path) -> None:
+    task = ContinuousTask.calibrated(
+        targets=[
+            SRETarget.lower(
+                "y",
+                weight=1.0,
+                floor=FloorAnchor(
+                    1.0,
+                    AnchorRationale(
+                        "theoretical",
+                        "Population-standardized RMSE has a no-skill value of one.",
+                    ),
+                ),
+            )
+        ],
+        calibration=GeneratedCalibration(),
+    )
+    lock = task.build_lock(
+        reference_metrics={"y": 0.2},
+        naive_metrics={"y": 0.98},
+        degenerate_metrics={"constant": {"y": 1.0}},
+        input_digests={"fixture": "digest"},
+    )
+    write_calibration_lock_atomic(task_dir / "calibration.lock.json", lock)
+    for strategy in (
+        task_dir / "reference_solution",
+        task_dir / "baselines" / "naive",
+    ):
+        (strategy / "model.manifest.json").write_text("{}\n")
+    proof_path = task_dir / PROOF_PATH
+    proof_path.parent.mkdir(exist_ok=True)
+    proof_path.parent.joinpath("calibration.evidence.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "continuous-calibration-evidence.v1",
+                "cache_key": "c" * 64,
+                "lock_sha256": lock.sha256,
+                "task_spec_sha256": task.spec_sha256,
+                "evaluation_plan_sha256": task.evaluation_plan.sha256,
+                "security_tier": task.security_tier,
+                "inputs": lock.payload["inputs"],
+                "qualification": lock.payload["qualification"],
+            }
+        )
+        + "\n"
+    )
+    proof_path.write_text(
+        json.dumps(
+            {
+                "ground_truth_result": {
+                    "score": 0.5,
+                    "trivial_baseline_score": 0.0,
+                    "calibration": {
+                        "lock_sha256": lock.sha256,
+                        "task_spec_sha256": task.spec_sha256,
+                        "evaluation_plan_sha256": task.evaluation_plan.sha256,
+                        "inputs": lock.payload["inputs"],
+                    },
+                }
+            }
+        )
+        + "\n"
+    )
+
+
 def test_valid_mlenvs_task_passes(tmp_path: Path):
     task_dir = _write_mlenvs_task(tmp_path)
+    _write_continuous_evidence(task_dir)
     result = _validate(task_dir, tmp_path)
     failed = {name: s.issues for name, s in result.stages.items() if not s.passed}
     assert result.status == "valid", failed
@@ -80,10 +155,7 @@ def test_static_stages_target_mlenvs_files(tmp_path: Path):
 
 
 def test_three_arg_grader_in_test_file_is_rejected(tmp_path: Path):
-    bad = (
-        "def compute_score(workspace, trajectory, private):\n"
-        "    return 0.5\n"
-    )
+    bad = "def compute_score(workspace, trajectory, private):\n" "    return 0.5\n"
     task_dir = _write_mlenvs_task(tmp_path, grader=bad)
     result = _validate(task_dir, tmp_path)
     assert not result.stages["grader_import"].passed
@@ -94,7 +166,9 @@ def _write_mlenvs_proof(task_dir: Path, ground_truth_result: dict) -> None:
     proof_dir = task_dir / ".alignerr"
     proof_dir.mkdir()
     (proof_dir / "build_proof.json").write_text(
-        json.dumps({"schema_version": "1.0", "ground_truth_result": ground_truth_result})
+        json.dumps(
+            {"schema_version": "1.0", "ground_truth_result": ground_truth_result}
+        )
     )
 
 
@@ -109,7 +183,9 @@ def test_mlenvs_without_ground_truth_result_skips_zero_anchor(tmp_path: Path):
     _write_mlenvs_proof(task_dir, {"score": 0.5})
     proofless = _write_mlenvs_task(tmp_path / "no-result")
     (proofless / ".alignerr").mkdir()
-    (proofless / ".alignerr" / "build_proof.json").write_text('{"schema_version": "1.0"}')
+    (proofless / ".alignerr" / "build_proof.json").write_text(
+        '{"schema_version": "1.0"}'
+    )
     stage, _meta = TaskValidator()._compute_score_return(proofless)
     assert stage.passed, stage.issues
 
@@ -143,9 +219,7 @@ def test_mlenvs_proof_rejects_unanchored_noop(tmp_path: Path):
 
 def test_llm_judge_in_test_file_is_rejected(tmp_path: Path):
     bad = (
-        "from grading import LLMJudge\n\n\n"
-        "def compute_score():\n"
-        "    return 0.5\n"
+        "from grading import LLMJudge\n\n\n" "def compute_score():\n" "    return 0.5\n"
     )
     task_dir = _write_mlenvs_task(tmp_path, grader=bad)
     result = _validate(task_dir, tmp_path)
@@ -153,7 +227,9 @@ def test_llm_judge_in_test_file_is_rejected(tmp_path: Path):
 
 
 def test_prompt_internal_env_reference_is_rejected(tmp_path: Path):
-    bad_prompt = _PROMPT + "\nInspect metadata.json to discover the installed packages.\n"
+    bad_prompt = (
+        _PROMPT + "\nInspect metadata.json to discover the installed packages.\n"
+    )
     task_dir = _write_mlenvs_task(tmp_path, prompt=bad_prompt)
     result = _validate(task_dir, tmp_path)
     assert not result.stages["prompt_runtime_references"].passed

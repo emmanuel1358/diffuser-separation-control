@@ -1,95 +1,65 @@
-"""Reference solution for the tabular continuous-scoring example.
-
-Trains a domain-aware linear model for `t1` and XGBoost models for `t2` and
-`label`, then writes `/tmp/output/submission.csv`.
-"""
+"""Package the committed model as a queryable predictor artifact."""
 
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import xgboost as xgb
-from sklearn.linear_model import LinearRegression
+HERE = Path(__file__).resolve().parent
+OUTPUT_DIR = Path(os.environ.get("LBT_OUTPUT_DIR", "/tmp/output"))
+MODEL_DIR = Path(os.environ.get("LBT_MODEL_DIR", HERE))
+MODEL_PATH = MODEL_DIR / "model.json"
 
-TRAIN_PATH = Path("/data/train.parquet")
-TEST_PATH = Path("/data/test.parquet")
-OUT_PATH = Path("/tmp/output/submission.csv")
+PREDICTOR_SOURCE = r"""
+import json
+import math
+from pathlib import Path
 
-SEED = 20260417
 
+def load_predictor():
+    model = json.loads(Path(__file__).with_name("model.json").read_text())
 
-def _engineer(df: pd.DataFrame) -> pd.DataFrame:
-    out = df[["x1", "x2", "x3"]].copy()
-    out["x2_sq"] = df["x2"] ** 2
-    out["sin_x3"] = np.sin(df["x3"])
-    out["cos_x3"] = np.cos(df["x3"])
-    out["x1_sin_x3"] = df["x1"] * np.sin(df["x3"])
-    return out
+    class Predictor:
+        @staticmethod
+        def _dot(coef, values):
+            return sum(float(a) * float(b) for a, b in zip(coef, values))
+
+        def predict(self, rows):
+            t1, t2, label = [], [], []
+            for row in rows:
+                x1 = float(row["x1"])
+                x2 = float(row["x2"])
+                x3 = float(row["x3"])
+                t1.append(
+                    self._dot(
+                        model["t1_coef"],
+                        [1.0, x1, x2, x1 * x1, x1 * x2],
+                    )
+                )
+                t2.append(
+                    self._dot(
+                        model["t2_coef"],
+                        [1.0, x1, x2, math.sin(x3), math.cos(x3), x1 * math.sin(x3)],
+                    )
+                )
+                feature = x2 * math.cos(x3)
+                label.append(int(feature > float(model["label_threshold"])))
+            return {"t1": t1, "t2": t2, "label": label}
+
+    return Predictor()
+""".lstrip()
 
 
 def main() -> None:
-    train = pd.read_parquet(TRAIN_PATH)
-    test = pd.read_parquet(TEST_PATH)
-
-    x_train_t1 = pd.DataFrame(
-        {
-            "x1": train["x1"],
-            "x2": train["x2"],
-            "x3": train["x3"],
-            "x2_sq": train["x2"] ** 2,
-        }
-    )
-    x_test_t1 = pd.DataFrame(
-        {
-            "x1": test["x1"],
-            "x2": test["x2"],
-            "x3": test["x3"],
-            "x2_sq": test["x2"] ** 2,
-        }
-    )
-    t1_model = LinearRegression().fit(x_train_t1, train["t1"].values)
-
-    x_train_eng = _engineer(train)
-    x_test_eng = _engineer(test)
-
-    t2_model = xgb.XGBRegressor(
-        n_estimators=400,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=SEED,
-        n_jobs=1,
-        verbosity=0,
-    )
-    t2_model.fit(x_train_eng, train["t2"].values)
-
-    label_model = xgb.XGBClassifier(
-        n_estimators=400,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        random_state=SEED,
-        n_jobs=1,
-        verbosity=0,
-        eval_metric="logloss",
-    )
-    label_model.fit(x_train_eng, train["label"].values)
-
-    submission = pd.DataFrame(
-        {
-            "t1": t1_model.predict(x_test_t1),
-            "t2": t2_model.predict(x_test_eng),
-            "label": label_model.predict(x_test_eng).astype(int),
-        }
-    )
-
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    submission.to_csv(OUT_PATH, index=False)
-    print(f"[reference] wrote {len(submission)} rows to {OUT_PATH}")
+    if not MODEL_PATH.is_file():
+        raise RuntimeError(
+            "committed reference model is missing; run reference_solution/train.py"
+        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(MODEL_PATH, OUTPUT_DIR / "model.json")
+    (OUTPUT_DIR / "predictor.py").write_text(PREDICTOR_SOURCE, encoding="utf-8")
+    print("[reference] wrote queryable predictor.py + model.json")
 
 
 if __name__ == "__main__":

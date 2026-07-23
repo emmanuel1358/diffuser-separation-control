@@ -54,36 +54,41 @@ not import submitted Python during scoring.
 
 ## Recommended Pattern
 
-Keep the simulation and scoring logic in `compute_score.py`; only move the
-submitted policy call behind `PolicyWorker`.
+Keep simulation/scoring in the scorer; only move the submitted policy call
+behind `PolicyWorker` (or `context.policy()` on a declarative `RubricTask`).
 
 ```python
-from grading import PolicyWorker, RubricBuilder
+from grading.evaluation import (
+    RubricCriterion,
+    RubricTask,
+    TextArtifact,
+    TrustedJson,
+)
 
-def rollout_case(model, case, policy):
-    obs = build_public_observation(model, case)
-    action = policy.act(obs)
-    apply_action(model, action)
-    return metrics
+def evaluate(context):
+    cases = context.fixtures["cases"]
+    metrics = []
+    with context.policy("policy.py", timeout_s=0.1) as policy:
+        for case in cases:
+            obs = build_public_observation(case)
+            action = policy.act(obs)
+            metrics.append(score_case(case, action))
+    return {"success_rate": success_rate(metrics)}
 
-def compute_score(workspace, trajectory, private):
-    cases = load_hidden_cases(private)
-    rb = RubricBuilder(workspace=workspace, trajectory=trajectory, private=private)
-
-    with PolicyWorker(workspace / "policy.py", timeout_s=0.1) as policy:
-        metrics = [rollout_case(model, case, policy) for case in cases]
-
-    @rb.criterion(id="success_rate", weight=1.0)
-    def _():
-        return success_rate(metrics)
-
-    return rb.grade().to_dict()
+TASK = RubricTask(
+    artifact=TextArtifact("policy.py"),
+    fixtures={"cases": TrustedJson("hidden_cases.json")},
+    criteria=(RubricCriterion("success_rate", weight=1.0),),
+    evaluate=evaluate,
+)
 ```
 
 Always close long-lived workers. The `with` block does this automatically. If a
 scorer creates a worker outside a context manager, close it in `finally`:
 
 ```python
+from grading import PolicyWorker
+
 policy = PolicyWorker(workspace / "policy.py", timeout_s=0.25)
 try:
     metrics = rollout(policy)

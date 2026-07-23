@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import signal
@@ -288,7 +289,9 @@ def kill_nvproxy_fd_holders() -> int:
         try:
             with open(f"{proc_path}/cmdline", "rb") as handle:
                 raw = handle.read()
-            cmd = raw.replace(b"\x00", b" ").strip().decode(errors="replace") or "<empty>"
+            cmd = (
+                raw.replace(b"\x00", b" ").strip().decode(errors="replace") or "<empty>"
+            )
         except OSError:
             pass
         try:
@@ -452,3 +455,55 @@ def lock_down_grader_private(paths: tuple[str | Path, ...]) -> None:
                 logger.warning(
                     "[SETUP_GUARD] could not tighten perms on %s: %s", path, exc
                 )
+
+
+def lock_down_public_readonly(path: str | Path = "/data") -> int:
+    """Make regular public inputs immutable while keeping them agent-readable.
+
+    Small QA-visible inputs arrive as regular Taiga preloaded files because
+    read-only mounts require squashfs images. The root setup process restores
+    the original `/data` contract (0555 directories, 0444 files) before the
+    agent starts. EROFS/EPERM is expected for an already read-only squashfs.
+    """
+    root = Path(path)
+    if not root.is_dir() or root.is_symlink():
+        return 0
+    targets = [root]
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        targets.extend(Path(dirpath) / name for name in (*dirnames, *filenames))
+
+    changed = 0
+    for target in targets:
+        try:
+            info = os.lstat(target)
+        except OSError as exc:
+            logger.warning(
+                "[SETUP_GUARD] could not stat public path %s: %s", target, exc
+            )
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            continue
+        mode = 0o555 if stat.S_ISDIR(info.st_mode) else 0o444
+        if os.geteuid() == 0 and (info.st_uid != 0 or info.st_gid != 0):
+            try:
+                os.chown(target, 0, 0)
+            except OSError as exc:
+                if exc.errno not in {errno.EROFS, errno.EPERM}:
+                    logger.warning(
+                        "[SETUP_GUARD] could not reset public ownership on %s: %s",
+                        target,
+                        exc,
+                    )
+        if stat.S_IMODE(info.st_mode) == mode:
+            continue
+        try:
+            os.chmod(target, mode)
+            changed += 1
+        except OSError as exc:
+            if exc.errno not in {errno.EROFS, errno.EPERM}:
+                logger.warning(
+                    "[SETUP_GUARD] could not make public path read-only %s: %s",
+                    target,
+                    exc,
+                )
+    return changed

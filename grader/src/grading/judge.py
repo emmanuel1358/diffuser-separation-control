@@ -1,16 +1,15 @@
-"""Anthropic LLM judge used by ``RubricBuilder.llm_criterion``.
+"""Anthropic LLM judge used by legacy ``RubricBuilder.llm_criterion``.
+
+.. deprecated::
+    Submitted task rubrics must not use LLM judges. Prefer deterministic
+    ``RubricTask`` criteria. Constructing ``LLMJudge`` emits
+    :class:`DeprecationWarning`.
 
 Trimmed port of worldsim's ``_call_anthropic_judge`` with retries, concurrency
 cap, ``ANTHROPIC_BASE_URL`` honoring (Boreal's sandbox routes Anthropic via an
 internal proxy; the env var must be respected or DNS fails), and structured
 ``<evaluation><explanation>...</explanation><score>YES|NO</score></evaluation>``
 parsing.
-
-Authors typically don't construct this directly; they use
-``RubricBuilder.llm_criterion(...)``. This class is exposed as a low-level
-escape hatch for anyone who wants to call the judge inside a custom criterion
-predicate (e.g. judge a specific structured output that doesn't fit the
-transcript-based prompt template).
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ import logging
 import os
 import random
 import re
+import warnings
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
@@ -102,9 +102,13 @@ class JudgeResult:
 
 
 class LLMJudge:
-    """Anthropic Claude judge with retry, backoff, and concurrency capping.
+    """Legacy Anthropic Claude judge with retry, backoff, and concurrency capping.
 
-    Usage::
+    .. deprecated::
+        Do not use in submitted task rubrics. Deterministic ``RubricTask``
+        criteria replace LLM-judged scoring.
+
+    Legacy usage::
 
         judge = LLMJudge()  # picks up ANTHROPIC_API_KEY from env
         result = await judge.judge(
@@ -123,7 +127,15 @@ class LLMJudge:
         model: str | None = None,
         timeout: float = 120.0,
         max_tokens: int = 512,
+        _emit_deprecation_warning: bool = True,
     ):
+        if _emit_deprecation_warning:
+            warnings.warn(
+                "LLMJudge is deprecated for submitted task rubrics; use "
+                "deterministic grading.evaluation.RubricTask criteria instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY") or ""
         self._model = (
             model

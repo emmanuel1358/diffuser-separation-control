@@ -32,9 +32,9 @@ description = "MJCF XML model for the damped pendulum"
 
 ## What The Grader Checks
 
-`scorer/compute_score.py` uses `RubricBuilder` and returns
-`rb.grade().to_dict()`. The grader compiles the submitted MJCF once and
-then scores ten criteria:
+`scorer/compute_score.py` declares a `RubricTask` with a bounded
+`TextArtifact`. The shared grader reads the submission, attributes malformed
+MJCF as an agent fault, aggregates ten criteria, and emits the attested result:
 
 - The MJCF compiles.
 - There is exactly one hinge joint.
@@ -57,7 +57,8 @@ headline score and per-criterion subscores.
 - `instruction.md`: the agent-facing prompt.
 - `environment/Dockerfile`: installs the shared `grader/` package and
   copies this task's public data, private scorer data, and scorer code.
-- `scorer/compute_score.py`: the grader implementation.
+- `scorer/compute_score.py`: declarative criteria and pure MuJoCo evaluation.
+- `scorer/evaluation.plan.json`: hash-bound public rubric protocol.
 - `solution/solve.sh`: the ground-truth solution that scores `1.0`.
 - `solution/render.sh`: required reviewer video generation for that solution.
 - `baselines/naive.sh`: a weak baseline script for comparison.

@@ -1,0 +1,43 @@
+{
+  "cache_key": "1e9275745173886e930d9d1fddc853b0e78e9a8decb1a7cd3bd58488bf4e6a49",
+  "evaluation_plan_sha256": "46d3f3f36924dd559bb38c6ad224f8679cd4dc7f60edfaaf1a4c23151dcd82fd",
+  "inputs": {
+    "base_image": "lbx-tasks-base-mlenvs-gpu:runtime-ml-core-py313-local",
+    "data_generation": "02a11439bf1f7870f490fb757ba19a137c97f211d002c3616dd1673132b75f30",
+    "dockerfile": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "environment": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "grader": "59c4603345c8419438e029659fbdcb98099e6d961561e9c83405e75bc8374e57",
+    "image": "sha256:cf0b09b082a81261e57a2fa31708dc6f6f27b7191d7bc63fc6a6cc35a1664f02",
+    "naive_strategy": "036cb9852f8e2c54e59b5f9f07dbfd3e5aa439f3eee38c9ff9d4eccc4973529e",
+    "private_data": "7edd545d4777ec9d21763cb59e30e939fd4bf5c7c6ffbaeacba59dea8fb91db1",
+    "public_data": "75e19cccb239738c2e44a3cb1727681737d12dc45f60c525f33cd19865e9e507",
+    "reference_strategy": "7f170e2e708572a69b9909cf6da896e18bba058fcceb5151f2e05ed23e3a6d78",
+    "task_config": "3c061b3319b3d1d9c5fd10e9e7312fa8f6fd62e2024fa76e82fcb0a06bc22b75",
+    "task_spec": "9c4d170f50f192421acbe0b1b8968676288cea1dfee70f8744c1f6d2a0c8bcd5"
+  },
+  "lock_sha256": "a4064ec209069d3763480d83a04b3a37365988b9aed3820639db32bba507f745",
+  "qualification": {
+    "degenerate_scores": {
+      "constant-mean": 0.0,
+      "constant-median": 0.0,
+      "constant-negative": 0.0,
+      "constant-positive": 0.0,
+      "jittered-constant": 0.0,
+      "row-index": 0.0,
+      "shuffled-truth": 0.0
+    },
+    "naive_progress": 0.002474847632067112,
+    "naive_quality_progress": 0.002474847632067112,
+    "naive_score": 0.0013010968390804048,
+    "naive_score_range": {
+      "exclusive_min": 1e-06,
+      "inclusive_max": 0.1
+    },
+    "null_score": 0.0,
+    "oracle_score": 1.0,
+    "reference_score": 0.5
+  },
+  "schema_version": "continuous-calibration-evidence.v1",
+  "security_tier": "sealed_challenge",
+  "task_spec_sha256": "9c4d170f50f192421acbe0b1b8968676288cea1dfee70f8744c1f6d2a0c8bcd5"
+}

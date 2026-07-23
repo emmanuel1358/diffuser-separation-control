@@ -76,7 +76,8 @@ def _warn_host_isolation_bypass(problem: HarnessProblem) -> None:
             "[reference][WARNING] running on the HOST path - isolation is NOT applied:",
             "  - no uid-1000 privilege drop (solve.sh runs as the invoking user)",
             "  - no network isolation (full host network, not --network none)",
-            "  - no held-out-truth isolation (grader runs in-process, not root-only " "/mcp_server/data)",
+            "  - no held-out-truth isolation (grader runs in-process, not root-only "
+            "/mcp_server/data)",
             "  This result is NOT Taiga-faithful and is NOT proof-authoritative; use "
             "the container path (or `--runtime ground-truth`) before trusting it.",
         ]
@@ -221,14 +222,17 @@ def _container_script_prefix(problem: HarnessProblem, *, skip_solve: bool) -> li
             [
                 "python -m env_server &",
                 "ENV_PID=$!",
-                "for _i in $(seq 1 120); do " "[ -S /tmp/env.sock ] && break; sleep 0.25; done",
+                "for _i in $(seq 1 120); do "
+                "[ -S /tmp/env.sock ] && break; sleep 0.25; done",
                 "test -S /tmp/env.sock",
             ]
         )
     return lines
 
 
-def _container_script_stop_env_server(problem: HarnessProblem, *, skip_solve: bool) -> list[str]:
+def _container_script_stop_env_server(
+    problem: HarnessProblem, *, skip_solve: bool
+) -> list[str]:
     if skip_solve or _hidden_env_mode(problem) not in {"env", "hybrid"}:
         return []
     return [
@@ -245,7 +249,11 @@ def _as_model_user(command: str) -> str:
     Resolves the uid-1000 account name from the image at run time (``agent`` on
     native bases, ``model`` on mlenvs bases) so the drop works on both flavors.
     """
-    model_command = "export PATH=/opt/lbx-runtime/.venv/bin:$PATH; " "export LBT_OUTPUT_DIR=/tmp/output; " f"{command}"
+    model_command = (
+        "export PATH=/opt/lbx-runtime/.venv/bin:$PATH; "
+        "export LBT_OUTPUT_DIR=/tmp/output; "
+        f"{command}"
+    )
     return f"su -s /bin/bash {_DROP_USER_BY_UID} -c {shlex.quote(model_command)}"
 
 
@@ -262,7 +270,9 @@ def _cache_has_required_outputs(problem: HarnessProblem, cache_dir: Path) -> boo
     return has_required
 
 
-def _effective_skip_solve(problem: HarnessProblem, options: ReferenceRunOptions, cache_dir: Path) -> bool:
+def _effective_skip_solve(
+    problem: HarnessProblem, options: ReferenceRunOptions, cache_dir: Path
+) -> bool:
     if options.skip_solve:
         return True
     if options.mode == "prove":
@@ -417,7 +427,9 @@ def _run_host_reference(
             )
             if solution_rc != 0:
                 transcript_path.write_text(sol_output)
-                raise RuntimeError(f"reference solution exited with status {solution_rc}")
+                raise RuntimeError(
+                    f"reference solution exited with status {solution_rc}"
+                )
             _sync_output_tree(tmp_output, cache_dir)
             _copy_outputs(tmp_output, workspace, problem)
     else:
@@ -439,7 +451,9 @@ def _run_host_reference(
         else:
             grade_payload = {"score": score}
     else:
-        transcript_path.write_text("\n".join([sol_output, "[reference] grading skipped (--no-grade)"]))
+        transcript_path.write_text(
+            "\n".join([sol_output, "[reference] grading skipped (--no-grade)"])
+        )
 
     return ReferenceRunResult(
         score=score,
@@ -453,7 +467,9 @@ def _run_host_reference(
     )
 
 
-def _container_solve_script(problem: HarnessProblem, *, sol_rel: str, render: bool) -> str:
+def _container_solve_script(
+    problem: HarnessProblem, *, sol_rel: str, render: bool
+) -> str:
     """Build the SOLVE-phase script: bring up env, run the reference, render."""
     lines = _container_script_prefix(problem, skip_solve=False)
     lines.append(
@@ -488,6 +504,24 @@ def _container_grade_script() -> str:
             # reward-details.json (error_type + traceback) before returning
             # non-zero, but `set -e` would otherwise skip this copy and discard
             # it, leaving only the useless stderr tail on a grade failure.
+            "cp -a /tmp/verifier/. /host_out/verifier/ 2>/dev/null || true",
+            "exit $rc",
+        ]
+    )
+
+
+def _container_measure_script() -> str:
+    """Build the raw-metric phase script used before a calibration lock exists."""
+    return "\n".join(
+        [
+            "set -e",
+            _CONTAINER_VENV_PATH,
+            "mkdir -p /tmp/verifier",
+            "rc=0",
+            "python -m grader_runner.raw_worker "
+            "--workspace /tmp/output --grader-dir /mcp_server/grader "
+            "--private-dir /mcp_server/data "
+            "--result-path /tmp/verifier/raw-metrics.json || rc=$?",
             "cp -a /tmp/verifier/. /host_out/verifier/ 2>/dev/null || true",
             "exit $rc",
         ]
@@ -570,6 +604,8 @@ def _docker_grade_command(
     scorer_dir: Path,
     container_out: Path,
     script: str,
+    *,
+    calibration_lock: Path | None = None,
 ) -> list[str]:
     """GRADE phase: run as root (so the grader can read the root-only held-out
     truth) and bind-mount the HOST ``scorer/`` over ``/mcp_server/grader`` so an
@@ -605,6 +641,11 @@ def _docker_grade_command(
     ]
     if scorer_dir.is_dir():
         cmd += ["-v", f"{scorer_dir}:/mcp_server/grader:ro"]
+    if calibration_lock is not None and calibration_lock.is_file():
+        cmd += [
+            "-v",
+            f"{calibration_lock}:/mcp_server/calibration/calibration.lock.json:ro",
+        ]
     cmd += [
         "-v",
         f"{container_out}:/host_out",
@@ -653,7 +694,9 @@ def _run_container_reference(
         # make it group/world-writable so the unprivileged user can write into a
         # host-owned directory on Linux (Docker Desktop ignores this on macOS).
         os.chmod(cache_dir, 0o777)
-        solve_script = _container_solve_script(problem, sol_rel=sol_rel, render=options.render)
+        solve_script = _container_solve_script(
+            problem, sol_rel=sol_rel, render=options.render
+        )
         solve_cmd = _docker_solve_command(image_tag, src, cache_dir, solve_script)
         solve_timeout = _agent_timeout(problem) + 300
         solution_rc, solve_out = _run_streaming(
@@ -665,7 +708,8 @@ def _run_container_reference(
         if solution_rc != 0:
             transcript_path.write_text("\n".join(transcript_chunks))
             raise RuntimeError(
-                f"reference container solve failed (status {solution_rc}). " f"stderr tail:\n{solve_out[-1500:]}"
+                f"reference container solve failed (status {solution_rc}). "
+                f"stderr tail:\n{solve_out[-1500:]}"
             )
 
     # Outputs live in the cache (bind-mounted /tmp/output); surface them to the
@@ -676,7 +720,14 @@ def _run_container_reference(
     grader_rc: int | None = None
     grade_payload: dict = {}
     if not options.no_grade:
-        grade_cmd = _docker_grade_command(image_tag, cache_dir, scorer_dir, container_out, _container_grade_script())
+        grade_cmd = _docker_grade_command(
+            image_tag,
+            cache_dir,
+            scorer_dir,
+            container_out,
+            _container_grade_script(),
+            calibration_lock=src / "calibration.lock.json",
+        )
         grade_timeout = _verifier_timeout(problem) + 300
         grader_rc, grade_out = _run_streaming(
             grade_cmd,
@@ -725,6 +776,8 @@ def grade_workspace_in_container(
     workspace: Path,
     verifier_dir: Path,
     transcript_path: Path,
+    *,
+    calibration_lock: Path | None = None,
 ) -> float:
     """Grade an already-populated workspace INSIDE the task image.
 
@@ -749,7 +802,14 @@ def grade_workspace_in_container(
     (container_out / "verifier").mkdir(parents=True, exist_ok=True)
     verifier_dir.mkdir(parents=True, exist_ok=True)
 
-    grade_cmd = _docker_grade_command(image_tag, workspace, scorer_dir, container_out, _container_grade_script())
+    grade_cmd = _docker_grade_command(
+        image_tag,
+        workspace,
+        scorer_dir,
+        container_out,
+        _container_grade_script(),
+        calibration_lock=calibration_lock or (src / "calibration.lock.json"),
+    )
     grader_rc, grade_out = _run_streaming(
         grade_cmd,
         timeout=_verifier_timeout(problem) + 300,
@@ -771,6 +831,54 @@ def grade_workspace_in_container(
     if not reward_path.exists():
         raise RuntimeError("container grade did not produce reward.json")
     return float(json.loads(reward_path.read_text())["score"])
+
+
+def measure_workspace_in_container(
+    problem: HarnessProblem,
+    workspace: Path,
+    output_dir: Path,
+    transcript_path: Path,
+) -> dict:
+    """Measure a v2 continuous TASK without loading or applying calibration."""
+    from lbx_rl_tasks_harness.docker import build_task_image
+
+    if problem.source_problem_dir is None:
+        raise ValueError("container measurement requires a source problem directory")
+
+    src = problem.source_problem_dir.resolve()
+    scorer_dir = src / "scorer"
+    image_tag = build_task_image(problem, write_proof=False).image_tag
+    container_out = output_dir / "container_out"
+    (container_out / "verifier").mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    measure_cmd = _docker_grade_command(
+        image_tag,
+        workspace,
+        scorer_dir,
+        container_out,
+        _container_measure_script(),
+    )
+    rc, output = _run_streaming(
+        measure_cmd,
+        timeout=_verifier_timeout(problem) + 300,
+        label="calibration raw-metric measurement (root, no network)",
+    )
+    transcript_path.write_text(output)
+    result_path = container_out / "verifier" / "raw-metrics.json"
+    if not result_path.exists():
+        raise RuntimeError(
+            f"raw-metric worker produced no result (status {rc}); output tail:\n{output[-1500:]}"
+        )
+    payload = json.loads(result_path.read_text())
+    if rc != 0 or payload.get("error_type"):
+        raise RuntimeError(
+            "raw-metric worker failed: "
+            f"{payload.get('error_type', 'error')}: {payload.get('error_message', '')}"
+        )
+    if not isinstance(payload.get("metrics"), dict):
+        raise RuntimeError("raw-metric worker result is missing metrics")
+    return payload
 
 
 def run_reference(
@@ -802,7 +910,11 @@ def run_reference(
             run_solution(problem, workspace, transcript_path)
             score = grade_workspace(problem, workspace, verifier_dir, transcript_path)
             details_path = verifier_dir / "reward-details.json"
-            grade_payload = json.loads(details_path.read_text()) if details_path.exists() else {"score": score}
+            grade_payload = (
+                json.loads(details_path.read_text())
+                if details_path.exists()
+                else {"score": score}
+            )
             result = ReferenceRunResult(
                 score=score,
                 workspace=workspace,

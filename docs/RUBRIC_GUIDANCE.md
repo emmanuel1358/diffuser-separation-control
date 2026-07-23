@@ -5,8 +5,9 @@ expert evaluation into objectively gradable tasks. Rubrics codify domain
 knowledge into specific, measurable criteria that can be applied consistently
 across evaluation, training, and testing.
 
-Use this guidance when writing or reviewing `RubricBuilder` criteria in
-`scorer/compute_score.py`.
+Use this guidance when writing or reviewing `RubricCriterion` declarations and
+the pure domain evaluator in `scorer/compute_score.py`. The mechanical protocol
+is documented in [`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md).
 
 ## Summary
 

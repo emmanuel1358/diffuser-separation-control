@@ -23,6 +23,30 @@ def test_policy_worker_accepts_module_act(tmp_path: Path) -> None:
         assert policy({"x": 3, "items": [6, 7]}) == [4, 7]
 
 
+def test_policy_worker_rejects_oversized_reply_before_body_allocation(
+    tmp_path: Path,
+) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text("def act(obs):\n    return 'x' * 10000\n")
+
+    with PolicyWorker(policy_path, max_reply_bytes=512) as policy:
+        with pytest.raises(PolicyWorkerError, match="serialized limit"):
+            policy.act(None)
+
+
+def test_policy_environment_scrubs_private_evaluation_context(monkeypatch) -> None:
+    monkeypatch.setenv("LBX_EVALUATION_TRACE_PATH", "/root/private-trace.json")
+    monkeypatch.setenv("LBX_EVALUATION_NONCE", "private-nonce")
+    monkeypatch.setenv("LBX_EVALUATION_PLAN_ATTESTED", "1")
+
+    env = policy_runner._scrubbed_environ()
+
+    assert "LBX_EVALUATION_TRACE_PATH" not in env
+    assert "LBX_EVALUATION_NONCE" not in env
+    assert "LBX_EVALUATION_PLAN_ATTESTED" not in env
+    assert policy_runner._isolated_python_environ()["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
 def test_policy_worker_bootstrap_does_not_need_env_server_on_sys_path(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -30,6 +54,7 @@ def test_policy_worker_bootstrap_does_not_need_env_server_on_sys_path(
         env = policy_runner._scrubbed_environ()
         env.pop("PYTHONPATH", None)
         env["PYTHONSAFEPATH"] = "1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         return env
 
     monkeypatch.setattr(
@@ -397,8 +422,7 @@ def test_unshare_ipc_defaults_to_true() -> None:
         is True
     )
     assert (
-        inspect.signature(helpers.run_policy).parameters["unshare_ipc"].default
-        is True
+        inspect.signature(helpers.run_policy).parameters["unshare_ipc"].default is True
     )
 
 
@@ -469,9 +493,7 @@ def _run_preexec_capturing_status(
 def test_agent_preexec_reports_unshare_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    status = _run_preexec_capturing_status(
-        monkeypatch, unshare_ret=0, errno_val=0
-    )
+    status = _run_preexec_capturing_status(monkeypatch, unshare_ret=0, errno_val=0)
     assert status == 0
 
 

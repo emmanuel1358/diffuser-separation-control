@@ -7,30 +7,32 @@ consumes the exported task for RL training.
 
 ## TL;DR
 
-- Every task ships **one Python file**: `scorer/compute_score.py`.
-- That function returns one of three shapes — pick whichever fits naturally.
+- Every task ships **one Python module**: `scorer/compute_score.py`.
+- `multi_deterministic_rubrics` modules declare `TASK = RubricTask(...)`; the
+  runner invokes it directly and owns all artifact/error/score plumbing.
+- Continuous/legacy modules use the supported `compute_score()` shapes.
 - The same grader powers both the Boreal rubric MCP server and Harbor's
   `tests/test.sh`. Per-criterion subscores show up in both UIs automatically.
 - A shared library at [`grader/`](../grader/) gives you
-  `RubricBuilder`, deterministic helpers, and `PolicyWorker` — baked into the
+  `RubricTask`, deterministic helpers, and `PolicyWorker` — baked into the
   base image so authors can import from `grading`.
 - Rubrics must be deterministic. Do not use LLMs as judges in
-  `compute_score.py`; reward functions must be reproducible from files,
+  scorers; reward functions must be reproducible from files,
   simulator state, fixed seeds, and hidden fixtures.
 
 ## The contract
 
-```python
-# scorer/compute_score.py
-from pathlib import Path
+For deterministic rubrics, the contract is:
 
-def compute_score(
-    workspace: Path,                   # /tmp/output (agent's workspace)
-    trajectory,                        # agent transcript (str), or [] if none
-    private: Path,                     # /mcp_server/data (your hidden test set)
-) -> float | dict | "Grade":
-    ...
+```python
+from grading.evaluation import RubricTask
+
+TASK: RubricTask
 ```
+
+See [`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md). The framework supplies the
+workspace, trajectory, private fixtures, artifact loader, error boundary,
+aggregation, result transport, attestation, and trace.
 
 `trajectory` carries the full agent transcript as a string (empty `[]` when
 none is available). Use `helpers.transcript_contains(trajectory, needle)` for
@@ -102,20 +104,16 @@ that point outside it, removes FIFOs/sockets/devices that could hang grading,
 uses a private grader cache, and runs Harbor scoring in a child process rather
 than importing task code in the verifier parent.
 
-Use `AgentFault` for problems caused by the submitted artifact itself. These
-score a clean `0.0` and are kept as training signal:
+For declarative rubrics, artifact specs and `RubricContext` raise `AgentFault`
+for submitted-artifact problems. Authors do not catch these errors:
 
 ```python
-from grading import AgentFault, helpers
+from grading.evaluation import JsonArtifact, NumericField
 
-def compute_score(workspace, trajectory, private):
-    sub = helpers.load_submission_or_fault(
-        workspace / "submission.csv",
-        required_columns=["id", "prediction"],
-        numeric_columns=["prediction"],
-        unique_key_column="id",
-    )
-    # score `sub` against hidden truth...
+artifact = JsonArtifact(
+    "submission.json",
+    numeric_fields=(NumericField("prediction"),),
+)
 ```
 
 Do not catch grader bugs, missing hidden fixtures, simulator crashes, OOMs, or
@@ -123,6 +121,13 @@ unsupported return shapes as `AgentFault`. Those are marked
 `env_internal_failure` so the platform can discard the rollout rather than
 train on a misleading zero. Non-finite scores (`NaN`, `inf`) also fail closed;
 return a finite number in `[0, 1]` or a supported `Grade`/score dict.
+
+Declarative rubric candidate-evaluation exceptions that remain untyped are a
+defense-in-depth exception: production keeps a zero and emits
+`critical_operator_alert` so the agent cannot void its episode/group. Trusted
+CI must reproduce and block that path. Known private-fixture, import,
+attestation, normalization, OOM, signal, and platform timeout faults still
+discard.
 
 The `agent_fault` validator stage statically enforces this discipline: it flags
 a broad `except` that returns a score (over-keep), pickle deserialization of an
@@ -151,7 +156,7 @@ Use them instead of reading the artifact by hand:
 | --- | --- | --- |
 | `float` | ML_Envs migration. The headline is a single anchor-mapped numeric metric (RMSE/F1/return). No per-criterion decomposition. | The float you returned, clamped to `[0, 1]`. |
 | `dict {score, subscores, weights, metadata}` | You have an existing scorer that returns its own headline plus per-target diagnostics (e.g. `{score: exp_curve(x_agg), subscores: {rmse: x1, f1: x2}}`). Per-criterion rows show up in Boreal UI; the headline stays your custom number. | `dict["score"]` verbatim. **NOT** recomputed from `subscores * weights`. |
-| `RubricBuilder.grade().to_dict()` | The natural shape when you want weighted deterministic criteria and/or penalties — and you don't already have a custom anchor mapping. | Weighted aggregate over criteria, minus penalties, optionally collapsed to binary. |
+| `TASK = RubricTask(...)` | Mandatory for `multi_deterministic_rubrics`; evaluator returns criterion values, not a score payload. | Framework-owned weighted/binary aggregation with required gates. |
 
 The runtime detects the return shape from the value type. Separately,
 `[difficulty].reward_type` tells validation what the ground-truth/reference
@@ -181,6 +186,33 @@ the submitted artifacts, hidden fixtures, and fixed-seed simulations, then maps
 those metrics into a stable reward in `[0, 1]`. Do not use an LLM judge or any
 non-reproducible service inside the reward function.
 
+For new tasks and migrations, follow
+[`CONTINUOUS_EVALUATION.md`](CONTINUOUS_EVALUATION.md). It defines the
+queryable Tier-A model/policy APIs, lock-v3 workflow, evidence-versus-quality
+semantics, public/private diagnostics, and migration from static
+`submission.csv` or `TASK.score(...)` graders.
+
+### V2 generated calibration (new ML tasks)
+
+New `task_type = "ml"` tasks compose their hand-authored `compute_score` and
+evaluation logic with a `grading.evaluation.ContinuousTask`. The local
+ground-truth harness measures the committed reference and weak naive models,
+generates ignored development lock/evidence state, and replays the
+no-op/reference/oracle contracts. Authors commit trained models and
+reproducible train/inference recipes, but never generated calibration locks,
+measured anchors, submissions, or score logs. Trusted CI restores or
+regenerates the authoritative bundle and mounts it read-only in Taiga.
+
+```bash
+uv run lbx-rl-harness run \
+  --runtime ground-truth \
+  --problem-dir problems/<task_id>
+```
+
+The author still owns loading, rollouts, k-fold, and raw metrics. `TASK` owns
+reviewed anchor schema, generated-lock verification, and final PWL mapping.
+See the composable example in `docs/MLENVS_TASKS.md`.
+
 ### Calibration anchors
 
 For each metric, define three anchors before writing the final curve:
@@ -191,6 +223,8 @@ For each metric, define three anchors before writing the final curve:
   measured metric pins that baseline to 0 and compresses the 0->reference range,
   inflating agent scores. Baselines under `baselines/` are *evidence* that naive
   models sit above the floor, not the floor itself.
+  V2 tasks encode this human-reviewed argument in `FloorAnchor` and
+  `AnchorRationale`; the framework records but does not invent the rationale.
 - `reference`: the reference solution value. This should map the final reward
   to about `0.5`, leaving headroom for better agents.
 - `perfect`: the theoretical or practical optimum. Examples: RMSE/SRE `0`,
@@ -225,7 +259,7 @@ x_agg = 0.4 * x_success + 0.35 * x_error + 0.25 * x_regret
 Then map `x_agg` to the final reward with a calibrated curve through three
 points:
 
-- `(0, 0)`: the naive baseline earns reward `0`.
+- `(0, 0)`: floor/no progress earns reward `0`.
 - `(x_ref, 0.5)`: the reference solution earns about reward `0.5`.
 - `(1, 1)`: perfect performance earns reward `1`.
 
@@ -359,79 +393,65 @@ def compute_score(workspace, trajectory, private) -> dict:
 `reward.json` gets one flat key per subscore for trainers that want
 per-target signals.
 
-### 3. RubricBuilder (typed deterministic criteria + penalties)
+### 3. RubricTask (mandatory declarative deterministic rubrics)
 
 ```python
-from pathlib import Path
-from grading import RubricBuilder, helpers
+from grading.evaluation import (
+    JsonArtifact,
+    NumericField,
+    RubricCriterion,
+    RubricTask,
+)
 
-def compute_score(workspace: Path, trajectory, private: Path):
-    rb = RubricBuilder(workspace=workspace, trajectory=trajectory, private=private)
+def evaluate(context):
+    design = context.candidate
+    return {
+        "present": bool(design),
+        "quality": context.ratio(
+            design["useful"],
+            design["total"],
+            label="quality",
+            zero="agent_fault",
+        ),
+    }
 
-    @rb.criterion(id="answer_present", weight=1.0,
-                  description="answer.txt exists and is non-empty")
-    def _():
-        return helpers.file_exists(workspace / "answer.txt", non_empty=True)
-
-    @rb.criterion(id="csv_rows_match", weight=2.0,
-                  description="Submission has exactly 200 rows")
-    def _():
-        return len((workspace / "submission.csv").read_text().splitlines()) == 201
-
-    @rb.penalty(id="wrote_outside", value=-0.5,
-                description="Agent wrote files outside /tmp/output")
-    def _():
-        return any((workspace / p).exists() for p in ["/etc/passwd", "/root/x"])
-
-    return rb.grade().to_dict()
+TASK = RubricTask(
+    artifact=JsonArtifact(
+        "design.json",
+        numeric_fields=(
+            NumericField("useful"),
+            NumericField("total"),
+        ),
+    ),
+    criteria=(
+        RubricCriterion("present", required=True),
+        RubricCriterion("quality", weight=2.0),
+    ),
+    evaluate=evaluate,
+)
 ```
 
+There is no author-owned `compute_score()`. The runner invokes `TASK`, and the
+framework owns artifact loading, exception handling, numeric policies, weights,
+aggregation, fault attribution, attestation, and result serialization.
+
+The full API, plan format, solver/policy boundaries, adversarial probes, and
+migration instructions are in
+[`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md).
+
 Live examples:
-- [`examples/mujoco-pendulum`](../../lbx-rl-tasks-template/examples/mujoco-pendulum/) — 10 deterministic criteria.
 
-## RubricBuilder API reference
+- [`examples/mujoco-pendulum`](../examples/mujoco-pendulum/) — typed XML and
+  deterministic MuJoCo criteria.
+- [`examples/opensees-base-isolation`](../examples/opensees-base-isolation/) —
+  bounded nested JSON and trusted private fixtures.
+- [`examples/openfoam-hydrofoil-flap`](../examples/openfoam-hydrofoil-flap/) —
+  bounded solver execution and a large weighted rubric.
 
-### `RubricBuilder(workspace, trajectory, private, *, binary_scoring=False)`
-
-- `workspace` / `trajectory` / `private` — passed straight through from
-  `compute_score()`.
-- `binary_scoring=True` collapses the headline to `1.0` iff every
-  criterion's subscore is `>= 0.5` AND no penalty triggered. Useful for
-  pass/fail style tasks where partial credit doesn't make sense.
-
-### `@rb.criterion(id=..., weight=..., description="")`
-
-Decorate a 0-arg predicate. Return `bool` (1.0 / 0.0) or `float` in
-`[0, 1]`. Predicates may be sync or async — async is useful for
-deterministic-but-slow probes (e.g. `await asyncio.gather(...)` over many
-files). Predicates are run in parallel via `asyncio.gather`. Exceptions
-are caught and turn into a 0-score with `error_type:
-"predicate_exception"` in the criterion log.
-
-### No LLM-judged criteria
-
-Do not call `rb.llm_criterion(...)` or invoke any model provider from
-`compute_score.py`. Boreal uses LLMs to solve tasks, but the verifier must
-be deterministic. If a requirement sounds subjective, rewrite it as a
-code-checkable property or remove it from the rubric.
-
-### `@rb.penalty(id=..., value=...)`
-
-Decorate a predicate that returns truthy iff the penalty triggered.
-`value` must be `<= 0`; its absolute value is subtracted from the
-weighted total before clamping. Penalties are mutually independent.
-
-### `rb.grade() -> Grade`
-
-Resolves all criteria + penalties (concurrently via asyncio) and returns
-a `Grade`. Authors call `.to_dict()` on the result before returning it
-from `compute_score()`.
-
-### `rb.metadata: dict[str, Any]`
-
-Free-form caller metadata that lands in `Grade.metadata`. Use it for
-debug values (raw metrics, computed thresholds, anything you want to see
-in `reward-details.json`).
+`RubricBuilder` is **deprecated** (emits ``DeprecationWarning`` on construct).
+It remains an internal compatibility type for old immutable task images.
+New or updated rubric tasks fail validation unless they use `RubricTask`.
+`LLMJudge` is similarly deprecated for submitted rubrics.
 
 ## Deterministic helpers
 
@@ -449,15 +469,17 @@ in `reward-details.json`).
 - `load_json(path) -> Any | None`
 - `require_regular_file(path, *, max_bytes=...) -> Path` — raise `AgentFault` if the agent path is a symlink / FIFO / dir / device or oversized; call it before a hand-rolled read (the submission loaders in the table above do this internally)
 
-These are convenience — if you need something not on this list, just
-write the Python directly inside the criterion.
+These remain useful for continuous/legacy graders. Declarative rubrics should
+use `RubricContext` operations whenever one exists, so error attribution stays
+framework-owned.
 
 ## Where the data flows
 
 ```mermaid
 flowchart LR
+  RT[RubricTask] --> G[canonical Grade]
   CS[compute_score.py] -->|float / dict / Grade| N[normalize_compute_score_return]
-  N --> G[canonical Grade]
+  N --> G
   G -->|Grade.to_dict| TUI[Boreal UI<br/>structured_subscores + rubric_breakdown]
   G -->|reward.json + reward.txt + reward-details.json| HUI[Harbor /logs/verifier/]
   HUI --> RL[Customer RL loop:<br/>reward = json.load reward.json score]
@@ -670,7 +692,7 @@ flowchart TD
   Q1 -- no --> Q2{Have weighted deterministic<br/>criteria and/or penalties?}
   Q1a -- no --> A[Bare float.<br/>return float]
   Q1a -- yes --> B[Score dict.<br/>return dict score subscores weights]
-  Q2 -- yes --> C[RubricBuilder.<br/>return rb.grade.to_dict]
+  Q2 -- yes --> C[RubricTask + evaluate.<br/>refresh evaluation.plan.json]
   Q2 -- no --> A
 ```
 
@@ -684,9 +706,9 @@ compare against hidden fixtures, or score against fixed numeric thresholds.
 
 ### "I want a penalty if the agent did something forbidden"
 
-`@rb.penalty(value=-0.5)` with a predicate that returns truthy iff the
-forbidden behavior happened. The penalty's absolute value is subtracted
-from the weighted total. Use multiple penalties for different misbehaviors.
+Return a zero (or low) score for a dedicated criterion, or fold the
+misbehavior into a required gate. Prefer explicit criterion IDs over
+ad-hoc score mutation so Boreal/Harbor surfaces the failure reason.
 
 ### "I want to migrate an ML_Envs task verbatim"
 
@@ -722,30 +744,25 @@ for a complete adapted ML_Envs task with parquet data and hidden targets.
 
 ### "My grader runs slow because each criterion makes an HTTP call"
 
-Use async predicates and `RubricBuilder` runs them concurrently via
-`asyncio.gather`:
-
-```python
-@rb.criterion(id="service_state_a", weight=1.0)
-async def _():
-    async with httpx.AsyncClient() as client:
-        resp = await client.get("http://svc:8080/state/a")
-        return resp.json()["ok"]
-```
+Avoid network I/O in scorers. If you must fan out independent local checks,
+keep them inside `evaluate` / helpers and prefer bounded trusted operations
+(`context.candidate_operation` / `context.trusted_operation`) over ad-hoc
+concurrency. External HTTP from a scorer is almost never appropriate for
+deterministic RL grading.
 
 ## Things you don't need to do
 
 - **Don't write a `rubric.toml`.** Authoring is code-first; the rubric
-  IS the Python.
+  IS the Python (`RubricTask` + criteria).
 - **Don't ship a `tests/` directory.** The Harbor exporter generates
   `tests/test.sh` for you.
 - **Don't shell out to a separate "grade" binary.** Just import what
-  you need and call functions directly.
-- **Don't worry about subscore weighting math.** `RubricBuilder`
+  you need and call functions directly (or `context.run_solver` for
+  trusted executables).
+- **Don't worry about subscore weighting math.** `RubricTask`
   normalizes weights to sum to 1.0 for you.
-- **Don't try to cap the score yourself when using `RubricBuilder`.**
-  `Grade.weighted_total()` clamps to `[0, 1]`.
-
+- **Don't try to cap the score yourself when using `RubricTask`.**
+  Aggregation clamps the headline to `[0, 1]`.
 ## Validation
 
 Template PR validation in mothership runs presence-driven checks:
@@ -766,5 +783,7 @@ ML_Envs migration bug (forgotten clip on a custom anchor mapping).
 
 - [`README.md`](../README.md) — repo overview and contributor loop
 - [`docs/AUTHORING.md`](AUTHORING.md) — task-creation walkthrough
+- [`docs/TASK_MIGRATION.md`](TASK_MIGRATION.md) — migrate older tasks onto
+  sealed continuous calibration, `RubricTask`, and sealed evaluation plans
 - [`grader/src/grading/`](../grader/src/grading/) — shared library source you can read locally
 - The mothership repo's `docs/MUJOCO_TASKS.md` and `docs/ML_ENVS_MIGRATION.md` (visible to FDEs only) cover task-family-specific patterns.

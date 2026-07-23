@@ -35,11 +35,12 @@ At a high level, the workflow is:
 1. Write the task prompt in `instruction.md`.
 2. Put any public files the model may inspect in `data/`.
 3. Put hidden grading fixtures in `scorer/data/`.
-4. Write a deterministic grader in `scorer/compute_score.py`.
+4. Declare a deterministic `RubricTask` in `scorer/compute_score.py` and
+   let harness reference/ground-truth refresh sealed `scorer/evaluation.plan.json` from `TASK` (commit it; never hand-edit).
 5. Write an oracle solution in `solution/solve.sh`.
 6. Run the local harness to prove the oracle scores `1.0`.
 7. Run a model attempt, then use the PR Prometheus Eval report to confirm
-   the task is challenging enough and has enough score diversity.
+   the task is challenging enough and has usable rollout evidence.
 
 The model sees the prompt and public files. The grader sees the model's output
 and private scorer data. This separation is important: it lets you use hidden
@@ -51,27 +52,35 @@ reference anchors without leaking the answer to the model.
 After you finish authoring, the eval acceptance path is:
 
 1. Open a PR in your fork (one task per PR).
-2. Trusted CI (`trusted-ci/grade`) runs first. Auto QA is part of this stage and
-   is advisory: read the verdict, but it alone does not mean the eval row is
-   accepted.
-3. When Trusted CI passes, Prometheus and Taiga run independently in parallel.
+2. Wait for `trusted-ci/grade` to pass. For Prometheus CFD/structures, that
+   check waits on Submit Prometheus, so a green check already means Prometheus
+   completed and the mean-reward gate passed. Auto QA is advisory only.
+3. Prometheus and Taiga run independently in parallel after sandbox validation.
    Taiga uses the dedicated Prometheus numerical-solvers environment and sends
-   OpenFOAM availability as a native hint rather than changing your instruction.
-4. Wait for both PR result streams. Before you treat the eval row as
-   accepted, these **blocking** gates must pass:
-   - average Prometheus target score `<= 0.500`
-   - Prometheus target score standard deviation `>= 0.100`
-   - required Prometheus target attempts `>= 4`
-5. The trainability auditor also runs on every Prometheus submission. It is
-   **advisory** (it does not block CI on score), but it is still important for
-   RL quality. Aim for a final composite trainability score of **40 or above**.
-   A score below `40` usually means the observed failures were not model-
-   controllable (environment, grader, or setup issues rather than solvable
-   model mistakes), so the problem is a weak RL candidate even if the blocking
-   score and diversity gates pass.
-6. Only after the blocking Prometheus gates pass, treat the eval row as
-   accepted. Do not accept after Trusted CI or Auto QA alone. Missing rollout
-   or score-gate sections means pending, not clean.
+   OpenFOAM availability as a native hint rather than changing your
+   instruction.
+4. The only acceptance gate is the Prometheus target average `<= 0.500`.
+   Standard deviation and the trainability audit are diagnostic context, not
+   approval gates.
+5. Boreal / LBx Validation QA may still appear for coaching. It is
+   **non-blocking** for eval: Boreal findings, required-QA completeness, and
+   the Boreal average score do **not** gate eval acceptance. Use them if
+   helpful; do not hold the eval row for them once trusted CI is green.
+6. Treat the eval row as accepted when `trusted-ci/grade` is green (Prometheus
+   average included). Do not accept after Auto QA alone. Missing rollout or
+   score-gate sections mean pending, not clean.
+
+### When to submit / accept (eval)
+
+| Situation | What to do |
+| --- | --- |
+| `trusted-ci/grade` still running or red | Wait. Do not accept. |
+| Prometheus average missing or `> 0.5` | Rework / re-trigger. Do not accept. |
+| `trusted-ci/grade` green (Prometheus average `<= 0.5`) | Eval row is accepted. |
+| Boreal QA incomplete, warnings, or criticals | Non-blocking for eval. Optional coaching only. |
+
+**Eligible / accepted for eval** means: `trusted-ci/grade` green, which already
+includes the Prometheus average gate. Boreal QA is advisory context only.
 
 ## 2. RL in Plain English
 
@@ -181,7 +190,9 @@ The main files are:
 - `environment/Dockerfile`: installs task dependencies and copies public/private
   files into the container.
 - `data/`: public files available to the model at `/data`.
-- `scorer/compute_score.py`: deterministic grading code.
+- `scorer/compute_score.py`: declarative criteria and pure domain evaluation;
+  shared APIs own artifact/error/aggregation plumbing.
+- `scorer/evaluation.plan.json`: hash-bound rubric protocol identity.
 - `scorer/<solver>_case.py`: optional helper that builds, runs, and parses a
   deterministic solver case.
 - `scorer/data/`: private files available only to the grader.
@@ -604,22 +615,21 @@ must finish the agent episode and hidden verifier runs.
 The targets are:
 
 ```text
-Blocking:
+Blocking (eval):
 Average Prometheus target score <= 0.500
-Prometheus target score standard deviation >= 0.100
-Required Prometheus target attempts >= 4
 
-Advisory (always runs; does not block CI on score, but still important):
-Final composite trainability score >= 40 (good RL candidate)
-Below 40: failures often not model-controllable; weak RL candidate
+Non-blocking for eval (coaching context only):
+Boreal QA findings and required-QA completeness
+Boreal average score
+Prometheus target score standard deviation
+Trainability-audit feedback
+Below 40 trainability: failures often not model-controllable; weak RL candidate
 ```
 
 If the average score is above `0.500`, the task is too easy for the target run
-even if local validation passed. If the standard deviation is below `0.100`, the
-task may be too binary, too deterministic in how attempts fail, or too tightly
-constrained to a single obvious path. Use the per-attempt scores and per-criterion
-breakdown to see what the target run is solving, then tighten or rebalance the
-engineering challenge fairly.
+even if local validation passed. Use the per-attempt scores, standard deviation,
+and per-criterion breakdown as context to see what the target run is solving,
+then tighten or rebalance the engineering challenge fairly.
 
 If the model scores `1.0`, the task may be too easy, too constrained to one
 obvious answer, or accidentally leaking the solution. Do not hide essential
@@ -636,16 +646,17 @@ instructions to make it harder. Instead, improve the engineering challenge:
 - add independent hidden checks so matching one public flow condition or geometry
   pattern is not enough to satisfy the Prometheus average-score target.
 
-If the standard deviation is too low, improve score resolution rather than adding
-randomness. Good fixes include smoother partial-credit curves, independently
-weighted physics criteria, hidden cases with different failure modes, and scoring
-that separates formatting, feasibility, solver health, nominal performance, and
+If the rollout results provide weak diagnostic evidence, improve score resolution
+rather than adding randomness. Good fixes include smoother partial-credit curves,
+independently weighted physics criteria, hidden cases with different failure
+modes, and scoring that separates formatting, feasibility, solver health,
+nominal performance, and
 robustness. Do not make the task nondeterministic just to create spread.
 
 The goal is not to trick the model. The goal is to create a fair engineering
 problem where a strong model can make progress, while the current Prometheus
-target run stays below the average-score ceiling and shows enough attempt-level
-score diversity for training.
+target run stays below the average-score ceiling and provides usable attempt-level
+evidence for review.
 
 ## 12. AVL Per-Task Install Recipe
 
@@ -668,9 +679,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ... then the standard grader COPY/install block ...
 ```
 
-Call `avl` from the scorer with `subprocess`, feed it a deterministic command
-script, and parse printed forces or stability derivatives. Treat failed or
-non-converged AVL runs as failed grading cases.
+Call `avl` through `context.run_solver(...)`, feed it a deterministic command
+script, and parse the typed bounded result. Do not call `subprocess` directly;
+the shared API owns process-group timeout and output-cap handling.
 
 ## 13. Final Author Checklist
 
@@ -682,7 +693,9 @@ Before opening or updating a task PR, check:
   answers.
 - Private fixtures, hidden conditions, and reference anchors live under
   `scorer/data/`.
-- `scorer/compute_score.py` is deterministic and returns a score in `[0, 1]`.
+- `scorer/compute_score.py` declares `TASK = RubricTask(...)`, contains no
+  author-owned `compute_score`, raw candidate reads, subprocesses, or failure
+  payloads, and has a matching `scorer/evaluation.plan.json`.
 - Solver version, serial execution, mesh generation, timestep or iteration
   budget, schemes, boundary conditions, and seeds are pinned.
 - The task uses deterministic `blockMesh` or a pre-built mesh; no nondeterministic
@@ -713,20 +726,20 @@ uv run lbx-rl-harness run \
   --problem-dir problems/<task_id>
 ```
 
-- Wait for the full Prometheus workflow to pass before treating the eval row as
-  accepted. The `submit-prometheus` job must pass the blocking gates: average
-  target score `<= 0.500`, target score standard deviation `>= 0.100`, and at
-  least 4 target attempts. The trainability auditor always runs and is important
-  even though it is advisory: aim for a final composite trainability score
-  `>= 40`. Below `40` usually means failures were not model-controllable, so
-  the task is a weak RL candidate. Absence of the
-  rollout or score-gate section means pending, not clean.
-- `.alignerr/build_proof.json` is committed after the final task edits.
+- Wait for a green `trusted-ci/grade` before treating the eval row as accepted.
+  For Prometheus CFD/structures that check already includes Submit Prometheus
+  and the only gate: average target score `<= 0.500`. Standard deviation and
+  trainability-audit feedback are context, not acceptance gates. Absence of
+  the rollout or score-gate section means pending, not clean.
+- Boreal QA is non-blocking for eval. You may use LBx Validation / dashboard
+  findings for coaching, but do not hold eval acceptance for Boreal QA
+  completeness or critical findings once trusted CI is green.
+
+- Trusted CI generates `.alignerr/build_proof.json` from the final PR revision.
 - `.alignerr/ground_truth/` artifacts are committed when the task declares them.
 - `.env.local`, `.harness-runs/`, API keys, and other secrets are not committed.
 
-If those checks pass and the full Prometheus workflow passes, the eval row is
-accepted.
+If those checks pass and `trusted-ci/grade` is green, the eval row is accepted.
 
 ## Env Pre-flight QA (Blocking in CI)
 

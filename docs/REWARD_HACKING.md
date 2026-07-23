@@ -13,6 +13,16 @@ Two failure classes drive everything:
 - **Training-data corruption** -- a `0.0` is mis-sorted into "agent earned it"
   (keep) vs "infra/author broke it" (discard), poisoning RL training.
 
+## Declarative rubric boundary
+
+`multi_deterministic_rubrics` tasks must use `TASK = RubricTask(...)`; see
+[`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md). Rubric authors do not read
+artifacts, catch exceptions, coerce untrusted numbers, divide, normalize
+weights, launch subprocesses, aggregate scores, or construct failure payloads.
+Artifact descriptors and `RubricContext` own those operations and their fault
+semantics. The legacy patterns below remain relevant to continuous/immutable
+graders and explain the attacks the declarative API closes.
+
 ## 1. The `agent_fault` validator stage (blocking)
 
 `lbx-rl-template validate` statically scans every `scorer/*.py` and **fails the
@@ -39,6 +49,11 @@ This is the training-integrity contract:
   crash, OOM) -> let it **propagate**. Marked `env_internal_failure` and the
   rollout is **discarded** rather than trained on.
 
+For mandatory declarative rubrics, an untyped exception specifically inside
+candidate evaluation is kept as zero with `critical_operator_alert` to close
+the free-veto fallback. Trusted CI's probe matrix must block it until the task
+uses the correct candidate/trusted shared operation boundary.
+
 A generic `except Exception: return 0.0` collapses both into a kept zero and is
 rejected on sight. Move author/infra reads (hidden truth) outside the agent
 `try`; wrap only agent code and `raise AgentFault`.
@@ -51,6 +66,8 @@ account and raises `AgentFault` for malformed input.
 
 | Submission | Loader | Closes |
 | --- | --- | --- |
+| Rubric JSON | `JsonArtifact` in `RubricTask` | `O_NOFOLLOW`, FIFO/device, byte/depth/node caps, strict UTF-8, schema, huge-number overflow, NaN/Inf |
+| Rubric text/XML | `TextArtifact` in `RubricTask` | `O_NOFOLLOW`, FIFO/device, byte cap, strict UTF-8 |
 | CSV / dataframe | `helpers.load_submission_or_fault` | symlink/FIFO, oversize, schema, non-finite |
 | NumPy `.npz` / `.npy` | `helpers.load_submission_npz_or_fault` | symlink-to-truth (`O_NOFOLLOW`), FIFO-hang (`O_NONBLOCK`), oversize, and pickle-RCE (`allow_pickle=False`) |
 | Any format read by hand | `helpers.require_regular_file(path)` before the read | symlink/FIFO/dir/device + oversize (an `os.lstat` + `stat.S_ISREG` guard as a callable; a bare `except OSError` does not stop a symlink) |
@@ -115,6 +132,22 @@ See [`POLICY_ISOLATION.md`](POLICY_ISOLATION.md) for the sandbox details.
 
 ## 5. Calibration gates (continuous tasks)
 
+- **Sealed evaluation:** new continuous tasks use
+  [`CONTINUOUS_EVALUATION.md`](CONTINUOUS_EVALUATION.md). Quality calibration
+  and information evidence are separate: certified targets keep their reviewed-
+  floor reward, while constants, perturbations, marginal shuffles, and
+  observation-independent policies receive zero. Exact evidence statistics are
+  root-only.
+- **Generated calibration (v3 ML):** local `run --runtime ground-truth`
+  validates committed model manifests and writes ignored development
+  lock/evidence state. Trusted CI independently restores or regenerates the
+  authoritative digest-keyed bundle from the immutable PR revision, then mounts
+  it read-only in Taiga. Validators reject stale/noncanonical locks, copied
+  score artifacts, and evidence mismatches. Rollout grading never reruns anchor
+  solutions.
+- **Floor rationale:** floors are reviewed metric-semantic/theoretical choices,
+  represented by `FloorAnchor` + `AnchorRationale`; a baseline measurement may
+  qualify task difficulty but must never silently become the floor.
 - **Trivial-submission gate**: a no-op submission (and, when extractable, the
   prompt's own example) must not out-score `[ground_truth].max_trivial_score`
   (default `0.5`). Stops "submit nothing" or "copy the example" beating real
@@ -142,6 +175,8 @@ contacts turned off. Gate the score on it for control tasks.
 
 ## Author checklist
 
+- [ ] Rubric tasks declare `TASK = RubricTask(...)` and a matching
+      `scorer/evaluation.plan.json`; they do not define `compute_score()`.
 - [ ] No bare/broad `except` that returns a score; agent faults `raise AgentFault`.
 - [ ] Author/infra reads (hidden truth) are outside the agent `try`.
 - [ ] Submissions are read via the sanctioned loader for their type.

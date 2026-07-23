@@ -35,11 +35,12 @@ At a high level, the workflow is:
 1. Write the task prompt in `instruction.md`.
 2. Put any public files the model may inspect in `data/`.
 3. Put hidden grading fixtures in `scorer/data/`.
-4. Write a deterministic grader in `scorer/compute_score.py`.
+4. Declare a deterministic `RubricTask` in `scorer/compute_score.py` and
+   let harness reference/ground-truth refresh sealed `scorer/evaluation.plan.json` from `TASK` (commit it; never hand-edit).
 5. Write an oracle solution in `solution/solve.sh`.
 6. Run the local harness to prove the oracle scores `1.0`.
 7. Run a model attempt, then use the PR Prometheus report to confirm
-   the task is challenging enough and has enough score diversity.
+   the task is challenging enough and has usable rollout evidence.
 
 The model sees the prompt and public files. The grader sees the model's output
 and private scorer data. This separation is important: it lets you use hidden
@@ -48,30 +49,53 @@ reference anchors without leaking the answer to the model.
 
 ## PR pipeline: Trusted CI to Prometheus to Labelbox
 
-After you finish authoring, the review path is:
+After you finish authoring, the Labelbox review path is:
 
 1. Open a PR in your fork (one task per PR).
-2. Trusted CI (`trusted-ci/grade`) runs first. Auto QA is part of this stage and
-   is advisory: read the verdict, but it alone does not mean the task is ready
-   to submit.
-3. When Trusted CI passes, Prometheus and Taiga run independently in parallel.
+2. Wait for `trusted-ci/grade` to pass. For Prometheus CFD/structures, that
+   check waits on Submit Prometheus, so a green check already means Prometheus
+   completed and the mean-reward gate passed. Auto QA is advisory only.
+3. Prometheus and Taiga run independently in parallel after sandbox validation.
    Taiga uses the dedicated Prometheus numerical-solvers environment and sends
-   OpenFOAM availability as a native hint rather than changing your instruction.
-4. Wait for both PR result streams. Before you submit the row for Labelbox
-   review, these **blocking** gates must pass:
-   - average Prometheus target score `<= 0.500`
-   - Prometheus target score standard deviation `>= 0.100`
-   - required Prometheus target attempts `>= 4`
-5. The trainability auditor also runs on every Prometheus submission. It is
-   **advisory** (it does not block CI on score), but it is still important for
-   RL quality. Aim for a final composite trainability score of **40 or above**.
-   A score below `40` usually means the observed failures were not model-
-   controllable (environment, grader, or setup issues rather than solvable
-   model mistakes), so the problem is a weak RL candidate even if the blocking
-   score and diversity gates pass.
-6. Only after the blocking Prometheus gates pass, submit the production row for
-   Labelbox review. Do not submit after Trusted CI or Auto QA alone. Missing
-   rollout or score-gate sections means pending, not clean.
+   OpenFOAM availability as a native hint rather than changing your
+   instruction.
+4. The only **score** gate is the Prometheus target average `<= 0.500`.
+   Standard deviation and the trainability audit are diagnostic context, not
+   approval gates. The **Boreal average score is not a blocker**.
+5. Boreal QA **is** required before Labelbox review / Done. Check **both**
+   surfaces and use whichever has the latest findings:
+   - the **LBx Validation / Boreal** PR comment, and
+   - the **results dashboard**.
+   Required QAs must be complete on at least one current surface:
+   `transcript_health`, `data_quality`, `env_linter`, `reward_hacking`.
+   Only **critical** findings block Done. Warning and info findings are fine.
+6. Submit the production row for Labelbox review only when the gates
+   above pass and no unresolved critical Boreal findings remain.
+   Do not submit after Trusted CI or Auto QA alone.
+   Missing rollout or score-gate sections mean pending, not clean.
+
+### When to submit for review (and when not to)
+
+| Situation | What to do |
+| --- | --- |
+| `trusted-ci/grade` still running or red | Wait. Do not submit. |
+| Prometheus average missing or `> 0.5` | Rework / re-trigger. Do not submit. |
+| Boreal QA incomplete on **both** surfaces | Wait. Do not submit. |
+| Latest Boreal **critical** findings are clear and fixable | Self-iterate: fix, push, wait for refreshed QA. Do **not** submit yet. |
+| Suspected false positive, or unclear how to proceed | Submit for **coaching** review. Name which Boreal surface is latest and what is unclear. |
+| Gates pass; zero criticals; warnings/info may remain | Submit for **acceptance** review. Name which Boreal surface is latest. |
+| Warning or info findings only | Allowed to submit for acceptance if other gates pass. Do not burn cycles clearing them. |
+
+**Eligible for review** means: `trusted-ci/grade` green (Prometheus average
+included) **and** latest Boreal QA complete on either surface.
+
+**Ready to accept / Done** means: those gates pass, zero unresolved critical
+Boreal findings (warnings/info may remain), and a reviewer confirms factual
+accuracy — not only green automated checks.
+
+When you submit, leave a PR comment that names **which surface has the latest
+Boreal QA** (LBx Validation comment and/or dashboard URL) and whether you want
+coaching or acceptance.
 
 ## 2. RL in Plain English
 
@@ -181,7 +205,9 @@ The main files are:
 - `environment/Dockerfile`: installs task dependencies and copies public/private
   files into the container.
 - `data/`: public files available to the model at `/data`.
-- `scorer/compute_score.py`: deterministic grading code.
+- `scorer/compute_score.py`: declarative criteria and pure domain evaluation;
+  shared APIs own artifact/error/aggregation plumbing.
+- `scorer/evaluation.plan.json`: hash-bound rubric protocol identity.
 - `scorer/<solver>_case.py`: optional helper that builds, runs, and parses a
   deterministic solver case.
 - `scorer/data/`: private files available only to the grader.
@@ -604,22 +630,24 @@ must finish the agent episode and hidden verifier runs.
 The targets are:
 
 ```text
-Blocking:
+Blocking score gate:
 Average Prometheus target score <= 0.500
-Prometheus target score standard deviation >= 0.100
-Required Prometheus target attempts >= 4
 
-Advisory (always runs; does not block CI on score, but still important):
-Final composite trainability score >= 40 (good RL candidate)
-Below 40: failures often not model-controllable; weak RL candidate
+Also required before review / Done:
+Boreal required QA complete on comment or dashboard
+No unresolved critical Boreal findings
+
+Reported for context (not gates):
+Prometheus target score standard deviation
+Trainability-audit feedback
+Boreal average score
+Below 40 trainability: failures often not model-controllable; weak RL candidate
 ```
 
 If the average score is above `0.500`, the task is too easy for the target run
-even if local validation passed. If the standard deviation is below `0.100`, the
-task may be too binary, too deterministic in how attempts fail, or too tightly
-constrained to a single obvious path. Use the per-attempt scores and per-criterion
-breakdown to see what the target run is solving, then tighten or rebalance the
-engineering challenge fairly.
+even if local validation passed. Use the per-attempt scores, standard deviation,
+and per-criterion breakdown as context to see what the target run is solving,
+then tighten or rebalance the engineering challenge fairly.
 
 If the model scores `1.0`, the task may be too easy, too constrained to one
 obvious answer, or accidentally leaking the solution. Do not hide essential
@@ -636,16 +664,17 @@ instructions to make it harder. Instead, improve the engineering challenge:
 - add independent hidden checks so matching one public flow condition or geometry
   pattern is not enough to satisfy the Prometheus average-score target.
 
-If the standard deviation is too low, improve score resolution rather than adding
-randomness. Good fixes include smoother partial-credit curves, independently
-weighted physics criteria, hidden cases with different failure modes, and scoring
-that separates formatting, feasibility, solver health, nominal performance, and
+If the rollout results provide weak diagnostic evidence, improve score resolution
+rather than adding randomness. Good fixes include smoother partial-credit curves,
+independently weighted physics criteria, hidden cases with different failure
+modes, and scoring that separates formatting, feasibility, solver health,
+nominal performance, and
 robustness. Do not make the task nondeterministic just to create spread.
 
 The goal is not to trick the model. The goal is to create a fair engineering
 problem where a strong model can make progress, while the current Prometheus
-target run stays below the average-score ceiling and shows enough attempt-level
-score diversity for training.
+target run stays below the average-score ceiling and provides usable attempt-level
+evidence for review.
 
 ## 12. AVL Per-Task Install Recipe
 
@@ -668,9 +697,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ... then the standard grader COPY/install block ...
 ```
 
-Call `avl` from the scorer with `subprocess`, feed it a deterministic command
-script, and parse printed forces or stability derivatives. Treat failed or
-non-converged AVL runs as failed grading cases.
+Call `avl` through `context.run_solver(...)`, feed it a deterministic command
+script, and parse the typed bounded result. Do not call `subprocess` directly;
+the shared API owns process-group timeout and output-cap handling.
 
 ## 13. Final Author Checklist
 
@@ -682,7 +711,9 @@ Before opening or updating a task PR, check:
   answers.
 - Private fixtures, hidden conditions, and reference anchors live under
   `scorer/data/`.
-- `scorer/compute_score.py` is deterministic and returns a score in `[0, 1]`.
+- `scorer/compute_score.py` declares `TASK = RubricTask(...)`, contains no
+  author-owned `compute_score`, raw candidate reads, subprocesses, or failure
+  payloads, and has a matching `scorer/evaluation.plan.json`.
 - Solver version, serial execution, mesh generation, timestep or iteration
   budget, schemes, boundary conditions, and seeds are pinned.
 - The task uses deterministic `blockMesh` or a pre-built mesh; no nondeterministic
@@ -713,28 +744,32 @@ uv run lbx-rl-harness run \
   --problem-dir problems/<task_id>
 ```
 
-- Wait for the full Prometheus workflow to pass before treating the task as
-  review-ready. The `submit-prometheus` job must pass the blocking gates:
-  average target score `<= 0.500`, target score standard deviation `>= 0.100`,
-  and at least 4 target attempts. The trainability auditor always runs and is
-  important even though it is advisory: aim for a final composite trainability
-  score `>= 40`. Below `40` usually means failures were not model-controllable,
-  so the task is a weak RL candidate. Absence of the
-  rollout or score-gate section means pending, not clean.
-- A passing `submit-prometheus` job means the production row can move into review.
-  Do not submit a non-passing production row for review. Submitting failed or
-  pending rows violates fair practices and may remove the tasker from the
-  project.
+- Wait for a green `trusted-ci/grade` before treating the task as review-ready.
+  For Prometheus CFD/structures that check already includes Submit Prometheus
+  and the only score gate: average target score `<= 0.500`. Standard deviation
+  and trainability-audit feedback are context, not approval gates. Absence of
+  the rollout or score-gate section means pending, not clean.
+- Confirm Boreal QA on the LBx Validation comment and/or dashboard: required
+  QAs complete (`transcript_health`, `data_quality`, `env_linter`,
+  `reward_hacking`) and no unresolved critical findings before submitting for
+  Labelbox review. Warning/info findings are fine. The Boreal average score is
+  not a blocker. Do not submit a failed or pending production row for review.
+  Submitting failed or pending rows violates fair practices and may remove the
+  tasker from the project.
+- Self-iterate on clear critical findings; submit for coaching only when stuck
+  or for acceptance when gates pass. When submitting, leave a PR comment naming
+  which Boreal surface is latest.
+
 - Diversity and originality are required. Problems submitted to the original CFD
   or structures projects, or previously submitted to Boreal, must not be
   resubmitted to Prometheus. These submissions will be rejected, count as
   cheating, and may warrant removal from the project.
-- `.alignerr/build_proof.json` is committed after the final task edits.
+- Trusted CI generates `.alignerr/build_proof.json` from the final PR revision.
 - `.alignerr/ground_truth/` artifacts are committed when the task declares them.
 - `.env.local`, `.harness-runs/`, API keys, and other secrets are not committed.
 
-If those checks pass and the full Prometheus workflow passes, the task is in
-good shape for review.
+If those checks pass, `trusted-ci/grade` is green, Boreal required QA is
+complete, and criticals are clear, the task is in good shape for review.
 
 ## Env Pre-flight QA (Blocking in CI)
 

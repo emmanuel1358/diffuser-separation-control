@@ -17,6 +17,8 @@ for path in "${required_json[@]}"; do
   test -s "$path"
   python3 -m json.tool "$path" >/dev/null
 done
+test -s "$PROBLEM_DIR/scorer/evaluation.plan.json"
+python3 -m json.tool "$PROBLEM_DIR/scorer/evaluation.plan.json" >/dev/null
 
 python3 -m py_compile \
   "$PROBLEM_DIR/scorer/compute_score.py" \

@@ -26,7 +26,9 @@ TEST_FILE = (
 )
 
 
-def _write_mlenvs_task(root: Path, *, metadata: dict, name: str = "demo-task_taiga") -> Path:
+def _write_mlenvs_task(
+    root: Path, *, metadata: dict, name: str = "demo-task_taiga"
+) -> Path:
     task_dir = root / name
     (task_dir / "data" / "public").mkdir(parents=True)
     (task_dir / "data" / "private").mkdir(parents=True)
@@ -81,7 +83,9 @@ def test_is_mlenvs_task_false_when_missing_or_malformed(tmp_path: Path):
 
 
 def test_synthesized_task_toml_pins_and_maps(tmp_path: Path):
-    task_dir = _write_mlenvs_task(tmp_path, metadata=_valid_metadata(**{"docker-base": "default"}))
+    task_dir = _write_mlenvs_task(
+        tmp_path, metadata=_valid_metadata(**{"docker-base": "default"})
+    )
     toml = load_task_toml(task_dir)
 
     # Mapped per-task fields.
@@ -191,7 +195,10 @@ def test_hf_resources_synthesized_as_preloaded_mounts(tmp_path: Path):
     mounts = {p.hf_repo: p for p in toml.preloaded_files}
     assert set(mounts) == {"meta-llama/Llama-3.1-8B", "org/ds"}
     model = mounts["meta-llama/Llama-3.1-8B"]
-    assert model.mount_path == "/tmp/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B"
+    assert (
+        model.mount_path
+        == "/tmp/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B"
+    )
     assert model.read_only is True and model.source == ""
     dataset = mounts["org/ds"]
     assert dataset.mount_path == "/tmp/.cache/huggingface/hub/datasets--org--ds"
@@ -230,7 +237,9 @@ def test_hf_resources_mount_path_matches_packer():
 def test_env_dependencies_accepted_for_env_task(tmp_path: Path):
     task_dir = _write_mlenvs_task(
         tmp_path,
-        metadata=_valid_metadata(ml_task_type="env", env_dependencies=["myosuite==2.9.0"]),
+        metadata=_valid_metadata(
+            ml_task_type="env", env_dependencies=["myosuite==2.9.0"]
+        ),
     )
     # env_dependencies is a build-only selector, not surfaced in the TaskToml.
     toml = load_task_toml(task_dir)
@@ -294,7 +303,9 @@ def test_grading_dependencies_accepted_for_dataset_task(tmp_path: Path):
         ),
         (_valid_metadata(hf_resources=["justname"]), "must look like 'org/name'"),
         (
-            _valid_metadata(hf_resources=[{"repo_id": "org/name", "repo_type": "space"}]),
+            _valid_metadata(
+                hf_resources=[{"repo_id": "org/name", "repo_type": "space"}]
+            ),
             "repo_type must be one of",
         ),
         (
@@ -304,7 +315,10 @@ def test_grading_dependencies_accepted_for_dataset_task(tmp_path: Path):
         (
             _valid_metadata(
                 hf_resources=["org/name"],
-                **{"docker-base": "tpu", "required_resources": "13vcpu+32gib+tpuv5e1x1"},
+                **{
+                    "docker-base": "tpu",
+                    "required_resources": "13vcpu+32gib+tpuv5e1x1",
+                },
             ),
             "hf_resources is not supported with a TPU base",
         ),
@@ -386,7 +400,21 @@ def test_grading_inputs_hash_scopes_to_mlenvs_inputs(tmp_path: Path):
 
     # private data edit MUST stale it.
     (task_dir / "data" / "private" / "truth.csv").write_text("y\n3\n")
-    assert grading_inputs_sha256(task_dir) != h1
+    h2 = grading_inputs_sha256(task_dir)
+    assert h2 != h1
+
+    # Calibration evidence is source-affecting: baseline/generator/lock changes
+    # must invalidate proof instead of preserving copied measurements.
+    (task_dir / "baselines" / "naive").mkdir(parents=True)
+    (task_dir / "baselines" / "naive" / "solution.py").write_text("print('naive')\n")
+    h3 = grading_inputs_sha256(task_dir)
+    assert h3 != h2
+    (task_dir / "data-generation").mkdir()
+    (task_dir / "data-generation" / "generate.py").write_text("print('data')\n")
+    h4 = grading_inputs_sha256(task_dir)
+    assert h4 != h3
+    (task_dir / "calibration.lock.json").write_text("{}\n")
+    assert grading_inputs_sha256(task_dir) != h4
 
 
 def test_reference_solution_dir_selectable_for_mlenvs(tmp_path: Path):
@@ -403,11 +431,23 @@ def test_reference_solution_dir_selectable_for_mlenvs(tmp_path: Path):
         reference=types.SimpleNamespace(entrypoint="solve.sh"),
     )
     # native default "solution" (and empty) mean "unset" -> reference_solution
-    assert solution_script_rel(ml_prob, solution_dir="solution") == "reference_solution/solution.py"
-    assert solution_script_rel(ml_prob, solution_dir="") == "reference_solution/solution.py"
+    assert (
+        solution_script_rel(ml_prob, solution_dir="solution")
+        == "reference_solution/solution.py"
+    )
+    assert (
+        solution_script_rel(ml_prob, solution_dir="")
+        == "reference_solution/solution.py"
+    )
     # an explicit dir runs THAT directory's solution.py
-    assert solution_script_rel(ml_prob, solution_dir="baselines/naive") == "baselines/naive/solution.py"
-    assert solution_script_rel(ml_prob, solution_dir="reference_solution") == "reference_solution/solution.py"
+    assert (
+        solution_script_rel(ml_prob, solution_dir="baselines/naive")
+        == "baselines/naive/solution.py"
+    )
+    assert (
+        solution_script_rel(ml_prob, solution_dir="reference_solution")
+        == "reference_solution/solution.py"
+    )
 
     native = tmp_path / "native"
     native.mkdir()
@@ -417,4 +457,6 @@ def test_reference_solution_dir_selectable_for_mlenvs(tmp_path: Path):
         reference=types.SimpleNamespace(entrypoint="solve.sh"),
     )
     assert solution_script_rel(nat_prob, solution_dir="solution") == "solution/solve.sh"
-    assert solution_script_rel(nat_prob, solution_dir="solution2") == "solution2/solve.sh"
+    assert (
+        solution_script_rel(nat_prob, solution_dir="solution2") == "solution2/solve.sh"
+    )

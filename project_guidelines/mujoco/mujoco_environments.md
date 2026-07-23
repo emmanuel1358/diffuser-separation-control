@@ -103,47 +103,43 @@ A task has three pieces:
 
 1. **Instruction**: the prompt in `instruction.md`. This is what the model sees.
 2. **Solution format**: typically MJCF XML, Python that builds an `MjModel`, a `policy.py`, or a combination.
-3. **Scorer**: `scorer/compute_score.py`, a deterministic function that returns a score in `[0, 1]`, a score dict, or `RubricBuilder.grade().to_dict()`.
+3. **Scorer**: `scorer/compute_score.py`, a declarative `RubricTask` whose pure
+   evaluator returns the declared deterministic criterion values.
 
 The grader is the whole game. A wrong grader teaches the wrong lesson. A gameable grader gets gamed.
 
 ## Grader Contract
 
-Every task uses the same grader contract:
-
-```python
-from pathlib import Path
-from typing import Any
-
-
-def compute_score(
-    workspace: Path,
-    trajectory: list[dict[str, Any]] | None,
-    private: Path,
-) -> float | dict[str, Any]:
-    ...
-```
+MuJoCo rubric tasks declare `TASK = RubricTask(...)` in
+`scorer/compute_score.py` (no `compute_score()`). Continuous / ML-style
+tasks still use `compute_score(workspace, trajectory, private)`.
 
 For MuJoCo tasks:
 
-- `workspace` is where the model output lives, for example `/tmp/output/model.xml` or `/tmp/output/policy.py`.
-- `private` points at `/mcp_server/data`, where hidden assets, seeds, and reference metrics live.
+- Agent artifacts land under `/tmp/output` (for example `model.xml` or
+  `policy.py`).
+- Private fixtures live under `/mcp_server/data`.
 - `trajectory` may be unused unless the task involves agent tool traces.
 
-Prefer `RubricBuilder` for MuJoCo rubrics because it gives one row per
-deterministic criterion:
+Use `RubricTask`; `TextArtifact` owns MJCF reads and
+`context.candidate_operation` owns compile/rollout rejection:
 
 ```python
-from grading import RubricBuilder
+from grading.evaluation import RubricCriterion, RubricTask, TextArtifact
 
-def compute_score(workspace, trajectory, private):
-    rb = RubricBuilder(workspace=workspace, trajectory=trajectory, private=private)
+def evaluate(context):
+    model = context.candidate_operation(
+        "MJCF compilation",
+        mujoco.MjModel.from_xml_string,
+        context.candidate,
+    )
+    return {"compiled": model is not None}
 
-    @rb.criterion(id="compiled", weight=0.1, description="MJCF compiles")
-    def _():
-        return load_model(workspace / "model.xml") is not None
-
-    return rb.grade().to_dict()
+TASK = RubricTask(
+    artifact=TextArtifact("model.xml"),
+    criteria=(RubricCriterion("compiled", required=True),),
+    evaluate=evaluate,
+)
 ```
 
 Before writing rubric criteria, read the shared
@@ -157,14 +153,11 @@ perturbations, and numeric thresholds.
 
 ### Executable Policies
 
-When a MuJoCo task asks for `/tmp/output/policy.py` or another executable Python
-controller, do not import the submitted module directly into `compute_score.py`
-while hidden cases or perturbation schedules are live. Use `PolicyWorker`:
+When a MuJoCo task asks for `/tmp/output/policy.py`, declare
+`RegularFileArtifact` and use the shared policy boundary:
 
 ```python
-from grading import PolicyWorker
-
-with PolicyWorker(workspace / "policy.py", timeout_s=0.1) as policy:
+with context.policy(timeout_s=0.1) as policy:
     action = policy.act(public_observation)
 ```
 
@@ -468,7 +461,7 @@ A PR attempt is eligible for payment when it meets all of these before review:
   QA, Auto QA, and downstream Taiga/Boreal feedback on the fork PR.
 - The task does **not** score perfectly under validation; a model score below
   `1.0` shows that the task still contains meaningful headroom.
-- If the task uses `RubricBuilder`, it includes at least **5 deterministic
+- Its `RubricTask` includes at least **5 deterministic
   criteria**. Strong MuJoCo tasks should still aim for the 10+ criterion
   structure described above.
 - If the task uses a continuous reward, follow the

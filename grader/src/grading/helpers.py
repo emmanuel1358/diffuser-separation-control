@@ -1,4 +1,8 @@
-"""Deterministic predicate helpers returning bool / float in [0, 1] for use inside RubricBuilder criteria."""
+"""Deterministic predicate helpers returning bool / float in [0, 1].
+
+Us inside ``RubricTask.evaluate`` / continuous ``compute_score`` criteria.
+Legacy ``RubricBuilder`` criteria also consume these helpers.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -16,12 +21,13 @@ import tempfile
 import threading
 import zipfile
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from grading.faults import AgentFault
+from grading.faults import AgentFault, GraderFault
 
 _DEFAULT_MAX_SUBMISSION_BYTES = 64 * 1024 * 1024
 # stdout cap for a captured agent executable: a flood past this is killed and
@@ -37,6 +43,20 @@ _DEFAULT_MAX_HDF5_BYTES = 2 * 1024 * 1024 * 1024
 # crafted file that tries to hang or OOM the grader during the libhdf5 parse;
 # the read itself is one RPC call, so this is the per-parse budget.
 _H5_READ_TIMEOUT_S = 120.0
+
+
+@dataclass(frozen=True)
+class SolverResult:
+    """Bounded trusted-solver outcome; process failures never escape untyped."""
+
+    returncode: int
+    output: str
+    timed_out: bool = False
+    output_exceeded: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0 and not self.timed_out and not self.output_exceeded
 
 
 def file_exists(path: str | Path, *, non_empty: bool = False) -> bool:
@@ -650,7 +670,7 @@ _MODEL_LOAD_TIMEOUT_S = 300.0
 # sibling-class resolution. The user-site is added with a plain sys.path.insert
 # (never site.addsitedir / HOME) so no agent .pth executes as root, and only
 # inside the dropped worker -- which holds no truth and returns over msgpack.
-_AGENT_USER_SITE_SNIPPET = '''
+_AGENT_USER_SITE_SNIPPET = """
     import pwd, glob
     try:
         _home = os.environ.get("TAIGA_AGENT_HOME") or pwd.getpwuid(os.getuid()).pw_dir
@@ -664,30 +684,38 @@ _AGENT_USER_SITE_SNIPPET = '''
                 _home, ".local", "lib", "python*", "site-packages"))):
             if os.path.isdir(_site) and _site not in sys.path:
                 sys.path.insert(0, _site)
-'''
+"""
 
-_PICKLE_WRAPPER = '''
+_PICKLE_WRAPPER = (
+    """
 def load_policy():
     import os, sys, pickle
     model_path = __file__
-''' + _AGENT_USER_SITE_SNIPPET + '''
+"""
+    + _AGENT_USER_SITE_SNIPPET
+    + """
     data_dir = os.path.dirname(model_path) or "."
     if data_dir not in sys.path:
         sys.path.insert(0, data_dir)
     with open(model_path, "rb") as fh:
         return pickle.load(fh)
-'''
+"""
+)
 
-_JOBLIB_WRAPPER = '''
+_JOBLIB_WRAPPER = (
+    """
 def load_policy():
     import os, sys, joblib
     model_path = __file__
-''' + _AGENT_USER_SITE_SNIPPET + '''
+"""
+    + _AGENT_USER_SITE_SNIPPET
+    + """
     data_dir = os.path.dirname(model_path) or "."
     if data_dir not in sys.path:
         sys.path.insert(0, data_dir)
     return joblib.load(model_path)
-'''
+"""
+)
 
 _WRAPPERS = {"pickle": _PICKLE_WRAPPER, "joblib": _JOBLIB_WRAPPER}
 
@@ -713,8 +741,7 @@ def load_submitted_model(
     """
     if deserializer not in _WRAPPERS:
         raise ValueError(
-            "deserializer must be one of %s; got %r"
-            % (sorted(_WRAPPERS), deserializer)
+            "deserializer must be one of %s; got %r" % (sorted(_WRAPPERS), deserializer)
         )
     path = Path(path)
     if not path.exists():
@@ -875,6 +902,85 @@ def _kill_quietly(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def run_trusted_solver(
+    cmd: list[str],
+    *,
+    cwd: str | Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout_s: float = 120.0,
+    max_output_bytes: int = _DEFAULT_MAX_EXECUTABLE_OUTPUT_BYTES,
+) -> SolverResult:
+    """Run a trusted solver with a process-group timeout and hard output cap.
+
+    A missing executable or process-launch error is a ``GraderFault``. Solver
+    nonzero exits, timeouts, and output floods are returned as typed outcomes so
+    the declarative rubric can assign criterion zero without an uncaught
+    ``TimeoutExpired`` voiding the rollout.
+    """
+    if not cmd or not all(isinstance(part, str) and part for part in cmd):
+        raise GraderFault("trusted solver command must be a non-empty string list")
+    if timeout_s <= 0.0 or max_output_bytes < 1:
+        raise GraderFault("trusted solver timeout/output limits must be positive")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd is not None else None,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise GraderFault(
+            f"could not launch trusted solver {cmd[0]!r}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    captured = bytearray()
+    exceeded = threading.Event()
+
+    def _drain() -> None:
+        assert proc.stdout is not None
+        try:
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    break
+                remaining = max_output_bytes + 1 - len(captured)
+                if remaining > 0:
+                    captured.extend(chunk[:remaining])
+                if len(captured) > max_output_bytes:
+                    exceeded.set()
+                    with contextlib.suppress(OSError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    break
+        except (OSError, ValueError):
+            pass
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    finally:
+        reader.join(timeout=5.0)
+        with contextlib.suppress(OSError):
+            if proc.stdout is not None:
+                proc.stdout.close()
+
+    return SolverResult(
+        returncode=int(proc.returncode if proc.returncode is not None else -1),
+        output=bytes(captured[:max_output_bytes]).decode("utf-8", errors="replace"),
+        timed_out=timed_out,
+        output_exceeded=exceeded.is_set(),
+    )
+
+
 def run_submitted_executable(
     cmd: list[str],
     *,
@@ -1007,7 +1113,10 @@ def run_submitted_executable(
                 f"bytes of stdout"
             )
         return subprocess.CompletedProcess(
-            args=cmd, returncode=proc.returncode, stdout=bytes(captured), stderr=b"",
+            args=cmd,
+            returncode=proc.returncode,
+            stdout=bytes(captured),
+            stderr=b"",
         )
 
     # Streaming: pump lines to sys.stderr (never the score-parsed sys.stdout),
@@ -1031,7 +1140,10 @@ def run_submitted_executable(
         sys.stderr.flush()
     proc.wait()
     return subprocess.CompletedProcess(
-        args=cmd, returncode=proc.returncode, stdout=b"", stderr=b"",
+        args=cmd,
+        returncode=proc.returncode,
+        stdout=b"",
+        stderr=b"",
     )
 
 
@@ -1048,7 +1160,7 @@ def run_submitted_executable(
 # manifest returns over the msgpack wire, so a multi-hundred-MiB read is not
 # bounded by the policy protocol's 1 GiB per-frame limit. Every logical guard
 # runs here, before any dataset is materialized.
-_H5_READER_WRAPPER = '''
+_H5_READER_WRAPPER = """
 def load_reader():
     import os
     import h5py
@@ -1092,7 +1204,7 @@ def load_reader():
                 return {"ok": False, "reason": "%s: %s" % (type(exc).__name__, exc)}
 
     return _Reader()
-'''
+"""
 
 
 def _np_load_regular_nofollow(path: str) -> np.ndarray:
@@ -1239,7 +1351,7 @@ def load_submission_h5_or_fault(
 # copy (no external links / virtual datasets), and the uid-1000 worker cannot
 # reach ``/mcp_server``, so a truth-pointing submission fails the read instead
 # of baking truth into the clean copy.
-_H5AD_SANITIZE_WRAPPER = '''
+_H5AD_SANITIZE_WRAPPER = """
 def load_reader():
     src_path = __file__
 
@@ -1256,7 +1368,7 @@ def load_reader():
                 return {"ok": False, "reason": "%s: %s" % (type(exc).__name__, exc)}
 
     return _Sanitizer()
-'''
+"""
 
 
 def load_submission_h5ad_or_fault(
@@ -1445,6 +1557,8 @@ __all__ = [
     "run_model_module",
     "run_policy",
     "run_submitted_executable",
+    "run_trusted_solver",
+    "SolverResult",
     "transcript_contains",
     "world_integrity",
 ]

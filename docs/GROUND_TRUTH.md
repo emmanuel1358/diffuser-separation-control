@@ -7,11 +7,10 @@ for agents.
 
 ## Oracle proof by task type
 
-All tasks commit `.alignerr/build_proof.json`. The **oracle proof** is the
-`ground_truth_result` block written by `--runtime ground-truth`. It is **not**
-the same as **agent proof** (`harness_result`), which records an optional local
-agent run and is populated by `--runtime claude-code`, `--runtime deepagents`, or
-trusted CI.
+Trusted CI generates the authoritative `.alignerr/build_proof.json` from the
+immutable PR revision. A local `--runtime ground-truth` run produces ignored
+development evidence for feedback. The **oracle proof** is its
+`ground_truth_result`; it is distinct from **agent proof** (`harness_result`).
 
 | | Rubric tasks (`multi_deterministic_rubrics`) | ML / continuous tasks (`continuous_scoring_function`) |
 | --- | --- | --- |
@@ -20,7 +19,7 @@ trusted CI.
 | **What proof means** | Reference is a perfect oracle under deterministic rubrics | Reference is a **calibrated anchor**: competent, not optimal; agents should beat it toward 1.0 |
 | **Reviewer video** | Required for `mujoco`; optional for other types if `[ground_truth].render_outputs` is declared | Usually none unless you explicitly declare render outputs |
 | **Static artifacts in `solution/`** | Common (MJCF, control JSON, policies) | Common (CSV, weights); `solve.sh` may copy a checked-in artifact rather than retrain |
-| **What ground-truth verifies** | Solve → grade → (render) → commit proof | Same pipeline: proves Dockerfile, grader, loaders, and **calibration** are correct |
+| **What ground-truth verifies** | Solve → grade → (render) → CI proof | Same pipeline: proves Dockerfile, grader, loaders, and **calibration** are correct |
 
 For ML tasks, oracle proof does **not** mean “we retrained the model in CI.” It
 means `solution/solve.sh` runs in the task environment, the grader accepts the
@@ -150,12 +149,12 @@ writes `.alignerr/reference_run/latest/manifest.json` and (by default) caches
 solve outputs under `.alignerr/reference_cache/output`. On **container** tasks,
 the first `reference` run may still rebuild the task image and refresh
 `image_digest` / `task_dir_sha256` in `build_proof.json` (without adding oracle
-or agent scores). Use `--runtime ground-truth` when you need a committable
-oracle proof.
+or agent scores). Use `--runtime ground-truth` when you want a local oracle
+preflight; trusted CI generates the submitted proof.
 
-### Before PR: ground-truth proof
+### Optional before PR: ground-truth preflight
 
-Run the ground-truth gate before opening a PR:
+Run ground truth before opening a PR when you want local feedback:
 
 ```bash
 uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime ground-truth
@@ -175,23 +174,17 @@ This command:
 6. records `ground_truth_result` in `.alignerr/build_proof.json` (score,
    subscores, and review artifact metadata when renders are expected).
 
-Commit the proof for every task:
-
-```bash
-git add problems/<task_id>/.alignerr/build_proof.json
-```
-
-For tasks with reviewer videos (typically `mujoco`), also commit:
+Do not commit generated lock/proof files. Trusted CI reruns or restores the
+digest-keyed evidence and passes that exact artifact to the Taiga submission
+job. For tasks with reviewer videos (typically `mujoco`), commit the reviewed
+media:
 
 ```bash
 git add problems/<task_id>/.alignerr/ground_truth/
 ```
 
-ML tasks usually commit only `build_proof.json` unless you explicitly declare
-render outputs.
-
 The template validation workflow checks that each committed video exists and
-matches the checksum recorded in `build_proof.json`.
+matches the checksum in trusted CI's generated proof.
 
 ### What goes in `build_proof.json`
 

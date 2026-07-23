@@ -12,7 +12,8 @@ OUTPUT = Path("/tmp/output")
 
 def main() -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    # TODO: write a trivial (untrained) submission to OUTPUT / "submission.csv".
+    # TODO: write a weak but input-dependent predictor.py. Constants belong in
+    # the generated no-information audit family and should receive zero.
     raise NotImplementedError("fill in the naive baseline")
 
 

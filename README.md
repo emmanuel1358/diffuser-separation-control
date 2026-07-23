@@ -14,14 +14,18 @@ You do not need mothership repo access to use this repo. The normal workflow is:
    opens and shows it in the Tasks table. (Path + field are a contract with
    Labelbox; leave the file in place.)
 4. Create your own task in `problems/<task_id>/`.
-5. Implement `scorer/compute_score.py`.
-6. Run the ground-truth verifier before creating a PR.
-7. Commit `problems/<task_id>/.alignerr/build_proof.json` and any generated
-   `problems/<task_id>/.alignerr/ground_truth/` reviewer artifacts.
-8. Open a GitHub PR in **your assigned fork** (not this template repo).
+5. Implement the task grader: metadata-mode ML uses `test_file.py`; native
+   verticals use `scorer/compute_score.py`.
+6. For continuous ML, commit reproducible reference/naive models and compose
+   hand-authored evaluation logic with `grading.evaluation.ContinuousTask`.
+7. Optionally run the ground-truth verifier for local feedback.
+8. Commit reproducible task/model source and reviewed
+   `.alignerr/ground_truth/` artifacts. Generated lock/proof files remain local;
+   trusted CI regenerates or restores the authoritative production evidence.
+9. Open a GitHub PR in **your assigned fork** (not this template repo).
    Labelbox relays the PR to trusted-side CI, which runs the agent harness,
    rubric QA, and Auto QA and posts a `trusted-ci/grade` check back on your PR.
-9. Read feedback on your PR, fix the same task, and push updates. Your reviewer
+10. Read feedback on your PR, fix the same task, and push updates. Your reviewer
    merges the PR once the check passes; submission happens after acceptance.
 
 ## What This Repo Contains
@@ -30,7 +34,7 @@ You do not need mothership repo access to use this repo. The normal workflow is:
 lbx-rl-tasks-template/
 ├── pyproject.toml
 ├── grader/
-│   ├── src/grading/           # Grade, deterministic RubricBuilder, helpers
+│   ├── src/grading/           # Grade, RubricTask, helpers, fault types
 │   ├── src/grader_runner/     # run-grader console script
 │   └── tests/                 # shared grader tests
 ├── alignerr_plugin/
@@ -48,11 +52,13 @@ lbx-rl-tasks-template/
 ├── docs/
 │   ├── AUTHORING.md           # task creation walkthrough
 │   ├── GRADING.md             # compute_score and grader package guide
+│   ├── TASK_MIGRATION.md      # migrate older tasks to sealed evaluation stack
 │   ├── GROUND_TRUTH.md        # oracle solution and reviewer video requirements
 │   ├── HIDDEN_ENV.md          # simulation/interaction tasks via the hidden-env RPC server
-│   ├── MLENVS_TASKS.md        # authoring ML_Envs-style (dataset/model/exec/hdf5/kfold) tasks
+│   ├── MLENVS_TASKS.md        # metadata-mode continuous ML authoring/calibration
 │   ├── REWARD_HACKING.md      # reward-hacking mitigations every scorer must respect
 │   ├── NUMERICAL_SOLVERS.md   # installed solver inventory + invocation guide
+│   ├── RUBRIC_EVALUATION.md   # mandatory declarative RubricTask protocol
 │   └── RUBRIC_GUIDANCE.md     # rubric design principles and examples
 └── project_guidelines/
     ├── cfd/cfd_environments.md
@@ -60,8 +66,8 @@ lbx-rl-tasks-template/
     └── strctural_engineering/STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md
 ```
 
-The `grader/` package is installed into task Docker images so your
-task-local `scorer/compute_score.py` can import `grading`. The `harness/`
+The `grader/` package is installed into task Docker images so task-local
+`test_file.py` or `scorer/compute_score.py` can import `grading`. The `harness/`
 package lets you run a local Boreal-like LLM attempt before opening a PR.
 Template PR validation only requires the deterministic ground-truth proof in
 `problems/<task_id>/.alignerr/build_proof.json` plus any renderer artifacts
@@ -89,23 +95,26 @@ uv run lbx-rl-harness --help
 
 You should normally run commands through `uv run ...` from the repo root.
 
-For task submission, run the deterministic ground-truth verifier:
+For optional local pre-submission feedback, run the deterministic ground-truth
+verifier:
 
 ```bash
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
 ```
 
 While developing the reference solution (especially ML training), use the
-lighter reference loop — it does not refresh build proof:
+lighter reference loop:
 
 ```bash
 uv run lbx-rl-harness reference --problem-dir problems/<task_id>
 uv run lbx-rl-harness reference --problem-dir problems/<task_id> --skip-solve
 ```
 
-That command records `ground_truth_result` in
-`problems/<task_id>/.alignerr/build_proof.json`. For MuJoCo tasks it also writes
-reviewer render artifacts under `.alignerr/ground_truth/`.
+Generated locks/proofs under `problems/**` are ignored development state.
+Trusted CI checks out the immutable PR revision, generates or restores the
+authoritative evidence, and passes it to the Taiga submission job. MuJoCo
+reviewer render artifacts under `.alignerr/ground_truth/` remain reviewable
+source artifacts.
 
 Optional local modes are available when you want earlier feedback before
 spending CI/model budget:
@@ -252,13 +261,17 @@ For `cfd` and `structures`, Prometheus delivery does not change the task type or
 the numerical-solver quality gates. Trusted CI still runs the normal CFD or
 structures validation, grader QA, oracle validation, local agent score gates,
 and Auto QA; only the final delivery job changes from Taiga submission to the
-Prometheus Agent Service runner. Numerical-solver Prometheus submissions also
-require the Prometheus target average score to be present and `<= 0.5`, with
-target reward standard deviation `>= 0.1` across the required attempts, and a
-passing trajectory trainability auditor score. The full `submit-prometheus`
-workflow must pass before an eval row is accepted or a non-eval row moves into
-review. Submitting a non-passing non-eval row for review violates fair practices
-and may remove the tasker from the project.
+Prometheus Agent Service runner. For Prometheus CFD/structures, `trusted-ci/grade` waits on Submit Prometheus.
+The only score gate is the Prometheus target average `<= 0.5`. Standard
+deviation and the trainability audit are diagnostic context, not approval
+gates. Eval rows are accepted once trusted CI is green; Boreal QA is
+non-blocking coaching context for eval. Non-eval rows also need Boreal
+required QA complete with no unresolved critical findings before Labelbox
+review (warnings/info are fine; Boreal average is not a blocker). Self-iterate
+on clear criticals for non-eval; submit for coaching when stuck, or for
+acceptance when gates pass, and name which Boreal surface is latest.
+Submitting a non-passing non-eval row for review violates fair practices and
+may remove the tasker from the project.
 
 ## Requesting GPUs
 
@@ -378,57 +391,46 @@ The arguments are:
   today.
 - `private`: the hidden grader data directory, copied from `scorer/data/`.
 
-`compute_score()` may return one of three deterministic shapes:
+Continuous/legacy `compute_score()` may return one of three deterministic shapes:
 
 - A `float` in `[0, 1]` for a single continuous score.
 - A `dict` with at least `score`, plus optional `subscores`, `weights`,
   and `metadata`.
-- `RubricBuilder.grade().to_dict()` for weighted deterministic criteria
-  and penalties.
+- A canonical `Grade`.
 
-For continuous reward functions, follow the ML_Envs calibration pattern in
-[`docs/GRADING.md`](docs/GRADING.md#continuous-reward-functions-from-ml_envs):
-anchor naive baselines near `0`, the reference solution near `0.5`, and
-perfect performance at `1`. Use a score dict when you want the calibrated
-headline reward plus diagnostic metric progress values.
+For continuous reward functions, follow
+[`docs/CONTINUOUS_EVALUATION.md`](docs/CONTINUOUS_EVALUATION.md). New tasks use
+queryable post-commit challenges; `ContinuousTask` owns registered metrics,
+reviewed floors, information certificates, generated calibration, and the PWL
+quality mapping.
 
-Most new tasks should use `RubricBuilder` because it gives reviewers,
-Boreal, and Harbor per-criterion detail:
+Every `multi_deterministic_rubrics` task must declare `TASK = RubricTask(...)`.
+The shared runner invokes it directly; rubric authors do not define
+`compute_score()` or hand-write artifact/error/aggregation plumbing:
 
 ```python
-from pathlib import Path
-from grading import RubricBuilder, helpers
+from grading.evaluation import JsonArtifact, RubricCriterion, RubricTask
 
-def compute_score(workspace: Path, trajectory, private: Path):
-    rb = RubricBuilder(workspace=workspace, trajectory=trajectory, private=private)
+def evaluate(context):
+    return {"answer_present": bool(context.candidate)}
 
-    @rb.criterion(
-        id="answer_present",
-        weight=1.0,
-        description="answer.txt exists and is non-empty",
-    )
-    def _():
-        return helpers.file_exists(workspace / "answer.txt", non_empty=True)
-
-    @rb.penalty(
-        id="forbidden_file",
-        value=-0.5,
-        description="Agent wrote a forbidden file",
-    )
-    def _():
-        return (workspace / "forbidden.txt").exists()
-
-    return rb.grade().to_dict()
+TASK = RubricTask(
+    artifact=JsonArtifact("answer.json"),
+    criteria=(RubricCriterion("answer_present", required=True),),
+    evaluate=evaluate,
+)
 ```
 
 Read [`docs/GRADING.md`](docs/GRADING.md) for the full grading contract,
 helper API, return shapes, Harbor outputs, and common patterns. Read
+[`docs/RUBRIC_EVALUATION.md`](docs/RUBRIC_EVALUATION.md) for artifact schemas,
+numeric/solver APIs, fault attribution, plans, and migration. Read
 [`docs/RUBRIC_GUIDANCE.md`](docs/RUBRIC_GUIDANCE.md) before writing
-`RubricBuilder` criteria so the rubric stays task-specific, measurable, and
+criteria so the rubric stays task-specific, measurable, and
 not overly prescriptive.
 
 Important: rubric criteria must be deterministic Python checks. Do not use
-LLMs as judges in `compute_score.py`; model calls make rewards non-reproducible
+LLMs as judges in rubric evaluation; model calls make rewards non-reproducible
 and are not allowed for submitted task rubrics.
 
 ## Using The Example Tasks
@@ -441,7 +443,8 @@ demonstrates:
 - A Dockerfile that installs the shared `grader/` package and copies the
   task scorer into `/mcp_server/grader/`.
 - Public `data/` versus private `scorer/data/`.
-- A deterministic MuJoCo `compute_score.py` with ten criteria.
+- A deterministic `RubricTask` registration with ten criteria and no
+  author-owned score/error plumbing.
 - Optional solution and baseline scripts.
 
 `examples/mle-tabular-classification/` is the canonical continuous
@@ -451,32 +454,35 @@ ML_Envs-style reference. It demonstrates:
   `ML_Envs/examples/dataset-example-task_taiga`.
 - Public parquet files in `data/` and hidden ground truth in
   `scorer/data/`.
-- A `compute_score.py` that computes raw ML metrics, anchor-normalizes
-  them, and applies the original exponential score curve.
-- No rubrics and no `RubricBuilder`; the score is a continuous function
-  of `/tmp/output/submission.csv`.
+- A queryable `predictor.py`, private challenge bank, `ContinuousTask.model()`,
+  and framework-generated `calibration.lock.json`.
+- No rubrics / no `RubricTask`; the score is a continuous function
+  of certified hidden-challenge quality.
 
 Use examples as patterns, but create your actual work under `problems/`,
 not under `examples/`.
 
-## Validate Before Opening A PR
+## Optional Local Validation
 
-Run the ground-truth verifier before opening or updating a PR:
+Run the ground-truth verifier when you want pre-PR feedback:
 
 ```bash
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
 ```
 
-The successful ground-truth run creates or overwrites:
+For v3 continuous ML, it validates reference/naive models, measures raw
+metrics, generates and replays the PWL calibration, and atomically updates
+ignored development state:
 
 ```text
-problems/<task_id>/.alignerr/build_proof.json
+problems/<task_id>/calibration.lock.json
+problems/<task_id>/.alignerr/calibration.evidence.json
 ```
 
-Commit that `build_proof.json` file and any generated
-`.alignerr/ground_truth/` artifacts with your task. PR validation rejects
-submitted tasks when the ground-truth proof is missing, stale, not scored at
-the `reward_type` target, or missing required reviewer render artifacts.
+Commit trained models/manifests, task source, and required reviewer artifacts;
+do not commit generated calibration files. Trusted CI computes a semantic cache
+key, restores or regenerates the authoritative bundle from the immutable PR
+revision, and promotes that exact lock to Taiga as a read-only mount.
 
 Optional local modes are available while iterating:
 
@@ -662,8 +668,13 @@ API secrets.
 
 ## More Reading
 
+- [`docs/TASK_MIGRATION.md`](docs/TASK_MIGRATION.md): authoritative guide for
+  migrating older tasks onto sealed continuous calibration, `RubricTask`, and
+  sealed `evaluation.plan.json`.
 - [`docs/AUTHORING.md`](docs/AUTHORING.md): task creation walkthrough.
 - [`docs/GRADING.md`](docs/GRADING.md): detailed grader package guide.
+- [`docs/RUBRIC_EVALUATION.md`](docs/RUBRIC_EVALUATION.md): mandatory
+  declarative rubric API, hardening, plans, fault semantics, and migration.
 - [`docs/MLENVS_TASKS.md`](docs/MLENVS_TASKS.md): authoring ML_Envs-style tasks
   (dataset/CSV, model module, executable, HDF5, k-fold) -- submission loaders,
   calibration, licensing, mounts, and base flavors.

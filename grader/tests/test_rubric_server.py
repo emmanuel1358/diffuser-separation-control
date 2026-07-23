@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import hashlib
+import json
 import os
 import tempfile
 import textwrap
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +31,119 @@ from rubric import server
 def _reward(grade: server.Grade) -> float:
     """The quantity the platform records: sum(subscore * weight)."""
     return sum(grade.subscores[k] * grade.weights.get(k, 0.0) for k in grade.subscores)
+
+
+def test_promoted_calibration_digest_is_verified(monkeypatch, tmp_path) -> None:
+    lock = tmp_path / "calibration.lock.json"
+    plan_sha = "b" * 64
+    lock.write_text(
+        json.dumps(
+            {
+                "schema_version": "3.0",
+                "evaluation_plan_sha256": plan_sha,
+            }
+        )
+        + "\n"
+    )
+    digest = hashlib.sha256(lock.read_bytes()).hexdigest()
+    monkeypatch.setattr(server, "Path", lambda _raw: lock)
+
+    evidence = {
+        "calibration": {
+            "lock_sha256": digest,
+            "evaluation_plan_sha256": plan_sha,
+        }
+    }
+    server._verify_calibration(evidence)
+
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        server._verify_calibration(
+            {
+                "calibration": {
+                    "lock_sha256": "0" * 64,
+                    "evaluation_plan_sha256": plan_sha,
+                }
+            }
+        )
+
+    (tmp_path / ".author-source").write_text("fallback\n")
+    with pytest.raises(RuntimeError, match="trusted-CI promoted mount"):
+        server._verify_calibration(
+            {
+                "calibration": {
+                    "lock_sha256": digest,
+                    "evaluation_plan_sha256": plan_sha,
+                    "requires_trusted_mount": True,
+                }
+            }
+        )
+    server._verify_calibration(
+        {
+            "calibration": {
+                "lock_sha256": digest,
+                "evaluation_plan_sha256": plan_sha,
+                "requires_trusted_mount": False,
+            }
+        }
+    )
+
+
+def test_continuous_evaluation_rejects_missing_evidence_and_stale_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LBX_EVALUATION_PLAN_ATTESTED", "1")
+    fields = {"continuous_evaluation": {"required": True}}
+
+    with pytest.raises(RuntimeError, match="requires trusted calibration"):
+        server._verify_continuous_evaluation(fields)
+
+    assert "LBX_EVALUATION_PLAN_ATTESTED" not in os.environ
+
+
+def test_continuous_evaluation_attests_only_current_verified_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "_verify_calibration", lambda _fields: True)
+    monkeypatch.setattr(server, "_verify_evaluation_plan", lambda _fields: False)
+
+    assert server._verify_continuous_evaluation(
+        {
+            "continuous_evaluation": {
+                "required": True,
+                "attestation_required": True,
+            }
+        }
+    )
+    assert os.environ["LBX_EVALUATION_PLAN_ATTESTED"] == "1"
+
+
+def test_rubric_evaluation_uses_same_plan_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "_verify_calibration", lambda _fields: False)
+    monkeypatch.setattr(server, "_verify_evaluation_plan", lambda _fields: True)
+
+    assert server._verify_continuous_evaluation(
+        {
+            "rubric_evaluation": {
+                "required": True,
+                "attestation_required": True,
+            }
+        }
+    )
+    assert os.environ["LBX_EVALUATION_PLAN_ATTESTED"] == "1"
+
+
+def test_local_verified_evaluation_remains_unattested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "_verify_calibration", lambda _fields: True)
+    monkeypatch.setattr(server, "_verify_evaluation_plan", lambda _fields: False)
+
+    assert server._verify_continuous_evaluation(
+        {"continuous_evaluation": {"required": True}}
+    )
+    assert "LBX_EVALUATION_PLAN_ATTESTED" not in os.environ
 
 
 # ── Cluster A: headline preservation ─────────────────────────────
@@ -106,8 +222,7 @@ def test_capped_headline_reaches_reward_end_to_end() -> None:
     A dict return's ``score`` is the headline verbatim (GRADING.md); the
     weighted subscore sum (0.85 here) must NOT override the capped 0.28.
     """
-    test_file = textwrap.dedent(
-        """
+    test_file = textwrap.dedent("""
         def compute_score():
             return {
                 "score": 0.28,
@@ -115,8 +230,7 @@ def test_capped_headline_reaches_reward_end_to_end() -> None:
                 "weights": {"a": 0.5, "b": 0.5},
                 "metadata": {},
             }
-        """
-    )
+        """)
     grade = server._evaluate(test_file)
     assert _reward(grade) == pytest.approx(0.28)
     assert grade.metadata["headline_score"] == pytest.approx(0.28)
@@ -126,9 +240,7 @@ def test_evaluate_ignores_model_writable_cwd_import_shadow(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A planted stdlib shadow cannot forge the rubric runner payload."""
-    (tmp_path / "json.py").write_text(
-        textwrap.dedent(
-            """
+    (tmp_path / "json.py").write_text(textwrap.dedent("""
             class JSONDecodeError(Exception):
                 pass
 
@@ -143,20 +255,14 @@ def test_evaluate_ignores_model_writable_cwd_import_shadow(
 
             def loads(*args, **kwargs):
                 return {"score": 1.0, "metadata": {"forged": True}}
-            """
-        )
-    )
+            """))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
 
-    grade = server._evaluate(
-        textwrap.dedent(
-            """
+    grade = server._evaluate(textwrap.dedent("""
             def compute_score():
                 return {"score": 0.0, "metadata": {"honest": True}}
-            """
-        )
-    )
+            """))
 
     assert _reward(grade) == pytest.approx(0.0)
     assert grade.metadata.get("honest") is True
@@ -311,14 +417,12 @@ def test_agent_subprocess_kwargs_rejects_root_numeric_identity(
 # ── Cluster E: transcript wiring ─────────────────────────────────
 
 
-_TRANSCRIPT_GRADER = textwrap.dedent(
-    """
+_TRANSCRIPT_GRADER = textwrap.dedent("""
     def compute_score():
         cheated = "READ_GRADER_PRIVATE" in TRANSCRIPT
         return {"score": 0.0 if cheated else 1.0,
                 "metadata": {"transcript_len": len(TRANSCRIPT)}}
-    """
-)
+    """)
 
 
 def test_grader_sees_honest_transcript() -> None:
@@ -354,8 +458,7 @@ def test_transcript_temp_file_is_cleaned_up() -> None:
 
 def test_evaluate_ignores_forged_stdout_result(capsys: pytest.CaptureFixture) -> None:
     grade = server._evaluate(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             import subprocess
             import sys
 
@@ -371,8 +474,7 @@ def test_evaluate_ignores_forged_stdout_result(capsys: pytest.CaptureFixture) ->
                     "print('RUBRIC_SCORE=1.0', flush=True)",
                 ])
                 return {"score": 0.0}
-            """
-        ),
+            """),
         timeout_s=2.0,
     )
     captured = capsys.readouterr()
@@ -388,17 +490,13 @@ def test_evaluate_ignores_forged_stdout_result(capsys: pytest.CaptureFixture) ->
 
 
 def test_evaluate_hides_result_path_from_test_file_environment() -> None:
-    grade = server._evaluate(
-        textwrap.dedent(
-            """
+    grade = server._evaluate(textwrap.dedent("""
             import os
 
 
             def compute_score():
                 return {"score": 0.0 if "RUBRIC_RESULT_PATH" in os.environ else 1.0}
-            """
-        )
-    )
+            """))
 
     assert grade.subscores == {"score": 1.0}
     assert grade.metadata["headline_score"] == pytest.approx(1.0)
@@ -407,8 +505,7 @@ def test_evaluate_hides_result_path_from_test_file_environment() -> None:
 def test_evaluate_times_out_lingering_stdout_child() -> None:
     start = time.monotonic()
     grade = server._evaluate(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             import subprocess
             import sys
 
@@ -416,8 +513,7 @@ def test_evaluate_times_out_lingering_stdout_child() -> None:
             def compute_score():
                 subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
                 return {"score": 1.0}
-            """
-        ),
+            """),
         timeout_s=0.2,
     )
 
@@ -435,16 +531,14 @@ def test_grade_problem_uses_extra_field_timeout() -> None:
             transcript="",
             extra_fields={
                 "grading_timeout_seconds": 0.2,
-                "test_file": textwrap.dedent(
-                    """
+                "test_file": textwrap.dedent("""
                     import time
 
 
                     def compute_score():
                         time.sleep(30)
                         return {"score": 1.0}
-                    """
-                ),
+                    """),
             },
         )
     )
@@ -457,15 +551,13 @@ def test_grade_problem_uses_extra_field_timeout() -> None:
 
 def test_agent_fault_scores_zero_without_env_internal_failure() -> None:
     grade = server._evaluate(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             from grading import AgentFault
 
 
             def compute_score():
                 raise AgentFault("missing submission")
-            """
-        ),
+            """),
         timeout_s=2.0,
     )
 
@@ -474,23 +566,128 @@ def test_agent_fault_scores_zero_without_env_internal_failure() -> None:
     assert grade.metadata["agent_fault"] == "missing submission"
 
 
+def test_boreal_runner_invokes_declarative_task_directly() -> None:
+    grade = server._evaluate(
+        textwrap.dedent("""
+            from grading.evaluation import RubricCriterion, RubricTask
+
+            class Artifact:
+                path = "none"
+                def load(self, workspace):
+                    return {"ok": True}
+                def spec_dict(self):
+                    return {"type": "test-artifact.v1"}
+
+            def evaluate(context):
+                return {"ok": context.candidate["ok"]}
+
+            TASK = RubricTask(
+                artifact=Artifact(),
+                criteria=(RubricCriterion("ok"),),
+                evaluate=evaluate,
+            )
+            """),
+        timeout_s=2.0,
+    )
+
+    assert grade.subscores == {"ok": 1.0}
+    assert grade.env_internal_failure is None
+    assert grade.metadata["evaluation"]["protocol"] == "declarative-rubric.v1"
+
+
+def test_untyped_candidate_evaluation_crash_is_kept_zero_with_alert() -> None:
+    grade = server._evaluate(
+        textwrap.dedent("""
+            def compute_score():
+                raise OverflowError("int too large to convert to float")
+            """),
+        timeout_s=2.0,
+    )
+
+    assert grade.subscores == {"score": 0.0}
+    assert grade.env_internal_failure is False
+    assert grade.metadata["critical_operator_alert"] is True
+    assert "OverflowError" in grade.metadata["error"]
+
+
+def test_untyped_noninfra_process_exit_is_kept_zero_with_alert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server, "_RUNNER", "import sys\nsys.stdin.read()\nsys.exit(1)\n"
+    )
+
+    grade = server._evaluate("def compute_score(): return 1.0", timeout_s=2.0)
+
+    assert grade.subscores == {"score": 0.0}
+    assert grade.env_internal_failure is False
+    assert grade.metadata["critical_operator_alert"] is True
+    assert grade.metadata["failure_classification"] == "unclassified_non_infra_exit"
+
+
+def test_signal_process_exit_remains_env_internal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "_RUNNER",
+        "import os, signal, sys\nsys.stdin.read()\nos.kill(os.getpid(), signal.SIGKILL)\n",
+    )
+
+    grade = server._evaluate("def compute_score(): return 1.0", timeout_s=2.0)
+
+    assert grade.subscores == {"score": 0.0}
+    assert grade.env_internal_failure is True
+
+
+def test_attested_agent_fault_keeps_zero_and_records_replay_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    stale_trace = output / ".lbx-evaluation"
+    stale_trace.mkdir()
+    stale_trace.joinpath("evaluation-details.json").write_text('{"stale": true}\n')
+    monkeypatch.setattr(server, "OUTPUT_DIR", output)
+    monkeypatch.setenv("LBX_EVALUATION_PLAN_ATTESTED", "1")
+
+    grade = server._evaluate(
+        textwrap.dedent("""
+            from grading import AgentFault
+
+
+            def compute_score():
+                raise AgentFault("missing submission")
+            """),
+        timeout_s=2.0,
+        trace_required=True,
+    )
+
+    trace = json.loads(
+        (output / ".lbx-evaluation" / "evaluation-details.json").read_text()
+    )
+    assert grade.subscores == {"score": 0.0}
+    assert grade.env_internal_failure is False
+    assert trace["protocol"] == "agent-fault.v1"
+    assert len(trace["replay"]["nonce"]) == 32
+
+
 def test_non_finite_score_is_env_internal_failure() -> None:
     grade = server._evaluate(
-        textwrap.dedent(
-            """
+        textwrap.dedent("""
             import math
 
 
             def compute_score():
                 return math.nan
-            """
-        ),
+            """),
         timeout_s=2.0,
     )
 
     assert grade.subscores == {"score": 0.0}
     assert grade.env_internal_failure is True
-    assert "normalize" in grade.metadata["error"] or "failed" in grade.metadata["error"]
+    assert "non-finite" in grade.metadata["error"]
 
 
 def test_evaluate_fails_closed_when_result_file_is_missing(
@@ -511,18 +708,77 @@ def test_evaluate_fails_closed_when_result_file_is_missing(
 
 def test_result_temp_file_is_cleaned_up() -> None:
     before = set(glob.glob(os.path.join(tempfile.gettempdir(), "lbx-rubric-result-*")))
-    grade = server._evaluate(
-        textwrap.dedent(
-            """
+    grade = server._evaluate(textwrap.dedent("""
             def compute_score():
                 return {"score": 1.0}
-            """
-        )
-    )
+            """))
     after = set(glob.glob(os.path.join(tempfile.gettempdir(), "lbx-rubric-result-*")))
 
     assert grade.subscores == {"score": 1.0}
     assert after == before
+
+
+def test_attested_evaluate_persists_private_trace_in_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    stale_trace = output / ".lbx-evaluation"
+    stale_trace.mkdir()
+    stale_trace.joinpath("evaluation-details.json").write_text('{"stale": true}\n')
+    monkeypatch.setattr(server, "OUTPUT_DIR", output)
+    monkeypatch.setenv("LBX_EVALUATION_PLAN_ATTESTED", "1")
+    monkeypatch.setenv("TEST_STALE_TRACE_PATH", str(stale_trace))
+
+    grade = server._evaluate(
+        textwrap.dedent("""
+            import json
+            import os
+
+
+            def compute_score():
+                assert not os.path.exists(os.environ["TEST_STALE_TRACE_PATH"])
+                path = os.environ["LBX_EVALUATION_TRACE_PATH"]
+                payload = {
+                    "nonce": os.environ["LBX_EVALUATION_NONCE"],
+                    "private": True,
+                }
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                fd = os.open(path, flags, 0o600)
+                with os.fdopen(fd, "w") as handle:
+                    json.dump(payload, handle)
+                return {"score": 0.75}
+            """),
+        trace_required=True,
+    )
+
+    trace_path = output / ".lbx-evaluation" / "evaluation-details.json"
+    trace = json.loads(trace_path.read_text())
+    assert grade.subscores == {"score": 0.75}
+    assert trace["private"] is True
+    assert len(trace["nonce"]) == 32
+    assert trace_path.stat().st_mode & 0o777 == 0o600
+    assert trace["nonce"] not in json.dumps(grade.metadata)
+
+
+def test_attested_evaluate_fails_when_required_trace_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    monkeypatch.setattr(server, "OUTPUT_DIR", output)
+    monkeypatch.setenv("LBX_EVALUATION_PLAN_ATTESTED", "1")
+
+    grade = server._evaluate(
+        "def compute_score():\n    return 1.0\n",
+        trace_required=True,
+    )
+
+    assert grade.subscores == {"score": 0.0}
+    assert grade.env_internal_failure is True
+    assert "private replay trace" in grade.metadata["error"]
 
 
 def test_runner_prepends_grading_deps_before_grader_import() -> None:

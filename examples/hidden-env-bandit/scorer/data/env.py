@@ -6,8 +6,9 @@ The agent reaches a ``make_env()`` instance over ``/tmp/env.sock`` via the publi
 are the hidden dynamics it must infer by pulling arms.
 
 ``_env_public_methods`` pins the socket-reachable surface to exploration only;
-``best_arm`` / ``mean`` are grader-only (the in-process scorer calls them
-directly, never over the socket), so the agent cannot just ask for the answer.
+``best_arm`` / ``mean`` are grader-only. The agent sees one training instance;
+the sealed scorer creates fresh post-commit instances and evaluates the
+submitted learning algorithm across them.
 """
 
 from __future__ import annotations
@@ -23,8 +24,8 @@ class BanditEnv:
     _env_public_methods = frozenset({"reset", "pull", "n_arms"})
 
     def __init__(self, seed: int = 0, noise: float = 0.25) -> None:
-        # Hidden per-arm means in [0, 1]; fixed by seed so the grader's env (same
-        # seed) shares them with the instance the agent explored over the socket.
+        # Hidden per-arm means in [0, 1]. The training server uses its configured
+        # seed; grading supplies secret per-attempt challenge seeds.
         self._means = np.random.default_rng(seed).uniform(0.0, 1.0, size=N_ARMS)
         self._noise = float(noise)
         self._pull_rng = np.random.default_rng(seed + 1)

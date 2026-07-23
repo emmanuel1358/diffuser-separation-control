@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from lbx_rl_tasks_harness.message_text import message_text as _message_text
@@ -104,7 +103,7 @@ def _quality_prompt(problem: HarnessProblem, grade_payload: dict[str, Any]) -> s
 
     return f"""You are reviewing rubric criteria quality for one task.
 
-Your job: given the TASK PROMPT/INSTRUCTIONS, the SCORER RUBRIC CRITERIA implemented in compute_score.py, and the STANDARD RUBRIC GUIDANCE, decide whether the rubric criteria adhere to the guidance.
+Your job: given the TASK PROMPT/INSTRUCTIONS, the declarative RubricTask criteria implemented in compute_score.py, and the STANDARD RUBRIC GUIDANCE, decide whether the rubric criteria adhere to the guidance.
 
 Focus on the rubric criteria themselves. Do not grade the agent submission, reference solution, or latest score. Use the latest harness grade only as context for what criteria exist and how they are weighted.
 
@@ -132,7 +131,7 @@ TASK PROMPT / INSTRUCTIONS:
 TASK TOML:
 {task_toml}
 
-SCORER RUBRIC CRITERIA / compute_score.py:
+DECLARATIVE RUBRIC TASK / compute_score.py:
 {scorer}
 
 LATEST HARNESS GRADE PAYLOAD (context only; do not grade the agent submission):

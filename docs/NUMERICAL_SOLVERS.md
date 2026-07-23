@@ -7,10 +7,12 @@ contract with zero harness changes. See
 [`../numerical_solver_dataset_proposal.md`](../numerical_solver_dataset_proposal.md)
 for the domain rationale.
 
-The contract is unchanged: `compute_score(workspace, trajectory, private)`,
-artifacts to `/tmp/output`, and enum-backed task metadata in `task.toml`.
-Most solver tasks use `reward_type = "multi_deterministic_rubrics"` with an
-oracle score of `1.0` and naive baseline near `0.0`.
+The contract is unchanged for continuous scorers:
+`compute_score(workspace, trajectory, private)`, artifacts to `/tmp/output`,
+and enum-backed task metadata in `task.toml`. Most solver tasks use
+`reward_type = "multi_deterministic_rubrics"` with a declarative
+`RubricTask` (see [`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md)), an oracle
+score of `1.0`, and a naive baseline near `0.0`.
 
 For `cfd` and `structures` tasks, `instruction.md` must be
 **solver-agnostic**. The grader may still own private cases and hidden operating

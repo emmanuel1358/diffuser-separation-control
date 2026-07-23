@@ -152,6 +152,76 @@ def test_runner_accepts_rubric_builder_return(
     assert details["structured_subscores"][0]["id"] == "ok"
 
 
+def test_runner_invokes_declarative_rubric_task_without_compute_score(
+    workspace: Path,
+    output_dir: Path,
+    tmp_path: Path,
+) -> None:
+    grader_dir = tmp_path / "declarative_rubric"
+    grader_dir.mkdir()
+    (workspace / "design.json").write_text('{"value": 0.7}')
+    (grader_dir / "compute_score.py").write_text(
+        "from grading.evaluation import JsonArtifact, NumericField, "
+        "RubricCriterion, RubricTask\n\n"
+        "def evaluate(context):\n"
+        "    return {'quality': context.candidate['value']}\n\n"
+        "TASK = RubricTask(\n"
+        "    artifact=JsonArtifact('design.json', "
+        "numeric_fields=(NumericField('value'),)),\n"
+        "    criteria=(RubricCriterion('quality'),),\n"
+        "    evaluate=evaluate,\n"
+        ")\n"
+    )
+
+    exit_code = _invoke_runner(workspace, grader_dir, output_dir)
+
+    assert exit_code == 0
+    details = json.loads((output_dir / "reward-details.json").read_text())
+    assert details["score"] == pytest.approx(0.7)
+    assert details["metadata"]["return_shape"] == "rubric_grade"
+    assert details["metadata"]["evaluation"]["protocol"] == "declarative-rubric.v1"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xff\xfe{}",
+        b"[" * 60_000 + b"]" * 60_000,
+        b'{"value":' + str(10**400).encode() + b"}",
+    ],
+)
+def test_runner_keeps_malformed_declarative_json_as_zero(
+    workspace: Path,
+    output_dir: Path,
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    grader_dir = tmp_path / "declarative_json"
+    grader_dir.mkdir()
+    (workspace / "design.json").write_bytes(payload)
+    (grader_dir / "compute_score.py").write_text(
+        "from grading.evaluation import JsonArtifact, NumericField, "
+        "RubricCriterion, RubricTask\n\n"
+        "def evaluate(context):\n"
+        "    return {'quality': context.candidate['value']}\n\n"
+        "TASK = RubricTask(\n"
+        "    artifact=JsonArtifact('design.json', "
+        "numeric_fields=(NumericField('value'),)),\n"
+        "    criteria=(RubricCriterion('quality'),),\n"
+        "    evaluate=evaluate,\n"
+        ")\n"
+    )
+
+    exit_code = _invoke_runner(workspace, grader_dir, output_dir)
+
+    assert exit_code == 0
+    details = json.loads((output_dir / "reward-details.json").read_text())
+    assert details["score"] == 0.0
+    assert details["env_internal_failure"] is False
+    assert details["metadata"]["return_shape"] == "rubric_grade"
+    assert details["metadata"]["agent_fault"]
+
+
 # ── Failure modes ──
 
 
@@ -180,11 +250,14 @@ def test_runner_handles_grader_runtime_error(
         "    raise RuntimeError('grader is broken')\n"
     )
     exit_code = _invoke_runner(workspace, grader_dir, output_dir)
-    assert exit_code == 1
+    assert exit_code == 0
 
     details = json.loads((output_dir / "reward-details.json").read_text())
-    assert (
-        details["metadata"]["grading_errors"][0]["error_type"] == "grader_runtime_error"
+    assert details["score"] == 0.0
+    assert details["env_internal_failure"] is False
+    assert details["metadata"]["critical_operator_alert"] is True
+    assert details["metadata"]["grading_errors"][0]["error_type"] == (
+        "unclassified_grader_crash"
     )
 
 
@@ -425,7 +498,9 @@ def test_runner_ignores_success_payload_on_signal_exit(
 # --- grading_dependencies: grader-only, root-only pip deps -----------------
 
 
-def test_prepend_grading_deps_makes_module_importable(tmp_path: Path, monkeypatch) -> None:
+def test_prepend_grading_deps_makes_module_importable(
+    tmp_path: Path, monkeypatch
+) -> None:
     """(a) A grader-only dep living ONLY in /mcp_server/grading_deps is importable
     by the (root) grader worker after _prepend_grading_deps -- so a dataset grader
     can use a scoring/reference library the agent never sees."""
@@ -465,7 +540,9 @@ def test_prepend_grading_deps_noop_when_absent(tmp_path: Path, monkeypatch) -> N
     assert sys.path == before
 
 
-def test_submission_worker_env_does_not_inherit_grading_deps(tmp_path: Path, monkeypatch) -> None:
+def test_submission_worker_env_does_not_inherit_grading_deps(
+    tmp_path: Path, monkeypatch
+) -> None:
     """(b) grading_deps reaches the grader via an in-process sys.path.insert, which
     a fresh-exec'd uid-1000 submission worker never inherits: its env scrubs
     PYTHONPATH and sets PYTHONSAFEPATH, so the worker cannot import grading_deps.

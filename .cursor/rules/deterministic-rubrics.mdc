@@ -6,9 +6,21 @@ alwaysApply: false
 
 # Deterministic Rubrics
 
+- Declare `TASK = RubricTask(...)`; do not define an author-owned
+  `compute_score()` for `multi_deterministic_rubrics`.
+- Use `JsonArtifact`, `TextArtifact`, or `RegularFileArtifact`. Do not open,
+  decode, parse, or deserialize `/tmp/output` directly.
+- Use `RubricContext` numeric, policy, candidate/trusted operation, and solver
+  APIs. Do not hand-roll exception handling, denominator policies, subprocess
+  timeouts, weight normalization, or failure payloads.
+- Commit the sealed `scorer/evaluation.plan.json` written by harness
+  `reference` / `ground-truth` (or `scripts/write_evaluation_plan.py`) via
+  `refresh_evaluation_plan`. Never hand-edit. `lbx-rl-template validate` only
+  checks it; Trusted CI reseals with an explicit refresh step before validate.
 - Submitted task rubrics must be deterministic. Same output files, hidden fixtures, seeds, and simulator settings must produce the same score.
-- Do not use `rb.llm_criterion(...)`, `LLMJudge`, provider SDKs, or external model APIs in `compute_score.py`.
+- Do not use deprecated `RubricBuilder`, `rb.llm_criterion(...)`, `LLMJudge`,
+  provider SDKs, or external model APIs in submitted scorers.
 - For subjective requirements, replace the wording with code-checkable properties: file parses, numeric tolerance, fixed rollout result, hidden fixture match, or structural model inspection.
 - Keep `[verifier].env` free of model-provider keys. Local harness keys belong in `.env.local`, not task verifier config.
 - For MuJoCo tasks, pin timestep, integrator, initial `qpos` / `qvel`, controls, perturbations, and RNG seeds before scoring.
-- Before opening or updating a PR, run `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` and commit the generated `problems/<task_id>/.alignerr/build_proof.json`. While iterating, use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>`.
+- Before opening or updating a PR, run `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` and commit the generated `problems/<task_id>/.alignerr/build_proof.json` plus any refreshed `scorer/evaluation.plan.json`. While iterating, use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>`.

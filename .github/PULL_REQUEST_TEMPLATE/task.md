@@ -49,8 +49,8 @@ executed through the approved sandbox helpers.
 
 ## Local Validation
 
-- [ ] I ran `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>`.
-- [ ] I committed `problems/<task_id>/.alignerr/build_proof.json`.
+- [ ] I optionally ran `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` for local feedback.
+- [ ] I did not commit generated calibration locks/proofs; trusted CI will generate the authoritative evidence.
 - [ ] Ground truth scores `1.000`.
 - [ ] Trivial/no-op score is within `[ground_truth].max_trivial_score`.
 - [ ] I set `[difficulty].task_type` to the correct supported task type.

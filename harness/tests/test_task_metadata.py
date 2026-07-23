@@ -14,7 +14,6 @@ from alignerr_plugin.task_metadata import (
 )
 from alignerr_plugin.utils import load_task_toml
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -204,6 +203,13 @@ def _load_compute_score(template: str):
         spec.loader.exec_module(module)
     finally:
         sys.path.remove(str(scorer))
+    task = getattr(module, "TASK", None)
+    if task is not None:
+        return lambda workspace, trajectory, private: task.grade(
+            workspace=workspace,
+            trajectory=trajectory,
+            private=private,
+        ).to_dict()
     return module.compute_score
 
 
@@ -266,14 +272,14 @@ def test_numerical_solver_prometheus_starters_keep_task_type() -> None:
     cfd = load_task_toml(templates / "prometheus-cfd")
     structures = load_task_toml(templates / "prometheus-structures")
 
-    assert 'eval = false' in (templates / "prometheus-cfd" / "task.toml").read_text()
+    assert "eval = false" in (templates / "prometheus-cfd" / "task.toml").read_text()
     assert cfd.delivery.platform == "prometheus"
     assert cfd.delivery.eval is False
     assert cfd.agent.user == "agent"
     assert cfd.verifier.user == "root"
     assert cfd.difficulty.task_type == "cfd"
     assert (
-        'eval = false'
+        "eval = false"
         in (templates / "prometheus-structures" / "task.toml").read_text()
     )
     assert structures.delivery.platform == "prometheus"
@@ -291,12 +297,14 @@ def test_prometheus_eval_starters_mark_eval_delivery() -> None:
     cfd = load_task_toml(templates / "prometheus-eval-cfd")
     structures = load_task_toml(templates / "prometheus-eval-structures")
 
-    assert 'eval = true' in (templates / "prometheus-eval-cfd" / "task.toml").read_text()
+    assert (
+        "eval = true" in (templates / "prometheus-eval-cfd" / "task.toml").read_text()
+    )
     assert cfd.delivery.platform == "prometheus"
     assert cfd.delivery.eval is True
     assert cfd.difficulty.task_type == "cfd"
     assert (
-        'eval = true'
+        "eval = true"
         in (templates / "prometheus-eval-structures" / "task.toml").read_text()
     )
     assert structures.delivery.platform == "prometheus"

@@ -1,0 +1,26 @@
+{
+  "decision_ids": [
+    "control_present"
+  ],
+  "evidence": {
+    "aggregation": "weighted",
+    "artifact": {
+      "allow_extra_keys": true,
+      "max_bytes": 67108864,
+      "max_depth": 64,
+      "max_nodes": 100000,
+      "numeric_fields": [],
+      "path": "control.json",
+      "require_object": true,
+      "required_keys": [],
+      "type": "json-artifact.v1"
+    },
+    "type": "declarative-rubric.v1"
+  },
+  "metric_ids": [],
+  "plan_sha256": "27d67d0cfee03329326608bd29926a518b491753585746e628aebd59ff3b8bf4",
+  "protocol": "declarative-rubric.v1",
+  "schema_version": "evaluation-plan.v2",
+  "security_tier": "sealed_rescore",
+  "task_spec_sha256": "5a3f033565d5c2f4ae636c52c9ffb859ad79c17ad3d3bc3153077f9e9e18323d"
+}

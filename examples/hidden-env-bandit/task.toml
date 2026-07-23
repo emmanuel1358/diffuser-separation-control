@@ -2,7 +2,7 @@ schema_version = "1.1"
 
 [task]
 name = "labelbox/hidden-env-bandit"
-description = "Infer the best arm of a hidden multi-armed bandit by interacting with it over the env socket, then submit a policy."
+description = "Develop a bandit exploration policy, then evaluate it on fresh hidden post-commit challenges."
 
 [environment]
 required_resources = "2vcpu+6gib"
@@ -32,4 +32,4 @@ license_source = "fully synthetic bandit env generated in-repo; no external data
 [[outputs]]
 path = "/tmp/output/policy.py"
 required = true
-description = "Python module defining load_policy() -> object with choose() -> int (the best arm)"
+description = "Python module defining an adaptive reset/choose/observe/recommend policy"

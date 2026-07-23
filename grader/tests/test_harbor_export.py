@@ -134,12 +134,11 @@ def test_export_mlenvs_task(tmp_path: Path) -> None:
     assert (out / "prompt.md").exists()
     assert (out / "test_file.py").exists()
     assert (out / "environment" / "test_file.py").exists()
+    assert (out / "environment" / "calibration.lock.json").exists()
     assert (out / "environment" / "data" / "public").exists()
     assert (out / "environment" / "data" / "private").exists()
     # The requirements file the Dockerfile COPYs must ship in the build context.
-    assert (
-        out / "environment" / "base" / "requirements-mlenvs-common.txt"
-    ).exists()
+    assert (out / "environment" / "base" / "requirements-mlenvs-common.txt").exists()
 
     dockerfile = (out / "environment" / "Dockerfile").read_text()
     assert "base/requirements-mlenvs-common.txt" in dockerfile
@@ -148,6 +147,14 @@ def test_export_mlenvs_task(tmp_path: Path) -> None:
     # Hardening parity.
     assert "chmod 0700 /mcp_server" in dockerfile
     assert "COPY --chown=root:root data/private/ /mcp_server/data/" in dockerfile
+    assert (
+        "COPY --chown=root:root calibration.lock.json "
+        "/mcp_server/calibration/calibration.lock.json" in dockerfile
+    )
+    assert (
+        "author-image-fallback\\n' > "
+        "/mcp_server/calibration/.author-source" in dockerfile
+    )
     assert "/mcp_server/grader/compute_score.py" in dockerfile
     # env activation baked so the env server can start.
     assert 'hidden_env = "env"' in dockerfile
@@ -253,7 +260,9 @@ def test_export_prometheus_numerical_solver_appends_solver_hint(
     tmp_path: Path,
 ) -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    templates = repo_root / "alignerr_plugin" / "src" / "alignerr_plugin" / "starter_templates"
+    templates = (
+        repo_root / "alignerr_plugin" / "src" / "alignerr_plugin" / "starter_templates"
+    )
 
     for template_name, heading, is_eval in (
         ("prometheus-cfd", "## OpenFOAM Availability", False),

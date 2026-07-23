@@ -6,7 +6,17 @@ set -euo pipefail
 cat > /tmp/output/policy.py <<'PY'
 def load_policy():
     class Policy:
+        def reset(self, n_arms, budget):
+            self.n_arms = int(n_arms)
+
         def choose(self):
             return 0
+
+        def observe(self, arm, reward):
+            pass
+
+        def recommend(self):
+            return 0
+
     return Policy()
 PY

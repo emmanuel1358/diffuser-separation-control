@@ -48,5 +48,13 @@ class TaskCreator:
 
         problem_dir = output_dir / task_id
         shutil.copytree(template_dir, problem_dir, dirs_exist_ok=True)
+        try:
+            from grading.evaluation.plan import refresh_evaluation_plan
+
+            sync = refresh_evaluation_plan(problem_dir)
+            if sync.wrote:
+                console.print(f"[green]Generated:[/green] {sync.path.name}")
+        except Exception:
+            pass
         console.print(f"[green]Created task scaffold:[/green] {problem_dir}")
         return problem_dir
