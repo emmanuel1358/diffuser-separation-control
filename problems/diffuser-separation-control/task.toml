@@ -5,3 +5,8 @@ entrypoint = "python3 verifier.py"
 [[outputs]]
 path = "/tmp/output/diffuser_design.json"
 required = true
+
+[environment]
+required_resources = "4vcpu+16gib"
+storage_mb = 10000
+allow_internet = false
