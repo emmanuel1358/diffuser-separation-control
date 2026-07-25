@@ -1,0 +1,7 @@
+[verifier]
+timeout_sec = 60
+entrypoint = "python3 verifier.py"
+
+[[outputs]]
+path = "/tmp/output/diffuser_design.json"
+required = true

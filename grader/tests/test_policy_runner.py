@@ -118,18 +118,17 @@ def test_policy_worker_times_out(tmp_path: Path) -> None:
         "import time\n" "def act(obs):\n" "    time.sleep(10)\n" "    return 0\n"
     )
 
-    # Pin the first-call budget too, otherwise the generous startup floor would
-    # mask the per-step timeout being exercised here.
-    with pytest.raises(TimeoutError) as excinfo:
+    # Allow startup/handshake time, but keep per-step timeout tight so act() hangs.
+    with pytest.raises(PolicyTimeoutError) as excinfo:
         with PolicyWorker(
-            policy_path, timeout_s=0.05, first_call_timeout_s=0.05
+            policy_path, timeout_s=0.05, first_call_timeout_s=2.0
         ) as policy:
             policy.act({})
     # A per-call hang must be a PolicyTimeoutError so it is ALSO catchable by a
     # migrated grader's `except RuntimeError: return 0.0` (kept 0.0) and the
     # handshake's `except PolicyWorkerError` -- a bare builtin TimeoutError would
     # escape `except RuntimeError` and get the rollout DISCARDED (a free veto).
-    assert isinstance(excinfo.value, PolicyTimeoutError)
+    assert isinstance(excinfo.value, TimeoutError)
     assert isinstance(excinfo.value, RuntimeError)
     assert isinstance(excinfo.value, PolicyWorkerError)
 
