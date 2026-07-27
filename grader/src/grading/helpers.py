@@ -6,15 +6,15 @@ Legacy ``RubricBuilder`` criteria also consume these helpers.
 
 from __future__ import annotations
 
+import bz2
 import contextlib
-import fcntl
+import gzip
 import io
 import json
 import os
 import re
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -28,8 +28,15 @@ from typing import Any
 import numpy as np
 
 from grading.faults import AgentFault, GraderFault
+from grading.secure_io import (
+    open_regular_file,
+    persistent_regular_file_snapshot,
+    read_regular_bytes,
+    regular_file_snapshot,
+)
 
 _DEFAULT_MAX_SUBMISSION_BYTES = 64 * 1024 * 1024
+_DEFAULT_MAX_CSV_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 # stdout cap for a captured agent executable: a flood past this is killed and
 # raised as an AgentFault (kept 0.0), so the child cannot OOM the grader.
 _DEFAULT_MAX_EXECUTABLE_OUTPUT_BYTES = 16 * 1024 * 1024
@@ -37,9 +44,12 @@ _DEFAULT_MAX_EXECUTABLE_OUTPUT_BYTES = 16 * 1024 * 1024
 # compressed bytes, so a small archive can expand to many GiB on member access.
 # Generous enough for honest submissions, tight enough to bound a bomb well under
 # grader OOM.
-_DEFAULT_MAX_NPZ_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+_DEFAULT_MAX_NPZ_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 _DEFAULT_MAX_HDF5_BYTES = 2 * 1024 * 1024 * 1024
-# Execution timeout for the privilege-dropped HDF5/h5ad reader worker. Bounds a
+_DEFAULT_MAX_HDF5_DATASETS = 256
+_DEFAULT_MAX_HDF5_DATASET_BYTES = 256 * 1024 * 1024
+_DEFAULT_MAX_HDF5_LOGICAL_BYTES = 512 * 1024 * 1024
+# Execution timeout for the privilege-dropped HDF5 reader worker. Bounds a
 # crafted file that tries to hang or OOM the grader during the libhdf5 parse;
 # the read itself is one RPC call, so this is the per-parse budget.
 _H5_READ_TIMEOUT_S = 120.0
@@ -60,16 +70,20 @@ class SolverResult:
 
 
 def file_exists(path: str | Path, *, non_empty: bool = False) -> bool:
-    """True iff ``path`` exists. Pass ``non_empty=True`` to also require content."""
-    p = Path(path)
-    if not p.exists() or not p.is_file():
+    """True iff ``path`` is a symlink-free regular file."""
+
+    try:
+        if not non_empty:
+            with open_regular_file(path, max_bytes=None, allow_empty=True):
+                return True
+        data = read_regular_bytes(
+            path,
+            max_bytes=_DEFAULT_MAX_SUBMISSION_BYTES,
+            allow_empty=True,
+        )
+    except OSError:
         return False
-    if non_empty:
-        try:
-            return bool(p.read_bytes().strip())
-        except OSError:
-            return False
-    return True
+    return bool(data.strip())
 
 
 def file_contains(
@@ -79,12 +93,14 @@ def file_contains(
     case_sensitive: bool = True,
     encoding: str = "utf-8",
 ) -> bool:
-    """True iff the file at ``path`` contains ``needle``."""
-    p = Path(path)
-    if not p.exists() or not p.is_file():
-        return False
+    """True iff one descriptor-pinned regular file contains ``needle``."""
+
     try:
-        text = p.read_text(encoding=encoding, errors="replace")
+        text = read_regular_bytes(
+            path,
+            max_bytes=_DEFAULT_MAX_SUBMISSION_BYTES,
+            allow_empty=True,
+        ).decode(encoding=encoding, errors="replace")
     except OSError:
         return False
     if case_sensitive:
@@ -277,14 +293,104 @@ def transcript_contains(
 
 
 def load_json(path: str | Path) -> Any:
-    """Load a JSON file, returning ``None`` on missing/invalid."""
-    p = Path(path)
-    if not p.exists() or not p.is_file():
-        return None
+    """Load descriptor-pinned JSON, returning ``None`` on missing/invalid."""
+
     try:
-        return json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
+        raw = read_regular_bytes(
+            path,
+            max_bytes=_DEFAULT_MAX_SUBMISSION_BYTES,
+            allow_empty=True,
+        )
+        return json.loads(raw.decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
+
+
+@contextlib.contextmanager
+def open_submission_file_or_fault(
+    path: os.PathLike | str,
+    *,
+    max_bytes: int = _DEFAULT_MAX_SUBMISSION_BYTES,
+    allow_empty: bool = False,
+):
+    """Yield immutable bytes from a component-safe submission-file snapshot."""
+
+    try:
+        raw = read_regular_bytes(
+            path,
+            max_bytes=max_bytes,
+            allow_empty=allow_empty,
+        )
+    except OSError as exc:
+        raise AgentFault(
+            f"submission at {path} could not be read as a stable regular file: {exc}"
+        ) from exc
+    with io.BytesIO(raw) as handle:
+        yield handle
+
+
+def _read_capped_stream(handle: Any, *, max_bytes: int, label: str) -> bytes:
+    raw = handle.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise AgentFault(f"{label} expands beyond the {max_bytes}-byte limit")
+    return raw
+
+
+def _csv_compression_method(
+    path: os.PathLike | str,
+    kwargs: dict[str, Any],
+) -> str | None:
+    compression = kwargs.get("compression", "infer")
+    if isinstance(compression, dict):
+        if set(compression) != {"method"}:
+            raise ValueError(
+                "compressed CSV options support only {'method': ...}; "
+                "decompress the submission before grading for custom options"
+            )
+        compression = compression["method"]
+    if compression in (None, False):
+        return None
+    if compression == "infer":
+        suffix = Path(path).suffix.lower()
+        if suffix in {".lzma", ".xz", ".zip", ".zst", ".zstd"}:
+            raise ValueError(
+                f"{suffix} CSV compression is unsupported; use gzip, bz2, "
+                "or an uncompressed CSV"
+            )
+        return {
+            ".bz2": "bz2",
+            ".gz": "gzip",
+        }.get(suffix)
+    method = str(compression).lower()
+    if method not in {"bz2", "gzip"}:
+        raise ValueError(
+            f"unsupported compressed CSV method {compression!r}; "
+            "supported methods are gzip and bz2"
+        )
+    return method
+
+
+def _read_bounded_compressed_csv(
+    snapshot: Path,
+    *,
+    method: str,
+    max_uncompressed_bytes: int,
+) -> bytes:
+    if method == "gzip":
+        with gzip.open(snapshot, "rb") as handle:
+            return _read_capped_stream(
+                handle,
+                max_bytes=max_uncompressed_bytes,
+                label="gzip CSV submission",
+            )
+    if method == "bz2":
+        with bz2.open(snapshot, "rb") as handle:
+            return _read_capped_stream(
+                handle,
+                max_bytes=max_uncompressed_bytes,
+                label="bz2 CSV submission",
+            )
+    raise AssertionError(f"unexpected CSV compression method: {method}")
 
 
 def load_submission_or_fault(
@@ -295,6 +401,7 @@ def load_submission_or_fault(
     numeric_columns: Iterable[str] | None = None,
     unique_key_column: str | None = None,
     max_bytes: int = _DEFAULT_MAX_SUBMISSION_BYTES,
+    max_uncompressed_bytes: int = _DEFAULT_MAX_CSV_UNCOMPRESSED_BYTES,
     read_csv_kwargs: dict[str, Any] | None = None,
     allow_extra_columns: bool = False,
 ):
@@ -306,32 +413,34 @@ def load_submission_or_fault(
     """
     import pandas as pd
 
-    p = Path(path)
+    if min(max_bytes, max_uncompressed_bytes) <= 0:
+        raise ValueError("CSV byte limits must be positive")
+    csv_kwargs = dict(read_csv_kwargs or {})
     try:
-        st = os.lstat(p)
+        with regular_file_snapshot(path, max_bytes=max_bytes) as snapshot:
+            compression = _csv_compression_method(path, csv_kwargs)
+            if compression is None:
+                df = pd.read_csv(snapshot, **csv_kwargs)
+            else:
+                raw = _read_bounded_compressed_csv(
+                    snapshot,
+                    method=compression,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                )
+                csv_kwargs["compression"] = None
+                csv_kwargs.pop("memory_map", None)
+                df = pd.read_csv(io.BytesIO(raw), **csv_kwargs)
     except FileNotFoundError as exc:
-        raise AgentFault(f"submission not found at {p}") from exc
+        raise AgentFault(f"submission not found at {path}") from exc
     except OSError as exc:
-        raise AgentFault(f"submission at {p} could not be stat'd: {exc}") from exc
-
-    if not stat.S_ISREG(st.st_mode):
         raise AgentFault(
-            f"submission at {p} is not a regular file "
-            f"(mode={stat.filemode(st.st_mode)}); expected a plain CSV file"
-        )
-    if st.st_size == 0:
-        raise AgentFault(f"submission at {p} is empty")
-    if st.st_size > max_bytes:
-        raise AgentFault(
-            f"submission at {p} is {st.st_size} bytes, over the "
-            f"{max_bytes}-byte limit"
-        )
-
-    try:
-        df = pd.read_csv(p, **(read_csv_kwargs or {}))
+            f"submission at {path} is not a regular file or changed while "
+            f"being read as CSV: {exc}"
+        ) from exc
     except Exception as exc:
         raise AgentFault(
-            f"submission at {p} is not a readable CSV: {type(exc).__name__}: {exc}"
+            f"submission at {path} is not a readable CSV: "
+            f"{type(exc).__name__}: {exc}"
         ) from exc
 
     required = list(required_columns) if required_columns is not None else None
@@ -420,60 +529,36 @@ def load_submission_npz_or_fault(
     """Read an agent ``.npz`` / ``.npy`` submission as the (root) grader, raising
     ``AgentFault`` for bad outputs. Numpy analog of :func:`load_submission_or_fault`.
 
-    Opens with ``O_NOFOLLOW`` so a symlink to the held-out truth cannot be
-    followed (a raw ``np.load`` would read it back as "predictions"), rejects
-    FIFO/dir/device/oversized files, and defaults ``allow_pickle=False`` so a
-    crafted array cannot execute ``__reduce__`` in the root grader. Returns an
-    ``ndarray`` for a ``.npy`` submission, or a plain ``dict`` ``{name: ndarray}``
-    for a ``.npz`` -- whose members are materialized eagerly here (inside the
-    AgentFault wrapper), so an object-array member is a kept-0.0 fault rather than
-    a bare ``ValueError`` at ``data[name]`` access time (which the runtime would
-    discard as env_internal_failure -- a void-veto).
+    Rejects symlinks in every path component, FIFO/dir/device/oversized files,
+    and defaults ``allow_pickle=False`` so a crafted array cannot execute
+    ``__reduce__`` in the root grader. Returns an ``ndarray`` for a ``.npy``
+    submission, or a plain ``dict`` ``{name: ndarray}`` for a ``.npz`` -- whose
+    members are materialized eagerly here (inside the AgentFault wrapper), so an
+    object-array member is a kept-0.0 fault rather than a bare ``ValueError`` at
+    ``data[name]`` access time (which the runtime would discard as
+    env_internal_failure -- a void-veto).
     """
     p = Path(path)
-    # O_NOFOLLOW: a symlink fails to open, never followed into /mcp_server.
-    # O_NONBLOCK: a writerless FIFO opens immediately and is rejected below
-    # instead of blocking the grader forever (a hang is itself a free veto).
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if allow_pickle:
+        raise ValueError(
+            "allow_pickle=True is forbidden for agent submissions; "
+            "use load_submitted_model() for sandboxed pickle artifacts"
+        )
     try:
-        fd = os.open(p, flags)
+        raw = read_regular_bytes(p, max_bytes=max_bytes)
     except FileNotFoundError as exc:
         raise AgentFault(f"submission not found at {p}") from exc
     except OSError as exc:
-        # ELOOP (symlink) / ENXIO / etc. -> agent-controlled, kept 0.0.
         raise AgentFault(
-            f"submission at {p} could not be opened as a regular file "
-            f"(symlink/FIFO/permission?): {exc}"
+            f"submission at {p} could not be read as a stable regular file: {exc}"
         ) from exc
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise AgentFault(
-                f"submission at {p} is not a regular file "
-                f"(mode={stat.filemode(st.st_mode)}); expected a plain .npz/.npy"
-            )
-        if st.st_size == 0:
-            raise AgentFault(f"submission at {p} is empty")
-        if st.st_size > max_bytes:
-            raise AgentFault(
-                f"submission at {p} is {st.st_size} bytes, over the "
-                f"{max_bytes}-byte limit"
-            )
-        # Confirmed a regular file: drop O_NONBLOCK so the read behaves normally.
-        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
-        with os.fdopen(fd, "rb", closefd=True) as fh:
-            fd = -1  # fdopen owns the descriptor
-            raw = fh.read()
-    finally:
-        if fd >= 0:
-            os.close(fd)
 
     # Bound the UNCOMPRESSED expansion of a .npz before materializing members, so
     # a decompression bomb under the compressed cap cannot OOM the grader.
     _reject_npz_decompression_bomb(raw, p, max_uncompressed_bytes)
 
     try:
-        obj = np.load(io.BytesIO(raw), allow_pickle=allow_pickle)
+        obj = np.load(io.BytesIO(raw), allow_pickle=False)
     except AgentFault:
         raise
     except Exception as exc:
@@ -509,38 +594,26 @@ def require_regular_file(
     *,
     max_bytes: int = _DEFAULT_MAX_SUBMISSION_BYTES,
 ) -> Path:
-    """Verify an agent-submission path is a plain regular file within a size
-    bound (raising ``AgentFault`` otherwise) and return it, for hand-rolled reads
-    when no format-specific loader fits. Uses ``os.lstat`` so a symlink to the
-    held-out truth is rejected rather than read as root.
+    """Return an immutable snapshot of a bounded regular submission file.
 
-    NOTE: this is an ``lstat``-then-read guard, race-free ONLY while no uid>=1000
-    process runs concurrently with the subsequent read -- which holds for the
-    ordinary "read the submission once, after the agent is SIGKILLed pre-grade"
-    grader. If your grader runs agent code MID-grade (``run_submitted_executable``
-    / ``run_policy``) and a double-forked child could survive it, that child can
-    swap a regular file for a symlink between this check and your read; open the
-    fd yourself with ``os.open(path, os.O_RDONLY | os.O_NOFOLLOW)`` and read THAT
-    descriptor instead (``load_submission_npz_or_fault`` does this internally).
+    The snapshot is rooted in a grader-owned directory and retained until this
+    grader process exits, so a later pathname-based parser cannot be redirected
+    by replacing the original file or any parent directory.
     """
-    p = Path(path)
+
     try:
-        st = os.lstat(p)
+        return persistent_regular_file_snapshot(
+            path,
+            max_bytes=max_bytes,
+            allow_empty=True,
+        )
     except FileNotFoundError as exc:
-        raise AgentFault(f"submission not found at {p}") from exc
+        raise AgentFault(f"submission not found at {path}") from exc
     except OSError as exc:
-        raise AgentFault(f"submission at {p} could not be stat'd: {exc}") from exc
-    if not stat.S_ISREG(st.st_mode):
         raise AgentFault(
-            f"submission at {p} is not a regular file "
-            f"(mode={stat.filemode(st.st_mode)}); a symlink / FIFO / directory / "
-            f"device is not accepted"
-        )
-    if st.st_size > max_bytes:
-        raise AgentFault(
-            f"submission at {p} is {st.st_size} bytes, over the {max_bytes}-byte limit"
-        )
-    return p
+            f"submission at {path} could not be snapshotted as a stable "
+            f"regular file: {exc}"
+        ) from exc
 
 
 _POLICY_FILENAMES = ("policy.py", "submission.py", "agent.py")
@@ -553,13 +626,16 @@ def _resolve_policy_path(policy: str | Path) -> Path:
     in which a conventional policy file (``policy.py`` etc.) is located.
     """
     p = Path(policy)
-    if p.is_file():
-        return p
-    if p.is_dir():
-        for name in _POLICY_FILENAMES:
-            candidate = p / name
-            if candidate.is_file():
+    for candidate in (p, *(p / name for name in _POLICY_FILENAMES)):
+        try:
+            with open_regular_file(
+                candidate,
+                max_bytes=_DEFAULT_MAX_SUBMISSION_BYTES,
+                allow_empty=True,
+            ):
                 return candidate
+        except OSError:
+            continue
     raise FileNotFoundError(f"no submitted policy found at {policy}")
 
 
@@ -570,6 +646,7 @@ def run_policy(
     first_call_timeout_s: float | None = None,
     cwd: str | Path | None = None,
     unshare_ipc: bool = True,
+    submitted_snapshot: str | Path | None = None,
 ):
     """Return a hardened worker for a submitted policy — the single approved way to run agent code.
 
@@ -581,12 +658,16 @@ def run_policy(
     """
     from grading.policy_runner import PolicyWorker
 
+    resolved_policy = (
+        Path(policy) if submitted_snapshot is not None else _resolve_policy_path(policy)
+    )
     return PolicyWorker(
-        _resolve_policy_path(policy),
+        resolved_policy,
         timeout_s=timeout_s,
         first_call_timeout_s=first_call_timeout_s,
         cwd=Path(cwd) if cwd is not None else None,
         unshare_ipc=unshare_ipc,
+        submitted_snapshot=submitted_snapshot,
     )
 
 
@@ -691,10 +772,11 @@ _PICKLE_WRAPPER = (
 def load_policy():
     import os, sys, pickle
     model_path = __file__
+    origin_path = __submission_origin__
 """
     + _AGENT_USER_SITE_SNIPPET
     + """
-    data_dir = os.path.dirname(model_path) or "."
+    data_dir = os.path.dirname(origin_path) or "."
     if data_dir not in sys.path:
         sys.path.insert(0, data_dir)
     with open(model_path, "rb") as fh:
@@ -707,10 +789,11 @@ _JOBLIB_WRAPPER = (
 def load_policy():
     import os, sys, joblib
     model_path = __file__
+    origin_path = __submission_origin__
 """
     + _AGENT_USER_SITE_SNIPPET
     + """
-    data_dir = os.path.dirname(model_path) or "."
+    data_dir = os.path.dirname(origin_path) or "."
     if data_dir not in sys.path:
         sys.path.insert(0, data_dir)
     return joblib.load(model_path)
@@ -743,35 +826,36 @@ def load_submitted_model(
         raise ValueError(
             "deserializer must be one of %s; got %r" % (sorted(_WRAPPERS), deserializer)
         )
-    path = Path(path)
-    if not path.exists():
-        raise AgentFault("Missing submitted model at %s" % path)
-    # Source mode skips load_submitted_policy's lstat/size guard, so do it here:
-    # a non-regular or over-sized artifact is an agent fault (lstat won't follow
-    # symlinks).
-    st = os.lstat(path)
-    if not stat.S_ISREG(st.st_mode):
-        raise AgentFault(
-            "submitted model at %s is not a regular file (mode=%s); "
-            "expected a plain file" % (path, stat.filemode(st.st_mode))
+    original = Path(path)
+    try:
+        snapshot = regular_file_snapshot(
+            original,
+            max_bytes=max_bytes,
+            allow_empty=True,
         )
-    if st.st_size > max_bytes:
+        pinned = snapshot.__enter__()
+    except FileNotFoundError as exc:
+        raise AgentFault(f"Missing submitted model at {original}") from exc
+    except OSError as exc:
         raise AgentFault(
-            "submitted model at %s is %d bytes, over the %d-byte limit"
-            % (path, st.st_size, max_bytes)
-        )
+            f"submitted model at {original} is not a stable regular file: {exc}"
+        ) from exc
 
-    # source mode: `path` sets the worker's module.__file__ (read by the wrapper)
-    # and is NOT auto-added to sys.path; sys_path_dirs=[] keeps /tmp/output off
-    # the path until the wrapper inserts it, after the deserializer import.
-    return load_submitted_policy(
-        source=_WRAPPERS[deserializer],
-        factory_name="load_policy",
-        path=path,
-        sys_path_dirs=[],
-        timeout_s=_MODEL_LOAD_TIMEOUT_S,
-        first_call_timeout_s=_MODEL_LOAD_TIMEOUT_S,
-    )
+    try:
+        # Source mode: the immutable snapshot is module.__file__ for the wrapper.
+        # The submitted model is fully deserialized during the worker handshake,
+        # before the snapshot is removed.
+        return load_submitted_policy(
+            source=_WRAPPERS[deserializer],
+            factory_name="load_policy",
+            path=pinned,
+            source_origin_path=original,
+            sys_path_dirs=[],
+            timeout_s=_MODEL_LOAD_TIMEOUT_S,
+            first_call_timeout_s=_MODEL_LOAD_TIMEOUT_S,
+        )
+    finally:
+        snapshot.__exit__(None, None, None)
 
 
 def world_integrity(
@@ -1169,13 +1253,22 @@ def load_reader():
     src_path = __file__
 
     class _Reader:
-        def read(self, names, out_dir):
+        def read(self, names, out_dir, max_datasets, max_dataset_bytes, max_total_bytes):
             try:
                 written = []
                 with h5py.File(src_path, "r", locking=False) as f:
                     if names is None:
+                        if len(f) > max_datasets:
+                            return {"ok": False, "reason": "file declares %d top-level datasets, over limit %d" % (len(f), max_datasets)}
                         names = list(f.keys())
+                    if len(names) > max_datasets:
+                        return {"ok": False, "reason": "requested %d datasets, over limit %d" % (len(names), max_datasets)}
+                    if len(names) != len(set(names)):
+                        return {"ok": False, "reason": "requested dataset names must be unique"}
+                    total_bytes = 0
                     for idx, name in enumerate(names):
+                        if not isinstance(name, str):
+                            return {"ok": False, "reason": "dataset names must be strings"}
                         if "/" in name.strip("/"):
                             return {"ok": False, "reason": "dataset %r must be top-level (no nested groups)" % (name,)}
                         link = f.get(name, getlink=True)
@@ -1191,14 +1284,20 @@ def load_reader():
                         if obj.file.filename != f.filename:
                             return {"ok": False, "reason": "dataset %r resolves outside the submission file" % (name,)}
                         if obj.dtype.hasobject:
-                            return {"ok": False, "reason": "dataset %r has object/vlen dtype; use the .h5ad loader" % (name,)}
+                            return {"ok": False, "reason": "dataset %r has object/vlen dtype; only bounded primitive HDF5 datasets are supported" % (name,)}
+                        logical_bytes = int(obj.size) * int(obj.dtype.itemsize)
+                        if logical_bytes > max_dataset_bytes:
+                            return {"ok": False, "reason": "dataset %r expands to %d bytes, over per-dataset limit %d" % (name, logical_bytes, max_dataset_bytes)}
+                        total_bytes += logical_bytes
+                        if total_bytes > max_total_bytes:
+                            return {"ok": False, "reason": "requested datasets expand to %d bytes, over aggregate limit %d" % (total_bytes, max_total_bytes)}
                         fname = "%d.npy" % idx
                         # allow_pickle=False refuses any object array (already
                         # rejected above); the parent also loads with
                         # allow_pickle=False, so the transfer never executes a
                         # pickle.
                         np.save(os.path.join(out_dir, fname), np.asarray(obj[()]), allow_pickle=False)
-                        written.append({"name": name, "file": fname})
+                        written.append({"name": name, "file": fname, "bytes": logical_bytes})
                 return {"ok": True, "written": written}
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 return {"ok": False, "reason": "%s: %s" % (type(exc).__name__, exc)}
@@ -1207,47 +1306,39 @@ def load_reader():
 """
 
 
-def _np_load_regular_nofollow(path: str) -> np.ndarray:
-    """``np.load`` a worker-written ``.npy``, rejecting a symlink or FIFO at the leaf.
+def _np_load_regular_nofollow(
+    path: str,
+    *,
+    max_bytes: int = _DEFAULT_MAX_HDF5_DATASET_BYTES,
+) -> np.ndarray:
+    """Load worker-written ``.npy`` through a component-safe descriptor.
 
     The HDF5 reader runs in a uid-1000 worker and writes each dataset into the
     world-writable ``out_dir``; the ROOT parent then loads them back. A worker
     that achieves a libhdf5 memory-safety code-exec could plant
     ``os.symlink('/mcp_server/data/y_true.npy', out_dir + '/0.npy')`` and have
     root dereference it, loading the held-out truth as the prediction for a
-    perfect score. ``O_NOFOLLOW`` makes the open fail atomically on a symlink leaf
-    (``basename()`` already pins the path to ``out_dir``'s top level), so the
-    planted link is rejected instead of followed. ``O_NONBLOCK`` makes a planted
-    writerless FIFO open immediately and be rejected by the ``S_ISREG`` check
-    below instead of blocking the root loader forever (this readback runs in the
-    root parent with no timeout, so a hang would itself be a free veto). Mirrors
-    this file's own ``load_submission_npz_or_fault`` fd-open pattern.
+    perfect score. The component-safe open rejects symlinks in the leaf and all
+    parent directories. ``O_NONBLOCK`` makes a planted writerless FIFO open
+    immediately and be rejected instead of blocking the root loader forever.
     (``allow_pickle=False`` is orthogonal; it blocks pickle-RCE on the array,
     not symlink traversal.)
     """
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(path, flags)
-    except OSError as exc:
+        with regular_file_snapshot(
+            path,
+            max_bytes=max_bytes,
+        ) as snapshot:
+            with open_regular_file(
+                snapshot,
+                max_bytes=max_bytes,
+            ) as (handle, _info):
+                return np.load(handle, allow_pickle=False)
+    except Exception as exc:
         raise AgentFault(
-            f"HDF5 readback file {path} could not be opened as a regular file "
-            f"(symlink/FIFO?): {exc}"
+            f"HDF5 readback file {path} could not be snapshotted and parsed "
+            f"safely: {type(exc).__name__}: {exc}"
         ) from exc
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise AgentFault(
-                f"HDF5 readback file {path} is not a regular file "
-                f"(mode={stat.filemode(st.st_mode)})"
-            )
-        # Confirmed a regular file: drop O_NONBLOCK so the read behaves normally.
-        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
-        with os.fdopen(fd, "rb", closefd=True) as fh:
-            fd = -1  # fdopen owns the descriptor
-            return np.load(fh, allow_pickle=False)
-    finally:
-        if fd >= 0:
-            os.close(fd)
 
 
 def load_submission_h5_or_fault(
@@ -1255,6 +1346,9 @@ def load_submission_h5_or_fault(
     *,
     datasets: Iterable[str] | None = None,
     max_bytes: int = _DEFAULT_MAX_HDF5_BYTES,
+    max_datasets: int = _DEFAULT_MAX_HDF5_DATASETS,
+    max_dataset_bytes: int = _DEFAULT_MAX_HDF5_DATASET_BYTES,
+    max_total_bytes: int = _DEFAULT_MAX_HDF5_LOGICAL_BYTES,
 ) -> dict[str, np.ndarray]:
     """Safely read top-level datasets from a submitted HDF5 file.
 
@@ -1272,6 +1366,9 @@ def load_submission_h5_or_fault(
     """
     from grading.policy_runner import PolicyWorkerError, load_submitted_policy
 
+    if min(max_bytes, max_datasets, max_dataset_bytes, max_total_bytes) <= 0:
+        raise ValueError("all HDF5 size and dataset limits must be positive")
+
     # Imported (not used to parse) only to fail closed with an infra error when
     # the image lacks it; the real parse happens in the dropped worker below.
     try:
@@ -1283,22 +1380,21 @@ def load_submission_h5_or_fault(
 
     p = Path(path)
     try:
-        st = os.lstat(p)
-    except OSError as exc:
+        snapshot = regular_file_snapshot(p, max_bytes=max_bytes)
+        pinned = snapshot.__enter__()
+    except FileNotFoundError as exc:
         raise AgentFault(f"submitted HDF5 at {p} is missing: {exc}") from exc
-    if not stat.S_ISREG(st.st_mode):
-        raise AgentFault(f"submitted HDF5 at {p} is not a regular file")
-    if st.st_size > max_bytes:
+    except OSError as exc:
         raise AgentFault(
-            f"submitted HDF5 at {p} is {st.st_size} bytes, over the "
-            f"{max_bytes}-byte limit"
-        )
+            f"submitted HDF5 at {p} is not a stable regular file: {exc}"
+        ) from exc
 
     names = list(datasets) if datasets is not None else None
 
     # Must be writable by the dropped (uid-1000) worker when the grader is root.
-    out_dir = tempfile.mkdtemp(prefix="h5-submission-read-")
+    out_dir: str | None = None
     try:
+        out_dir = os.path.realpath(tempfile.mkdtemp(prefix="h5-submission-read-"))
         if os.geteuid() == 0:
             os.chmod(out_dir, 0o777)
 
@@ -1308,12 +1404,18 @@ def load_submission_h5_or_fault(
         reader = load_submitted_policy(
             source=_H5_READER_WRAPPER,
             factory_name="load_reader",
-            path=p,
+            path=pinned,
             sys_path_dirs=[],
             timeout_s=_H5_READ_TIMEOUT_S,
         )
         try:
-            result = reader.read(names, out_dir)
+            result = reader.read(
+                names,
+                out_dir,
+                max_datasets,
+                max_dataset_bytes,
+                max_total_bytes,
+            )
         except TimeoutError as exc:
             raise AgentFault(
                 f"submitted HDF5 at {p} timed out after {_H5_READ_TIMEOUT_S:.1f}s"
@@ -1331,44 +1433,48 @@ def load_submission_h5_or_fault(
             raise AgentFault(f"submitted HDF5 at {p} could not be read: {reason}")
 
         out: dict[str, np.ndarray] = {}
-        for entry in result.get("written") or []:
-            # basename() pins the file to out_dir's top level, and the loader
-            # opens it O_NOFOLLOW + fstat-S_ISREG so a worker-planted symlink to
-            # /mcp_server truth is rejected, not followed (allow_pickle=False
-            # inside also blocks a smuggled pickled object array).
-            npy = os.path.join(out_dir, os.path.basename(str(entry["file"])))
-            out[str(entry["name"])] = _np_load_regular_nofollow(npy)
+        written = result.get("written") or []
+        if len(written) > max_datasets:
+            raise AgentFault(
+                f"submitted HDF5 produced {len(written)} datasets, over limit "
+                f"{max_datasets}"
+            )
+        seen_names: set[str] = set()
+        seen_files: set[str] = set()
+        total_bytes = 0
+        for entry in written:
+            # basename() pins the file to out_dir's top level; the loader pins
+            # every directory component and the regular leaf before np.load.
+            # allow_pickle=False also blocks a smuggled object array.
+            name = str(entry["name"])
+            filename = os.path.basename(str(entry["file"]))
+            if name in seen_names or filename in seen_files:
+                raise AgentFault("submitted HDF5 produced duplicate dataset outputs")
+            seen_names.add(name)
+            seen_files.add(filename)
+            npy = os.path.join(out_dir, filename)
+            array = _np_load_regular_nofollow(
+                npy,
+                max_bytes=max_dataset_bytes + 1024 * 1024,
+            )
+            logical_bytes = int(array.nbytes)
+            if logical_bytes > max_dataset_bytes:
+                raise AgentFault(
+                    f"submitted HDF5 dataset {name!r} expands to {logical_bytes} "
+                    f"bytes, over per-dataset limit {max_dataset_bytes}"
+                )
+            total_bytes += logical_bytes
+            if total_bytes > max_total_bytes:
+                raise AgentFault(
+                    f"submitted HDF5 datasets expand to {total_bytes} bytes, "
+                    f"over aggregate limit {max_total_bytes}"
+                )
+            out[name] = array
         return out
     finally:
-        shutil.rmtree(out_dir, ignore_errors=True)
-
-
-# LITERAL source wrapper executed INSIDE the privilege-dropped policy worker
-# (source mode). Reading whole-object / categorical / sparse AnnData needs the
-# anndata library's structure handling rather than a dense-dataset read; doing
-# it in the dropped worker keeps the parse off the root grader process. The
-# in-worker ``read_h5ad`` + ``write_h5ad`` round-trip yields a self-contained
-# copy (no external links / virtual datasets), and the uid-1000 worker cannot
-# reach ``/mcp_server``, so a truth-pointing submission fails the read instead
-# of baking truth into the clean copy.
-_H5AD_SANITIZE_WRAPPER = """
-def load_reader():
-    src_path = __file__
-
-    class _Sanitizer:
-        def sanitize(self, out_path):
-            try:
-                import anndata
-            except ImportError as exc:
-                return {"ok": False, "infra": True, "reason": "anndata is not installed: %s" % (exc,)}
-            try:
-                anndata.read_h5ad(src_path).write_h5ad(out_path)
-                return {"ok": True}
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                return {"ok": False, "reason": "%s: %s" % (type(exc).__name__, exc)}
-
-    return _Sanitizer()
-"""
+        if out_dir is not None:
+            shutil.rmtree(out_dir, ignore_errors=True)
+        snapshot.__exit__(None, None, None)
 
 
 def load_submission_h5ad_or_fault(
@@ -1377,58 +1483,20 @@ def load_submission_h5ad_or_fault(
     out_path: str | Path,
     max_bytes: int = _DEFAULT_MAX_HDF5_BYTES,
 ) -> Path:
-    """Round-trip a submitted ``.h5ad`` through anndata IN the privilege-dropped
-    worker into a self-contained clean copy at ``out_path``.
+    """Reject whole-object H5AD handoff to the root grader.
 
-    Use this (not :func:`load_submission_h5_or_fault`) for categorical / sparse /
-    whole-object AnnData. Drops external links / virtual datasets, and the
-    unprivileged worker cannot reach ``/mcp_server``, so a truth-pointing
-    submission fails the read. Agent-controlled failures raise ``AgentFault``
-    (kept 0.0); a missing ``anndata`` or dead worker propagates as infra.
-    ``out_path`` must be writable by the (possibly dropped) worker. Returns it.
+    A dropped parser cannot safely "sanitize" a complex H5AD for a second,
+    root-side anndata parse: a compromised first parser could craft a new
+    exploit payload. Evaluate H5AD entirely inside a task-specific dropped
+    worker, or submit bounded primitive HDF5 datasets through
+    :func:`load_submission_h5_or_fault`.
     """
-    from grading.policy_runner import PolicyWorkerError, load_submitted_policy
 
-    p = Path(path)
-    out = Path(out_path)
-    try:
-        st = os.lstat(p)
-    except OSError as exc:
-        raise AgentFault(f"submitted .h5ad at {p} is missing: {exc}") from exc
-    if not stat.S_ISREG(st.st_mode):
-        raise AgentFault(f"submitted .h5ad at {p} is not a regular file")
-    if st.st_size > max_bytes:
-        raise AgentFault(
-            f"submitted .h5ad at {p} is {st.st_size} bytes, over the "
-            f"{max_bytes}-byte limit"
-        )
-
-    sanitizer = load_submitted_policy(
-        source=_H5AD_SANITIZE_WRAPPER,
-        factory_name="load_reader",
-        path=p,
-        sys_path_dirs=[],
-        timeout_s=_H5_READ_TIMEOUT_S,
+    del path, out_path, max_bytes
+    raise RuntimeError(
+        "whole-object H5AD loading is disabled: evaluate it entirely inside a "
+        "privilege-dropped worker or use bounded primitive HDF5 datasets"
     )
-    try:
-        result = sanitizer.sanitize(str(out))
-    except TimeoutError as exc:
-        raise AgentFault(
-            f"submitted .h5ad at {p} timed out after {_H5_READ_TIMEOUT_S:.1f}s"
-        ) from exc
-    except PolicyWorkerError as exc:
-        raise AgentFault(
-            f"submitted .h5ad at {p} crashed the sanitizer: {exc}"
-        ) from exc
-    finally:
-        sanitizer.close()
-
-    if not isinstance(result, dict) or not result.get("ok"):
-        reason = result.get("reason") if isinstance(result, dict) else result
-        if isinstance(result, dict) and result.get("infra"):
-            raise RuntimeError(f"could not sanitize submitted .h5ad: {reason}")
-        raise AgentFault(f"submitted .h5ad at {p} could not be sanitized: {reason}")
-    return out
 
 
 # ── Internal: JSON path parser ────────────────────────────────────
@@ -1538,6 +1606,7 @@ def _parse_json_path(path: str):
 
 
 __all__ = [
+    "SolverResult",
     "abs_error",
     "exact_match",
     "file_contains",
@@ -1552,13 +1621,13 @@ __all__ = [
     "load_submission_or_fault",
     "load_submitted_model",
     "load_submitted_policy",
+    "open_submission_file_or_fault",
     "regex_search",
     "require_regular_file",
     "run_model_module",
     "run_policy",
     "run_submitted_executable",
     "run_trusted_solver",
-    "SolverResult",
     "transcript_contains",
     "world_integrity",
 ]

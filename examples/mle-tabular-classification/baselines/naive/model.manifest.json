@@ -7,7 +7,7 @@
   ],
   "inference_entrypoint": "solution.py",
   "public_training_data": {
-    "path": "../../data/public/train.parquet",
+    "path": "../../data/train.parquet",
     "sha256": "5ebe0fde4c63d16fe81d5c46a308ec69c864f36fb4fa5e50001d76641d64124d"
   },
   "role": "naive",

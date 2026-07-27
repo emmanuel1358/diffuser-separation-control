@@ -27,8 +27,11 @@ Do not write the final answer anywhere else.
 - `graded_case_sampling_policy.json` - discloses the deterministic stress-test
   envelope, phase-seed convention, and suite-composition rules used to select
   the private grading records.
+- `public_isolation_model.py` - the nonlinear time-history structural model,
+  isolator, and ground-motion generator; use it to score candidate designs on
+  records you synthesize yourself.
 - `public_model_summary.py` - lightweight screening helpers for effective period
-  and damping.
+  and damping, built on `public_isolation_model.py`.
 - `isolation_starter.json` - a valid but intentionally poor (too-soft) starter.
 
 The hidden grading uses the **same** model, isolator, ground-motion generator
@@ -73,7 +76,7 @@ targets, moat capacity, recentering gate, and the tradeoff between isolation
 softness and superstructure demands. A design that only performs well on mild
 motions may not be robust across the full disclosed envelope.
 
-Before stopping, confirm the files exist and parse:
+Before stopping, confirm the file exists and parses:
 
 ```bash
 python -m json.tool /tmp/output/isolation_design.json >/dev/null

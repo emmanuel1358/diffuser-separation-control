@@ -26,10 +26,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Sequence
 
 import numpy as np
-
 from env_server.policy_loader import load_submitted_policy
 
-from grading.faults import AgentFault
+from grading.faults import AgentFault, InfrastructureFault
 from grading.helpers import load_submission_or_fault
 
 if TYPE_CHECKING:
@@ -86,7 +85,11 @@ def _world_writable_mounts(mounts_path: str = "/proc/self/mounts") -> list[str]:
             st = os.lstat(mp)
         except OSError:
             continue
-        if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode) and (st.st_mode & stat.S_IWOTH):
+        if (
+            stat.S_ISDIR(st.st_mode)
+            and not stat.S_ISLNK(st.st_mode)
+            and (st.st_mode & stat.S_IWOTH)
+        ):
             out.append(mp)
     return out
 
@@ -98,6 +101,7 @@ def _agent_wipe_roots(roots: Sequence[str]) -> list[str]:
     out = list(roots)
     try:
         import pwd  # noqa: PLC0415
+
         home = pwd.getpwuid(_AGENT_UID).pw_dir
         if home:
             out.append(home)
@@ -105,6 +109,7 @@ def _agent_wipe_roots(roots: Sequence[str]) -> list[str]:
         pass
     out.extend(_world_writable_mounts())
     return list(dict.fromkeys(out))
+
 
 # Root-only (0700) base for the per-run pristine copy of the agent tree; not
 # agent-writable and not a wipe root.
@@ -115,7 +120,97 @@ def _pristine_path(pristine_dir: str, p: str) -> str:
     """Root-only pristine location for a captured path, named by sha256(path).
     A fixed-length name (not ``pristine_dir + p``) keeps a deep agent path from
     exceeding PATH_MAX and silently skipping capture / restore."""
-    return os.path.join(pristine_dir, hashlib.sha256(p.encode("utf-8", "surrogateescape")).hexdigest())
+    return os.path.join(
+        pristine_dir, hashlib.sha256(p.encode("utf-8", "surrogateescape")).hexdigest()
+    )
+
+
+def _seal_agent_entry(path: str, info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode) or not (
+        stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+    ):
+        os.unlink(path)
+        return
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    if stat.S_ISDIR(info.st_mode):
+        flags |= os.O_DIRECTORY
+    else:
+        flags |= os.O_NONBLOCK
+    fd = os.open(path, flags)
+    try:
+        if os.geteuid() == 0:
+            os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0)
+    finally:
+        os.close(fd)
+
+
+def _quarantine_agent_subtrees(root: str) -> None:
+    """Seal each shallowest agent-owned subtree without traversing into it.
+
+    A path-length attack necessarily enters an agent-created directory before
+    exceeding ``PATH_MAX``. Root-owning and mode-000 sealing that first subtree
+    is linear in the trusted tree depth and makes the hidden cache unreachable
+    to later agent processes, even when the parent directory remains writable.
+    """
+
+    try:
+        root_info = os.lstat(root)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise InfrastructureFault(
+            f"could not inspect k-fold wipe root {root!r}: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise InfrastructureFault(f"k-fold wipe root is not a real directory: {root}")
+
+    def fail_quarantine(exc: OSError) -> None:
+        raise InfrastructureFault(
+            f"could not quarantine k-fold wipe root {root!r}: {exc}"
+        ) from exc
+
+    try:
+        for dirpath, dirnames, filenames in os.walk(
+            root,
+            topdown=True,
+            followlinks=False,
+            onerror=fail_quarantine,
+        ):
+            trusted_dirs: list[str] = []
+            for name in dirnames:
+                path = os.path.join(dirpath, name)
+                info = os.lstat(path)
+                if info.st_uid >= _AGENT_UID:
+                    _seal_agent_entry(path, info)
+                else:
+                    trusted_dirs.append(name)
+            dirnames[:] = trusted_dirs
+            for name in filenames:
+                path = os.path.join(dirpath, name)
+                info = os.lstat(path)
+                if info.st_uid >= _AGENT_UID:
+                    _seal_agent_entry(path, info)
+    except OSError as exc:
+        raise InfrastructureFault(
+            f"could not quarantine agent cache under {root!r}: {exc}"
+        ) from exc
+
+
+def _raise_tree_walk_error(exc: OSError, *, root: str | None = None) -> None:
+    """Fail closed when a wipe-root subtree cannot be traversed.
+
+    In particular, an agent can create a path beyond ``PATH_MAX`` through
+    iterative ``dir_fd`` calls. Silently skipping the resulting ``os.walk``
+    error would preserve a cross-fold label cache.
+    """
+
+    if root is not None:
+        _quarantine_agent_subtrees(root)
+    raise AgentFault(
+        f"could not securely traverse k-fold wipe root: " f"{type(exc).__name__}: {exc}"
+    ) from exc
 
 
 def _get_dir_xattrs(p: str) -> dict:
@@ -142,24 +237,38 @@ def _clear_xattrs(p: str) -> None:
         pass
 
 
-def _capture_entry(seen: dict, pristine_dir: str, p: str, st) -> None:
+def _capture_entry(
+    seen: dict,
+    pristine_dir: str,
+    p: str,
+    st,
+    *,
+    root: str,
+) -> None:
     """Snapshot one entry into ``seen``; for a regular file also copy it into
     the pristine store."""
     if stat.S_ISLNK(st.st_mode):
         try:
             seen[p] = ("l", st.st_uid, st.st_gid, os.readlink(p))
-        except OSError:
-            pass
+        except OSError as exc:
+            _raise_tree_walk_error(exc, root=root)
     elif stat.S_ISDIR(st.st_mode):
         seen[p] = (
-            "d", st.st_uid, st.st_gid,
-            (st.st_mtime_ns, st.st_atime_ns, stat.S_IMODE(st.st_mode), _get_dir_xattrs(p)),
+            "d",
+            st.st_uid,
+            st.st_gid,
+            (
+                st.st_mtime_ns,
+                st.st_atime_ns,
+                stat.S_IMODE(st.st_mode),
+                _get_dir_xattrs(p),
+            ),
         )
     elif stat.S_ISREG(st.st_mode):
         try:
             shutil.copy2(p, _pristine_path(pristine_dir, p), follow_symlinks=False)
-        except OSError:
-            return
+        except OSError as exc:
+            _raise_tree_walk_error(exc, root=root)
         seen[p] = ("f", st.st_uid, st.st_gid, None)
 
 
@@ -177,20 +286,28 @@ def _capture_agent_tree(roots: Sequence[str], pristine_dir: str) -> dict:
         # policy cannot stash a cache in its mtime/xattrs.
         try:
             rst = os.lstat(root)
-            if rst.st_uid >= _AGENT_UID and stat.S_ISDIR(rst.st_mode) and not stat.S_ISLNK(rst.st_mode):
-                _capture_entry(seen, pristine_dir, root, rst)
-        except OSError:
-            pass
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            if (
+                rst.st_uid >= _AGENT_UID
+                and stat.S_ISDIR(rst.st_mode)
+                and not stat.S_ISLNK(rst.st_mode)
+            ):
+                _capture_entry(seen, pristine_dir, root, rst, root=root)
+        except OSError as exc:
+            _raise_tree_walk_error(exc, root=root)
+        for dirpath, dirnames, filenames in os.walk(
+            root,
+            followlinks=False,
+            onerror=lambda exc, root=root: _raise_tree_walk_error(exc, root=root),
+        ):
             for name in dirnames + filenames:
                 p = os.path.join(dirpath, name)
                 try:
                     st = os.lstat(p)
-                except OSError:
-                    continue
+                except OSError as exc:
+                    _raise_tree_walk_error(exc, root=root)
                 if st.st_uid < _AGENT_UID:
                     continue
-                _capture_entry(seen, pristine_dir, p, st)
+                _capture_entry(seen, pristine_dir, p, st, root=root)
     return seen
 
 
@@ -199,14 +316,19 @@ def _reset_agent_tree(initial: dict, pristine_dir: str, roots: Sequence[str]) ->
     DELETE every current uid>=_AGENT_UID entry (symlink-safely) then REBUILD the
     captured tree from the pristine snapshot. Deleting first closes the
     in-place-restore holes (a parent swapped for a symlink, a dir<->file
-    type-swap, planted xattrs/mtime). Best-effort; unrecoverable paths skipped."""
+    type-swap, planted xattrs/mtime). Tree traversal errors fail closed."""
     # 1. Remove every current agent-owned entry (bottom-up, symlink-safe), never
     #    following a symlink and never removing a wipe root itself.
     roots_set = set(roots)
     for root in roots:
         if not os.path.isdir(root):
             continue
-        for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        for dirpath, dirnames, filenames in os.walk(
+            root,
+            topdown=False,
+            followlinks=False,
+            onerror=lambda exc, root=root: _raise_tree_walk_error(exc, root=root),
+        ):
             for name in filenames + dirnames:
                 p = os.path.join(dirpath, name)
                 if p in roots_set:
@@ -220,13 +342,15 @@ def _reset_agent_tree(initial: dict, pristine_dir: str, roots: Sequence[str]) ->
                     else:
                         try:
                             os.rmdir(p)
-                        except OSError:
-                            pass  # non-empty (root-owned children remain)
-                except OSError:
-                    continue
+                        except OSError as exc:
+                            _raise_tree_walk_error(exc, root=root)
+                except OSError as exc:
+                    _raise_tree_walk_error(exc, root=root)
     # 2. Recreate captured entries, parents first. Step 1 removed every agent
     #    symlink, so no path component can redirect a write.
-    for p, (kind, uid, gid, extra) in sorted(initial.items(), key=lambda kv: kv[0].count(os.sep)):
+    for p, (kind, uid, gid, extra) in sorted(
+        initial.items(), key=lambda kv: kv[0].count(os.sep)
+    ):
         try:
             parent = os.path.dirname(p)
             if parent and not os.path.isdir(parent):
@@ -266,7 +390,9 @@ def _reset_agent_tree(initial: dict, pristine_dir: str, roots: Sequence[str]) ->
     # 3. Re-stamp captured-directory metadata LAST, deepest first (re-creating a
     #    child bumps its parent's mtime). Clear policy xattrs, then restore
     #    captured xattrs / mode / mtime / atime.
-    for p, (kind, uid, gid, extra) in sorted(initial.items(), key=lambda kv: kv[0].count(os.sep), reverse=True):
+    for p, (kind, uid, gid, extra) in sorted(
+        initial.items(), key=lambda kv: kv[0].count(os.sep), reverse=True
+    ):
         if kind != "d":
             continue
         if not (os.path.isdir(p) and not os.path.islink(p)):
@@ -289,7 +415,9 @@ def _reset_agent_tree(initial: dict, pristine_dir: str, roots: Sequence[str]) ->
             continue
 
 
-def _capture_writable_nonagent_files(roots: Sequence[str], pristine_dir: str) -> dict[str, tuple[int, int, int]]:
+def _capture_writable_nonagent_files(
+    roots: Sequence[str], pristine_dir: str
+) -> dict[str, tuple[int, int, int]]:
     """Capture root-owned (uid < _AGENT_UID) but world-writable regular files.
 
     A root-owned yet world-writable file (e.g. /tmp/uv-*.lock) is a cross-fold
@@ -303,13 +431,17 @@ def _capture_writable_nonagent_files(roots: Sequence[str], pristine_dir: str) ->
     for root in roots:
         if not os.path.isdir(root):
             continue
-        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        for dirpath, _dirnames, filenames in os.walk(
+            root,
+            followlinks=False,
+            onerror=lambda exc, root=root: _raise_tree_walk_error(exc, root=root),
+        ):
             for name in filenames:
                 p = os.path.join(dirpath, name)
                 try:
                     st = os.lstat(p)
-                except OSError:
-                    continue
+                except OSError as exc:
+                    _raise_tree_walk_error(exc, root=root)
                 if not stat.S_ISREG(st.st_mode):
                     continue  # symlink / socket / device: not a content channel
                 if st.st_uid >= _AGENT_UID:
@@ -320,20 +452,26 @@ def _capture_writable_nonagent_files(roots: Sequence[str], pristine_dir: str) ->
                 try:
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy2(p, dst, follow_symlinks=False)
-                except OSError:
-                    continue
+                except OSError as exc:
+                    raise InfrastructureFault(
+                        f"could not snapshot writable k-fold file {p}: {exc}"
+                    ) from exc
                 out[p] = (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode))
     return out
 
 
-def _restore_writable_nonagent_files(captured: dict[str, tuple[int, int, int]], pristine_dir: str) -> None:
+def _restore_writable_nonagent_files(
+    captured: dict[str, tuple[int, int, int]], pristine_dir: str
+) -> None:
     """Revert each captured root-owned world-writable file to its start content /
     owner / mode between folds, wiping any cache the policy wrote. Best-effort."""
     for p, (uid, gid, mode) in captured.items():
         src = pristine_dir + p
         try:
             if not os.path.isfile(src):
-                continue
+                raise InfrastructureFault(
+                    f"missing pristine k-fold file snapshot for {p}"
+                )
             shutil.copy2(src, p, follow_symlinks=False)
             try:
                 os.chown(p, uid, gid)
@@ -343,8 +481,10 @@ def _restore_writable_nonagent_files(captured: dict[str, tuple[int, int, int]], 
                 os.chmod(p, mode)
             except OSError:
                 pass
-        except OSError:
-            continue
+        except OSError as exc:
+            raise InfrastructureFault(
+                f"could not restore writable k-fold file {p}: {exc}"
+            ) from exc
 
 
 # Per-RPC timeout for the policy's fit/predict during CV. PolicyWorker defaults
@@ -368,15 +508,22 @@ def _quiesce_agent_processes_between_folds() -> None:
     the targets) can re-serve the (id -> target) map with nothing left on disk.
     After the per-fold ``policy.close()`` the only uid>=1000 processes are
     agent-spawned, so this is safe; reuses the runner's pre-grade quiesce.
-    Best-effort: import or kill failure never aborts grading.
+    A confirmed respawning agent process is an ``AgentFault``; inability to
+    inspect or kill processes is an ``InfrastructureFault``. Neither state may
+    continue into the next fold in the root production runtime. Non-root local
+    development has no privilege boundary to enforce and skips this step.
     """
+    if os.name != "posix" or os.geteuid() != 0:
+        return
     try:
         from grading.runtime_hardening import (  # noqa: PLC0415
             kill_pre_grade_agent_processes,
         )
-        kill_pre_grade_agent_processes()
-    except Exception:
-        pass
+    except ImportError as exc:
+        raise InfrastructureFault(
+            "runtime process-quiesce support is unavailable between folds"
+        ) from exc
+    kill_pre_grade_agent_processes()
 
 
 def _ensure_root_owned_dir(d: Path) -> None:
@@ -440,7 +587,11 @@ def score_kfold_cv(
     feature_cols = list(feature_cols)
     wipe_roots = _agent_wipe_roots(wipe_roots)
 
-    missing = [c for c in (id_col, target_col, fold_col, *feature_cols) if c not in full_df.columns]
+    missing = [
+        c
+        for c in (id_col, target_col, fold_col, *feature_cols)
+        if c not in full_df.columns
+    ]
     if missing:
         raise RuntimeError(f"dataset missing required columns {missing}")
 
@@ -547,11 +698,13 @@ def score_kfold_cv(
         # quiesce + reset once more before dropping the pristine store.
         try:
             _quiesce_agent_processes_between_folds()
-        except Exception:
-            pass
-        try:
             _reset_agent_tree(initial, pristine_dir, wipe_roots)
             _restore_writable_nonagent_files(writable_nonagent, pristine_dir)
-        except Exception:
-            pass
-        shutil.rmtree(pristine_dir, ignore_errors=True)
+        except (AgentFault, InfrastructureFault):
+            raise
+        except Exception as exc:
+            raise InfrastructureFault(
+                f"could not restore k-fold isolation state: {exc}"
+            ) from exc
+        finally:
+            shutil.rmtree(pristine_dir, ignore_errors=True)

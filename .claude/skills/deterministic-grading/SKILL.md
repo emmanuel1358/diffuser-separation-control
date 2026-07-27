@@ -44,7 +44,12 @@ uv run python scripts/write_evaluation_plan.py problems/<task_id>
 - For MuJoCo scoring, pin timestep, integrator, initial state, controls,
   perturbations, and RNG seeds.
 - Load agent artifacts through descriptors (`JsonArtifact`, `TextArtifact`) or
-  sanctioned helpers — never raw `open` / `json.loads` / pickle on `/tmp/output`.
+  sanctioned component-safe helpers. Use `open_submission_file_or_fault` for
+  custom file-like parsers; never raw `open`, `lstat`, leaf-only `O_NOFOLLOW`,
+  `json.loads`, or pickle on `/tmp/output`.
+- Never disable worker privilege dropping or enable NumPy pickle loading.
+  Whole-object H5AD evaluation stays entirely inside a dropped worker; the root
+  grader may consume only bounded primitive HDF5 datasets.
 - Before opening or updating a task PR, run
   `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>`
   and commit the generated `problems/<task_id>/.alignerr/build_proof.json` plus

@@ -16,13 +16,13 @@ import sys
 from pathlib import Path
 
 import pytest
+from _fixture_guard import EXAMPLES as TEMPLATE_EXAMPLES
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GRADING_SRC = REPO_ROOT / "grader" / "src"
 GRADER_RUNNER_SRC = REPO_ROOT / "grader" / "src"
 ALIGNERR_PLUGIN_SRC = REPO_ROOT / "alignerr_plugin" / "src"
 RUBRIC_SRC = REPO_ROOT / "taiga_runtime" / "rubric" / "src"
-TEMPLATE_EXAMPLES = REPO_ROOT / "examples"
 
 
 for _p in (GRADING_SRC, GRADER_RUNNER_SRC, ALIGNERR_PLUGIN_SRC, RUBRIC_SRC):

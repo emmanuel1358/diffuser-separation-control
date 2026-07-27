@@ -8,7 +8,12 @@ import shutil
 import tomllib
 from pathlib import Path
 
-from alignerr_plugin.exporters.harbor import export_harbor
+from alignerr_plugin.exporters.harbor import (
+    _SELF_CONTAINED_DOCKERFILE,
+    _SOLVER_SELF_CONTAINED_DOCKERFILE,
+    export_harbor,
+)
+from alignerr_plugin.schemas import HF_HOME
 
 # A native-contract (task.toml) ml task written inline, for the runtime-notice
 # tests that need native behavior. Kept as a helper, not a fixture directory.
@@ -91,85 +96,123 @@ def _write_native_ml_task(problem_dir: Path) -> Path:
     return problem_dir
 
 
-def _write_mlenvs_task(problem_dir: Path) -> Path:
-    """A minimal env task (metadata.json + prompt.md + test_file.py + data +
-    reference_solution) with deps / apt_extras / env_dependencies so the Harbor
-    render exercises every block."""
+def _write_native_env_task(problem_dir: Path) -> Path:
+    """A native hidden-env task declaring every dependency channel, so the
+    Harbor render exercises the agent-visible, grader-only and env-only blocks."""
     problem_dir.mkdir(parents=True, exist_ok=True)
+    (problem_dir / "task.toml").write_text("""\
+schema_version = "1.1"
+
+[task]
+name = "labelbox/native-env-task"
+
+[environment]
+required_resources = "12vcpu+100gib+h100/2"
+hidden_env = "env"
+
+[difficulty]
+task_type = "ml"
+domain = "scientific_discovery_computational_science"
+reward_type = "continuous_scoring_function"
+license = "MIT"
+license_source = "https://opensource.org/license/mit"
+
+[[outputs]]
+path = "/tmp/output/policy.py"
+required = true
+""")
     (problem_dir / "metadata.json").write_text(
         json.dumps(
             {
-                "ml_task_type": "env",
-                "required_resources": "12vcpu+100gib+h100/2",
-                "domain": "scientific_discovery_computational_science",
-                "license": "MIT",
-                "license_source": "https://opensource.org/license/mit",
-                "dependencies": ["gymnasium==0.29.1"],
-                "apt_extras": ["libglfw3"],
-                "env_dependencies": ["myosuite==2.9.0"],
-                "grading_dependencies": ["scikit-learn==1.5.0"],
+                "benchmark": "taiga_task",
+                "problem_data": {"instance_id": "native-env-task"},
             }
         )
     )
-    (problem_dir / "prompt.md").write_text("# Task\nWrite /tmp/output/policy.py.\n")
-    (problem_dir / "test_file.py").write_text(
+    (problem_dir / "instruction.md").write_text(
+        "# Task\nWrite /tmp/output/policy.py.\n"
+    )
+    (problem_dir / "environment").mkdir(parents=True)
+    (problem_dir / "environment" / "requirements.txt").write_text("gymnasium==0.29.1\n")
+    (problem_dir / "environment" / "apt.txt").write_text("libglfw3\n")
+    (problem_dir / "scorer" / "data").mkdir(parents=True)
+    (problem_dir / "scorer" / "compute_score.py").write_text(
         "from pathlib import Path\n"
         "SUB = Path('/tmp/output')\n"
         "PRIV = Path('/mcp_server/data')\n\n\n"
-        "def compute_score():\n    return 0.5\n"
+        "def compute_score(workspace, trajectory, private):\n    return 0.5\n"
     )
-    (problem_dir / "data" / "public").mkdir(parents=True)
-    (problem_dir / "data" / "private").mkdir(parents=True)
-    (problem_dir / "reference_solution").mkdir(parents=True)
-    (problem_dir / "reference_solution" / "solution.py").write_text("print('ref')\n")
+    (problem_dir / "scorer" / "requirements.txt").write_text("scikit-learn==1.5.0\n")
+    (problem_dir / "scorer" / "env-requirements.txt").write_text("myosuite==2.9.0\n")
+    (problem_dir / "calibration.lock.json").write_text("{}\n")
+    (problem_dir / "data").mkdir(parents=True)
+    (problem_dir / "solution").mkdir(parents=True)
+    (problem_dir / "solution" / "solve.sh").write_text("echo ref\n")
     return problem_dir
 
 
-def test_export_mlenvs_task(tmp_path: Path) -> None:
-    problem_dir = _write_mlenvs_task(tmp_path / "mlenvs-env-task")
+def test_export_native_env_task(tmp_path: Path) -> None:
+    problem_dir = _write_native_env_task(tmp_path / "native-env-task")
     out = tmp_path / "harbor"
     export_harbor(problem_dir, out)
 
-    # prompt.md + test_file.py exported; no task.toml/scorer.
-    assert (out / "prompt.md").exists()
-    assert (out / "test_file.py").exists()
-    assert (out / "environment" / "test_file.py").exists()
+    assert (out / "task.toml").exists()
+    assert (out / "instruction.md").exists()
+    assert (out / "environment" / "scorer" / "compute_score.py").exists()
     assert (out / "environment" / "calibration.lock.json").exists()
-    assert (out / "environment" / "data" / "public").exists()
-    assert (out / "environment" / "data" / "private").exists()
-    # The requirements file the Dockerfile COPYs must ship in the build context.
-    assert (out / "environment" / "base" / "requirements-mlenvs-common.txt").exists()
+    # The dependency channels the Dockerfile COPYs must ship in the build context.
+    assert (out / "environment" / "base" / "install-task-deps.sh").exists()
+    assert (out / "environment" / "source_environment" / "requirements.txt").exists()
 
     dockerfile = (out / "environment" / "Dockerfile").read_text()
-    assert "base/requirements-mlenvs-common.txt" in dockerfile
-    # GPU-capable (cu121), not CPU-only.
-    assert "cu121" in dockerfile
-    # Hardening parity.
+    # Hardening parity: the answer key, grader and calibration lock stay root-only.
     assert "chmod 0700 /mcp_server" in dockerfile
-    assert "COPY --chown=root:root data/private/ /mcp_server/data/" in dockerfile
+    assert "COPY --chown=root:root scorer/data/ /mcp_server/data/" in dockerfile
+    assert "COPY --chown=root:root scorer/ /mcp_server/grader/" in dockerfile
     assert (
-        "COPY --chown=root:root calibration.lock.json "
-        "/mcp_server/calibration/calibration.lock.json" in dockerfile
+        "COPY --chown=root:root calibration.lock.json \\\n"
+        "    /mcp_server/calibration/calibration.lock.json" in dockerfile
     )
-    assert (
-        "author-image-fallback\\n' > "
-        "/mcp_server/calibration/.author-source" in dockerfile
-    )
-    assert "/mcp_server/grader/compute_score.py" in dockerfile
-    # env activation baked so the env server can start.
-    assert 'hidden_env = "env"' in dockerfile
-    # Declared deps / apt extras / env-only deps are wired.
-    assert "gymnasium==0.29.1" in dockerfile
-    assert "libglfw3" in dockerfile
-    assert "/mcp_server/env_deps" in dockerfile
-    assert "myosuite==2.9.0" in dockerfile
-    # Grader-only deps render a root-only /mcp_server/grading_deps block, and the
-    # placeholder is fully substituted (no @@GRADING_DEPS@@ left in the output).
-    assert "/mcp_server/grading_deps" in dockerfile
-    assert "scikit-learn==1.5.0" in dockerfile
-    assert "@@GRADING_DEPS@@" not in dockerfile
+    # The baked lock must be marked as the author fallback so the rubric server
+    # refuses it when the export requires the trusted-CI mount.
+    assert "/mcp_server/calibration/.author-source" in dockerfile
+    # Every declared channel installs through the one hardened installer; the
+    # private package names never appear in the agent-visible Dockerfile.
+    assert "/tmp/base/install-task-deps.sh /tmp/task-deps" in dockerfile
+    assert "myosuite" not in dockerfile
+    assert "scikit-learn" not in dockerfile
+    assert "@@TASK_EXTRAS@@" not in dockerfile
+    # This image is FROM python:3.13-slim, not a native base, so it has to repeat
+    # HF_HOME itself -- [[preloaded_files]] derives its mount paths from it, and
+    # without it offline from_pretrained/load_dataset looks in the wrong cache.
+    assert f"ENV HF_HOME={HF_HOME}" in dockerfile
     workdirs = re.findall(r"(?m)^WORKDIR\s+(\S+)\s*$", dockerfile)
     assert workdirs[-1] == "/workdir"
+
+
+def test_every_self_contained_template_sets_the_shared_hf_home() -> None:
+    """Both Harbor templates must agree with the bases on the HF cache root."""
+    for template in (_SELF_CONTAINED_DOCKERFILE, _SOLVER_SELF_CONTAINED_DOCKERFILE):
+        assert f"ENV HF_HOME={HF_HOME}" in template
+
+
+def test_export_omits_task_deps_block_when_no_channels_declared(tmp_path: Path) -> None:
+    problem_dir = _write_native_env_task(tmp_path / "no-channels")
+    for rel in (
+        "environment/requirements.txt",
+        "environment/apt.txt",
+        "scorer/requirements.txt",
+        "scorer/env-requirements.txt",
+        "calibration.lock.json",
+    ):
+        (problem_dir / rel).unlink()
+    out = tmp_path / "harbor"
+    export_harbor(problem_dir, out)
+
+    dockerfile = (out / "environment" / "Dockerfile").read_text()
+    assert "install-task-deps.sh" not in dockerfile
+    assert "/mcp_server/calibration" not in dockerfile
+    assert "@@TASK_EXTRAS@@" not in dockerfile
 
 
 def test_export_default_mode(template_examples: Path, tmp_path: Path) -> None:

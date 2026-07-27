@@ -214,22 +214,25 @@ def test_public_source_without_payload_files_uses_squashfs(
     assert qa_visible_public_files(public, "/data") is None
 
 
-def test_sync_mount_exposes_public_data_for_every_task_mode() -> None:
+def test_sync_mount_exposes_public_data_for_every_task() -> None:
     script = (REPO_ROOT / "scripts" / "sync_mount.sh").read_text()
 
+    # Every task's data/ tree is auto-mounted at /data, whether or not the author
+    # declared it, and the QA lane expands it into individually-listed files.
     assert "_upload_qa_visible_public_tree" in script
+    assert "['data', '', '', '/data', 'true', 'public']" in script
     assert (
-        '_upload_qa_visible_public_tree "${PROBLEM_DIR}/data/public" "/data"' in script
+        '_upload_qa_visible_public_tree "${PROBLEM_DIR}/${source}" "$mount_path"'
+        in script
     )
-    assert script.index(
-        '_upload_qa_visible_public_tree "${PROBLEM_DIR}/data/public" "/data"'
-    ) < script.index('if [[ "$ml_task_type" != "dataset" ]]')
     assert "prompt_text=prompt" in script
     assert 'local_path="/lbx-public-files/${address}/${relative}"' in script
-    assert 'if [[ "$public_complete" != "true" ]]' in script
-    assert "['data', '', '', '/data', 'true', 'public']" in script
+    assert 'if [[ "$complete" != "true" ]]' in script
+    assert "QA_PUBLIC_EXPANSION_COMPLETE" in script
     assert 'if [[ "$origin" == "public" ]]' in script
-    assert '_pack_data_tree "${PROBLEM_DIR}/data/private" "/mcp_server/data"' in script
+    # hf_repo mounts are packed by pack_hf_resource.py, not the generic packer.
+    assert "if e.hf_repo:" in script
+    assert "sync_hf_resources" in script
 
 
 # ── manifest load / notice ─────────────────────────────────────────────────

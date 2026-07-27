@@ -13,11 +13,15 @@ from grading.evaluation import (
     load_task_registration,
     measure_task_module,
 )
+from _fixture_guard import requires_examples
+
 from grading.evaluation.author import load_task_module
 from lbx_rl_tasks_harness.calibration import validate_committed_model_manifest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = REPO_ROOT / "examples" / "mle-tabular-classification"
+
+pytestmark = requires_examples("mle-tabular-classification")
 
 
 def _run(script: Path, *, env: dict[str, str]) -> None:
@@ -33,15 +37,15 @@ def _run(script: Path, *, env: dict[str, str]) -> None:
 
 
 def test_example_models_reproduce_and_score(tmp_path, monkeypatch) -> None:
-    data_dir = EXAMPLE / "data" / "public"
-    private = EXAMPLE / "data" / "private"
+    data_dir = EXAMPLE / "data"
+    private = EXAMPLE / "scorer" / "data"
     reference_models = tmp_path / "reference-model"
     naive_models = tmp_path / "naive-model"
     reference_output = tmp_path / "reference-output"
     naive_output = tmp_path / "naive-output"
 
     _run(
-        EXAMPLE / "reference_solution" / "train.py",
+        EXAMPLE / "solution" / "train.py",
         env={
             "LBT_DATA_DIR": str(data_dir),
             "LBT_MODEL_DIR": str(reference_models),
@@ -55,14 +59,14 @@ def test_example_models_reproduce_and_score(tmp_path, monkeypatch) -> None:
         },
     )
     assert (reference_models / "model.json").read_bytes() == (
-        EXAMPLE / "reference_solution" / "model.json"
+        EXAMPLE / "solution" / "model.json"
     ).read_bytes()
     assert (naive_models / "model.json").read_bytes() == (
         EXAMPLE / "baselines" / "naive" / "model.json"
     ).read_bytes()
 
     _run(
-        EXAMPLE / "reference_solution" / "solution.py",
+        EXAMPLE / "solution" / "solution.py",
         env={
             "LBT_DATA_DIR": str(data_dir),
             "LBT_MODEL_DIR": str(reference_models),
@@ -78,8 +82,8 @@ def test_example_models_reproduce_and_score(tmp_path, monkeypatch) -> None:
         },
     )
 
-    module = load_task_module(EXAMPLE / "test_file.py")
-    task = load_task_registration(EXAMPLE / "test_file.py")
+    module = load_task_module(EXAMPLE / "scorer" / "compute_score.py")
+    task = load_task_registration(EXAMPLE / "scorer" / "compute_score.py")
     assert task is not None
     lock_path = EXAMPLE / "calibration.lock.json"
     lock = load_calibration_lock(lock_path, task_spec_sha256=task.spec_sha256)
@@ -102,7 +106,7 @@ def test_example_generator_reproduces_committed_data(tmp_path) -> None:
     completed = subprocess.run(
         [
             sys.executable,
-            str(EXAMPLE / "data-generation" / "generate.py"),
+            str(EXAMPLE / "data_generation" / "generate.py"),
             "--output-root",
             str(isolated),
         ],
@@ -113,9 +117,9 @@ def test_example_generator_reproduces_committed_data(tmp_path) -> None:
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     for relative in (
-        Path("data/public/train.parquet"),
-        Path("data/public/test.parquet"),
-        Path("data/private/test_target.parquet"),
+        Path("data/train.parquet"),
+        Path("data/test.parquet"),
+        Path("scorer/data/test_target.parquet"),
     ):
         assert pd.read_parquet(EXAMPLE / relative).equals(
             pd.read_parquet(isolated / relative)
@@ -128,7 +132,7 @@ def test_private_challenge_requires_uncommitted_trusted_seed() -> None:
     completed = subprocess.run(
         [
             sys.executable,
-            str(EXAMPLE / "data-generation" / "generate_private_challenge.py"),
+            str(EXAMPLE / "data_generation" / "generate_private_challenge.py"),
         ],
         env=env,
         text=True,
@@ -137,18 +141,18 @@ def test_private_challenge_requires_uncommitted_trusted_seed() -> None:
     )
     assert completed.returncode != 0
     assert "LBX_PRIVATE_CHALLENGE_SEED is required" in completed.stderr
-    challenge = pd.read_parquet(EXAMPLE / "data" / "private" / "challenge.parquet")
+    challenge = pd.read_parquet(EXAMPLE / "scorer" / "data" / "challenge.parquet")
     assert len(challenge) == 1000
     assert set(challenge) == {"x1", "x2", "x3", "t1", "t2", "label"}
 
 
 def test_example_has_no_committed_score_copies() -> None:
     for strategy in (
-        EXAMPLE / "reference_solution",
+        EXAMPLE / "solution",
         EXAMPLE / "baselines" / "naive",
         EXAMPLE / "baselines" / "linear",
     ):
         assert not (strategy / "results.txt").exists()
         assert not (strategy / "submission.csv").exists()
-    validate_committed_model_manifest(EXAMPLE / "reference_solution", role="reference")
+    validate_committed_model_manifest(EXAMPLE / "solution", role="reference")
     validate_committed_model_manifest(EXAMPLE / "baselines" / "naive", role="naive")

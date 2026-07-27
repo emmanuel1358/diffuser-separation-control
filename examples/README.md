@@ -11,8 +11,8 @@ The current end-to-end examples are:
 - [`mujoco-pendulum`](mujoco-pendulum/): rubric-style deterministic
   scoring with declarative `RubricTask`.
 - [`mle-tabular-classification`](mle-tabular-classification/):
-  the canonical **ML_Envs-mode** task (minimal `metadata.json` + `prompt.md` +
-  no-arg `test_file.py`; continuous scoring, no rubric).
+  the canonical continuous-scored `ml` task (static held-out data;
+  no rubric).
 - [`openfoam-hydrofoil-flap`](openfoam-hydrofoil-flap/):
   CFD/OpenFOAM scoring with solver-backed oracle/grader logic.
 - [`opensees-base-isolation`](opensees-base-isolation/):
@@ -33,16 +33,16 @@ This example demonstrates:
 
 ### `mle-tabular-classification`
 
-The canonical **ML_Envs-mode** example — the minimal authoring contract
-(`docs/MLENVS_TASKS.md`). It demonstrates:
+The canonical continuous-scored **`ml`** example (`docs/ML_TASKS.md`). It
+demonstrates:
 
-- The whole authored surface: `metadata.json` (8-key minimal config),
-  `prompt.md`, `test_file.py`, `data/{public,private}/`, `reference_solution/`,
-  `baselines/` — **no `task.toml`, no per-task Dockerfile, no `tests/test.sh`**.
-- A **no-arg** `compute_score()` that reads `/tmp/output` + `/mcp_server/data`
-  directly, loads the submission via `grading.helpers`, and calibrates
-  with `FLOOR/REF/PERFECT` + the sanctioned `PiecewiseLinearCurve` (reference
-  scores ~0.5).
+- Public parquet in `data/` and held-out truth in
+  `scorer/data/`.
+- The dependency-channel split: agent-visible `environment/requirements.txt`
+  versus the root-only channels the grader and hidden env server use.
+- A `compute_score` that loads the submission via `grading.helpers` and
+  calibrates with `FLOOR/REF/PERFECT` + the sanctioned `PiecewiseLinearCurve`
+  (reference scores ~0.5).
 - A `{score, subscores}` return with no `RubricTask`.
 
 ## How To Use This Example

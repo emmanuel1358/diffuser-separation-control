@@ -64,6 +64,7 @@ from alignerr_plugin.solver_hints import task_type_solver_hint
 from alignerr_plugin.taiga_resources import (
     RESOURCE_RANK,
     is_accelerator_resource,
+    is_cpu_resource,
     validate_required_resources,
 )
 from alignerr_plugin.utils import load_task_toml, read_prompt, task_id, write_json
@@ -76,10 +77,6 @@ from alignerr_plugin.utils import load_task_toml, read_prompt, task_id, write_js
 # 120s MCP init timeout, losing whole rollouts before the agent started. The
 # venv is already synced at image-build time, so a plain exec starts instantly.
 STARTUP_COMMAND = "/opt/lbx-runtime/.venv/bin/rubric mcp"
-
-# ML_Envs bases install the rubric MCP server --system (no venv), so `rubric` is a
-# plain console script on PATH.
-MLENVS_STARTUP_COMMAND = "rubric mcp"
 
 # ML timeout pins (ML_SETUP/GRADING/TOOL_TIMEOUT_SEC, ML_MAX_EPISODE_SEC) are the
 # hour-scale, non-author-controlled timeouts imported from schemas. For
@@ -139,24 +136,13 @@ CUDA_GRAPHICS_BASE_IMAGE = (
     "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-cuda-graphics"
 )
 TPU_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-tpu"
-# mlenvs-specific registry images (not shared with the native flavors).
-MLENVS_SLIM_BASE_IMAGE = (
-    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-slim"
-)
-MLENVS_GPU_BASE_IMAGE = (
-    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-gpu"
-)
-MLENVS_CUDA_GRAPHICS_BASE_IMAGE = (
-    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-cuda-graphics"
-)
-MLENVS_TPU_BASE_IMAGE = (
-    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-tpu"
-)
-# Blackwell overlays (local-only; not deployable on Taiga).
-MLENVS_GPU_BLACKWELL_BASE_IMAGE = (
-    "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-gpu-blackwell"
-)
-MLENVS_CUDA_GRAPHICS_BLACKWELL_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-mlenvs-cuda-graphics-blackwell"
+
+# Set by the automatic CPU QA lane to a CPU required_resources tier. When present,
+# the export forces that tier and swaps the base flavor for its CPU counterpart, so
+# the image, tag, container_runtime AND the agent-facing accelerator notice all
+# describe the machine the job will actually land on. Unset everywhere else, which
+# leaves the declared tier untouched.
+QA_CPU_RESOURCE_ENV = "LBX_TAIGA_QA_CPU_RESOURCE"
 
 
 def _tpu_base_image_tag() -> str:
@@ -168,25 +154,12 @@ def _tpu_base_image_tag() -> str:
     )
 
 
-def _mlenvs_slim_base_image_tag() -> str:
+def _graphics_base_image_tag() -> str:
+    # cuda-graphics runs py3.13 like cpu/gpu but keeps its own tag prefix and
+    # env var, so its CUDA-native rasterization layers are pinned independently.
     return os.environ.get(
-        "LBX_RL_TASKS_MLENVS_SLIM_BASE_IMAGE_TAG",
-        "runtime-mlenvs-slim-py312-1b75cb075439",
-    )
-
-
-def _mlenvs_base_image_tag() -> str:
-    # mlenvs bases share a py3.12 tag prefix; the image suffix disambiguates.
-    return os.environ.get(
-        "LBX_RL_TASKS_MLENVS_BASE_IMAGE_TAG", "runtime-mlenvs-py312-1b75cb075439"
-    )
-
-
-def _mlenvs_blackwell_base_image_tag() -> str:
-    # cu128 / sm_120 overlays (local-only).
-    return os.environ.get(
-        "LBX_RL_TASKS_MLENVS_BLACKWELL_BASE_IMAGE_TAG",
-        "runtime-mlenvs-blackwell-py312-1b75cb075439",
+        "LBX_RL_TASKS_GRAPHICS_BASE_IMAGE_TAG",
+        "runtime-ml-graphics-py313-1b75cb075439",
     )
 
 
@@ -206,24 +179,9 @@ def _base_image_and_tag(flavor: str) -> tuple[str, str]:
     if flavor == "gpu-blackwell":
         return GPU_BLACKWELL_BASE_IMAGE, _blackwell_base_image_tag()
     if flavor == "cuda-graphics":
-        return CUDA_GRAPHICS_BASE_IMAGE, BASE_IMAGE_TAG
+        return CUDA_GRAPHICS_BASE_IMAGE, _graphics_base_image_tag()
     if flavor == "tpu":
         return TPU_BASE_IMAGE, _tpu_base_image_tag()
-    if flavor == "mlenvs-slim":
-        return MLENVS_SLIM_BASE_IMAGE, _mlenvs_slim_base_image_tag()
-    if flavor == "mlenvs-gpu":
-        return MLENVS_GPU_BASE_IMAGE, _mlenvs_base_image_tag()
-    if flavor == "mlenvs-cuda-graphics":
-        return MLENVS_CUDA_GRAPHICS_BASE_IMAGE, _mlenvs_base_image_tag()
-    if flavor == "mlenvs-tpu":
-        return MLENVS_TPU_BASE_IMAGE, _mlenvs_base_image_tag()
-    if flavor == "mlenvs-gpu-blackwell":
-        return MLENVS_GPU_BLACKWELL_BASE_IMAGE, _mlenvs_blackwell_base_image_tag()
-    if flavor == "mlenvs-cuda-graphics-blackwell":
-        return (
-            MLENVS_CUDA_GRAPHICS_BLACKWELL_BASE_IMAGE,
-            _mlenvs_blackwell_base_image_tag(),
-        )
     return CPU_BASE_IMAGE, CPU_BASE_IMAGE_TAG
 
 
@@ -245,13 +203,41 @@ def derive_taiga_resources(problem_dir: Path) -> dict[str, str]:
     return _derive_resources_from_toml(task_toml)
 
 
+def qa_cpu_flavor_for(flavor: str) -> str:
+    """Map a resolved base flavor to its CPU-lane counterpart.
+
+    Every flavor shares one runtime contract, so the CPU QA lane always runs on
+    the ``cpu`` base.
+    """
+    _ = flavor
+    return "cpu"
+
+
+def _qa_cpu_resource_override() -> str:
+    return (os.environ.get(QA_CPU_RESOURCE_ENV) or "").strip()
+
+
 def _derive_resources_from_toml(task_toml: TaskToml) -> dict[str, str]:
     env = task_toml.environment
     runner = task_toml.runner
     required = validate_required_resources(env.required_resources)
+    # Resolve against the DECLARED tier first so a bad author flavor still fails
+    # loudly, before the CPU QA lane below can swap it out.
     flavor = resolve_base_flavor_for_resource(
         getattr(env, "base_flavor", "auto"), required
     )
+
+    override = _qa_cpu_resource_override()
+    if override:
+        required = validate_required_resources(override)
+        if not is_cpu_resource(required):
+            raise ValueError(
+                f"{QA_CPU_RESOURCE_ENV} must be a CPU required_resources tier; got "
+                f"{required!r}. The CPU QA lane submits without the deploy-to-taiga "
+                "reviewer gate, so it must never request an accelerator."
+            )
+        flavor = qa_cpu_flavor_for(flavor)
+
     base_image, base_tag = _base_image_and_tag(flavor)
 
     return {
@@ -576,8 +562,8 @@ def compute_score():
         )
     if not callable(_compute_score):
         raise RuntimeError("grader defines neither TASK=RubricTask(...) nor compute_score()")
-    # ML_Envs-mode graders define a no-arg compute_score() that reads the baked
-    # /tmp/output and /mcp_server/data paths directly; call it with no args.
+    # A no-arg compute_score() reads the baked /tmp/output and /mcp_server/data
+    # paths directly; call it with no args.
     if not _takes_args:
         return _compute_score()
     # Native graders take (workspace, trajectory, private). The rubric runtime
@@ -612,16 +598,7 @@ def _build_problem_entry(
 ) -> dict[str, Any]:
     """Build the per-problem entry dict that lives under
     ``problems_metadata.problem_set.problems[]``."""
-    from alignerr_plugin import mlenvs
     from alignerr_plugin.preloaded import load_preloaded_manifest
-
-    # mlenvs bases install the rubric MCP server --system (no venv); point their
-    # startup command at the --system console script.
-    startup_command = (
-        MLENVS_STARTUP_COMMAND
-        if mlenvs.is_mlenvs_task(problem_dir)
-        else STARTUP_COMMAND
-    )
 
     task_toml = load_task_toml(problem_dir)
     runner: RunnerConfig = task_toml.runner
@@ -632,6 +609,8 @@ def _build_problem_entry(
         _effective_timeouts(task_toml)
     )
     resources = _derive_resources_from_toml(task_toml)
+
+    startup_command = STARTUP_COMMAND
     prompt = _read_prompt(problem_dir)
     shim = test_file_shim()
 

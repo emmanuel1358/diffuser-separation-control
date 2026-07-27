@@ -28,8 +28,14 @@ description = "policy"
 """
 
 
-def _make_task(tmp_path: Path, *, mode: str = "env", env_py: bool = True,
-               client: bool = True, leak_env: bool = False) -> Path:
+def _make_task(
+    tmp_path: Path,
+    *,
+    mode: str = "env",
+    env_py: bool = True,
+    client: bool = True,
+    leak_env: bool = False,
+) -> Path:
     d = tmp_path / "task"
     (d / "scorer" / "data").mkdir(parents=True, exist_ok=True)
     (d / "data").mkdir(parents=True, exist_ok=True)

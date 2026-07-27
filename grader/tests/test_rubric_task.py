@@ -5,18 +5,18 @@ import os
 from pathlib import Path
 
 import pytest
-
 from grading import AgentFault, GraderFault
 from grading.evaluation import (
     JsonArtifact,
     NumericField,
+    RegularFileArtifact,
     RubricCriterion,
     RubricEvaluation,
     RubricTask,
     TrustedJson,
 )
-from grading.numeric import NumericContractError, safe_mean, safe_ratio
 from grading.evaluation.plan import validate_serialized_plan
+from grading.numeric import NumericContractError, safe_mean, safe_ratio
 
 
 def _task(*, evaluate=None, required: bool = False, fixtures=None) -> RubricTask:
@@ -81,6 +81,31 @@ def test_symlink_artifact_is_agent_fault(tmp_path: Path) -> None:
         _task().grade(workspace=workspace, private=tmp_path)
 
 
+def test_symlink_workspace_parent_is_agent_fault(tmp_path: Path) -> None:
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "design.json").write_text('{"value": 1.0}')
+    workspace = tmp_path / "output"
+    os.symlink(private, workspace)
+
+    with pytest.raises(AgentFault):
+        _task().grade(workspace=workspace, private=tmp_path)
+
+
+def test_regular_file_artifact_returns_immutable_snapshot(tmp_path: Path) -> None:
+    workspace = tmp_path / "output"
+    workspace.mkdir()
+    original = workspace / "policy.py"
+    original.write_text("VALUE = 1\n")
+
+    submitted = RegularFileArtifact("policy.py").load(workspace)
+    original.write_text("VALUE = 2\n")
+
+    assert submitted.original_path == original
+    assert submitted.path != original
+    assert submitted.path.read_text() == "VALUE = 1\n"
+
+
 def test_unclassified_evaluator_exception_is_kept_zero(tmp_path: Path) -> None:
     def evaluate(_context):
         raise ZeroDivisionError("candidate-dependent denominator")
@@ -94,9 +119,10 @@ def test_unclassified_evaluator_exception_is_kept_zero(tmp_path: Path) -> None:
     assert grade.env_internal_failure is False
     assert grade.metadata["critical_operator_alert"] is True
     assert "traceback" not in grade.metadata
-    assert "ZeroDivisionError" in grade.criterion_logs[
-        "unclassified_grader_crash"
-    ]["error_message"]
+    assert (
+        "ZeroDivisionError"
+        in grade.criterion_logs["unclassified_grader_crash"]["error_message"]
+    )
 
 
 def test_declared_zero_denominator_policy_becomes_agent_fault(tmp_path: Path) -> None:

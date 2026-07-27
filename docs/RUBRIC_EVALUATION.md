@@ -122,10 +122,11 @@ The validator hard-blocks legacy rubric graders and stale/missing plans.
 
 ### `JsonArtifact`
 
-`JsonArtifact` opens with `O_NOFOLLOW | O_NONBLOCK`, validates a regular file,
-caps bytes before reading, decodes strict UTF-8, bounds JSON depth/node count,
-checks object shape, and converts declared numeric fields through finite,
-overflow-safe coercion.
+`JsonArtifact` walks every path component through pinned directory descriptors,
+opens the leaf with `O_NOFOLLOW | O_NONBLOCK`, validates a regular file, and
+parses immutable bounded bytes from that descriptor. It then decodes strict
+UTF-8, bounds JSON depth/node count, checks object shape, and converts declared
+numeric fields through finite, overflow-safe coercion.
 
 All submission-content failures become `AgentFault`, including:
 
@@ -175,8 +176,11 @@ with context.policy(timeout_s=2.0) as policy:
     score = rollout(policy)
 ```
 
-The artifact is checked for regular-file and size constraints before the
-privilege-dropped worker opens it.
+The artifact is captured through the same component-safe reader before the
+privilege-dropped worker executes that immutable source. Parent-directory and
+leaf symlink swaps are rejected. `context.candidate.path` is the immutable
+grader-owned copy; `context.policy()` preserves the submitted module's original
+`__file__` and sibling-import directory while executing those captured bytes.
 
 ### `TrustedJson`
 

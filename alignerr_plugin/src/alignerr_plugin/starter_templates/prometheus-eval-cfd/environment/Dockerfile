@@ -7,10 +7,20 @@ ARG PROBLEM_DIR=.
 
 WORKDIR /workdir
 
-RUN mkdir -p /mcp_server/data /workdir /tmp/output && chown -R 1000:1000 /workdir /tmp/output
 # OpenFOAM (simpleFoam/pimpleFoam/blockMesh/topoSet/...) ships in the base image
-# conda env, reached via /etc/solver-envs.d/openfoam.sh. Add any extra Python
-# deps your scorer needs here.
+# conda env, reached via /etc/solver-envs.d/openfoam.sh. Anything the base does
+# not already carry goes in a declared dependency channel -- never in base/ and
+# never as a raw install here. Each file is optional; the installer routes each
+# one to its isolation boundary:
+#   environment/apt.txt          apt packages (agent-visible)
+#   environment/requirements.txt pip into the runtime venv (agent-visible)
+#   scorer/requirements.txt      pip into root-only /mcp_server/grading_deps
+#   scorer/env-requirements.txt  pip into root-only /mcp_server/env_deps
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+
+RUN mkdir -p /mcp_server/data /workdir /tmp/output && chown -R 1000:1000 /workdir /tmp/output
 COPY ${PROBLEM_DIR}/data/ /data/
 COPY --chown=root:root ${PROBLEM_DIR}/scorer/data/ /mcp_server/data/
 COPY --chown=root:root ${PROBLEM_DIR}/scorer/ /mcp_server/grader/

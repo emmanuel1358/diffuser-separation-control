@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
+import pytest
 from lbx_rl_tasks_harness.models import (
     GroundTruthSpec,
     HarnessProblem,
@@ -19,7 +21,9 @@ from lbx_rl_tasks_harness.reference_config import (
 from lbx_rl_tasks_harness.runner import run_reference_harness
 from lbx_rl_tasks_harness.runtimes import reference as reference_module
 from lbx_rl_tasks_harness.runtimes.reference import (
+    ReferenceRunOptions,
     _cache_has_required_outputs,
+    _container_measure_script,
     _container_script_prefix,
     _container_script_stop_env_server,
     _container_solve_script,
@@ -29,7 +33,6 @@ from lbx_rl_tasks_harness.runtimes.reference import (
     _hidden_env_mode,
     _run_streaming,
     collect_host_info,
-    ReferenceRunOptions,
 )
 
 
@@ -209,12 +212,98 @@ def test_native_ml_prefers_manifest_inference_entrypoint(tmp_path: Path) -> None
     assert solution_script_rel(problem, solution_dir="solution") == "solution/solve.sh"
 
 
+def test_continuous_ml_reference_does_not_fall_back_on_invalid_manifest(
+    tmp_path: Path,
+) -> None:
+    problem_dir = tmp_path / "problem"
+    strategy = problem_dir / "solution"
+    strategy.mkdir(parents=True)
+    (problem_dir / "task.toml").write_text(
+        '[difficulty]\ntask_type = "ml"\n'
+        'reward_type = "continuous_scoring_function"\n'
+    )
+    (problem_dir / "metadata.json").write_text("{}\n")
+    (strategy / "solve.sh").write_text("#!/bin/bash\nexit 0\n")
+    (strategy / "strategy.manifest.json").write_text("{not-json\n")
+    problem = _problem(
+        source_problem_dir=problem_dir,
+        reference=ReferenceSpec(entrypoint="solve.sh"),
+        metadata={
+            "difficulty": {
+                "task_type": "ml",
+                "reward_type": "continuous_scoring_function",
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="invalid reference strategy manifest"):
+        solution_script_rel(problem, solution_dir="solution")
+
+
+def test_custom_naive_path_uses_naive_manifest_role(tmp_path: Path) -> None:
+    import hashlib
+
+    problem_dir = tmp_path / "problem"
+    strategy = problem_dir / "heuristic"
+    strategy.mkdir(parents=True)
+    (problem_dir / "task.toml").write_text(
+        '[difficulty]\ntask_type = "ml"\n'
+        'reward_type = "continuous_scoring_function"\n'
+    )
+    (problem_dir / "metadata.json").write_text("{}\n")
+    policy = strategy / "policy.py"
+    policy.write_text("def load_policy(): return object()\n")
+    (strategy / "solve.sh").write_text(
+        "#!/bin/bash\ncp policy.py /tmp/output/policy.py\n"
+    )
+    (strategy / "strategy.manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "role": "naive",
+                "kind": "committed_artifact",
+                "inference_entrypoint": "solve.sh",
+                "artifacts": [
+                    {
+                        "path": "policy.py",
+                        "sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+    problem = _problem(
+        source_problem_dir=problem_dir,
+        reference=ReferenceSpec(entrypoint="solve.sh"),
+        metadata={
+            "difficulty": {
+                "task_type": "ml",
+                "reward_type": "continuous_scoring_function",
+            }
+        },
+    )
+
+    assert (
+        solution_script_rel(problem, solution_dir="heuristic") == "heuristic/solve.sh"
+    )
+
+
 def test_container_script_bootstraps_hidden_env() -> None:
     problem = _problem(metadata={"environment": {"hidden_env": "env"}})
     prefix = _container_script_prefix(problem, skip_solve=False)
     assert "python -m env_server &" in prefix
     assert _container_script_stop_env_server(problem, skip_solve=False)
     assert _hidden_env_mode(problem) == "env"
+
+
+def test_raw_measurement_bootstraps_hidden_env() -> None:
+    problem = _problem(metadata={"environment": {"hidden_env": "hybrid"}})
+    script = _container_measure_script(problem)
+
+    assert "python -m env_server &" in script
+    assert "grader_runner.raw_worker" in script
+    assert 'kill "$ENV_PID"' in script
 
 
 def test_container_script_skips_env_server_on_skip_solve() -> None:
@@ -401,8 +490,8 @@ def test_container_solve_script_runs_env_server_as_root_then_solve_as_agent() ->
     script = _container_solve_script(problem, sol_rel="solution/solve.sh", render=False)
 
     assert "python -m env_server &" in script
-    # uid-1000 account is resolved from the image (agent on native, model on
-    # mlenvs) rather than hardcoded, so the drop works on both base flavors.
+    # uid-1000 account is resolved from the image rather than hardcoded, so the
+    # drop works whatever the base flavor names that account.
     assert 'su -s /bin/bash "$(getent passwd 1000 | cut -d: -f1)" -c' in script
     assert "cd /host_task && bash solution/solve.sh" in script
 
@@ -433,11 +522,12 @@ def test_container_grade_command_runs_root_with_host_scorer_mount(tmp_path) -> N
     assert any(part == "/cache:/tmp/output" for part in cmd)
 
 
-def test_container_grade_command_skips_grader_mount_for_mlenvs(tmp_path) -> None:
-    # ML_Envs tasks have no host scorer/; the grader is baked into the image
-    # (test_file.py -> /mcp_server/grader/compute_score.py). Mounting a
-    # non-existent host path would shadow the baked grader with an empty dir, so
-    # the grader mount must be omitted and the baked grader used.
+def test_container_grade_command_skips_grader_mount_when_host_scorer_missing(
+    tmp_path,
+) -> None:
+    # Mounting a non-existent host path would shadow the image's baked
+    # /mcp_server/grader with an empty dir, so the mount must be omitted and the
+    # baked grader used instead.
     missing_scorer = tmp_path / "scorer"  # never created
     cmd = _docker_grade_command(
         "img:tag", Path("/cache"), missing_scorer, Path("/out"), "echo grade"
@@ -479,6 +569,66 @@ def test_run_streaming_tees_and_captures(capsys) -> None:
     assert "err" in streamed
 
 
+def test_grade_failure_detail_reads_the_shape_to_dict_actually_writes(
+    tmp_path: Path,
+) -> None:
+    """Grade.to_dict() has no top-level criterion_logs: the failure only reaches
+    metadata.grading_errors, metadata.rubric_breakdown and structured_subscores,
+    and reading just the first shape left CI printing an empty stderr tail."""
+    verifier = tmp_path / "verifier"
+    verifier.mkdir()
+    (verifier / "reward-details.json").write_text(
+        json.dumps(
+            {
+                "score": 0.0,
+                "structured_subscores": [
+                    {"name": "run_grader", "reasoning": "[grader_launch_failed] EROFS"}
+                ],
+                "metadata": {
+                    "grading_errors": [
+                        {
+                            "criterion": "run_grader",
+                            "error_type": "grader_launch_failed",
+                            "error_message": "could not reset root ownership",
+                        }
+                    ],
+                    "traceback": "Traceback (most recent call last):\n  OSError",
+                },
+            }
+        )
+    )
+
+    detail = reference_module._grade_failure_detail(verifier)
+
+    assert "grader_launch_failed: could not reset root ownership" in detail
+    assert "grader traceback:" in detail
+    assert "OSError" in detail
+
+
+def test_grade_failure_detail_is_empty_for_a_successful_grade(tmp_path: Path) -> None:
+    """Only errored criteria carry the "[error_type] ..." reasoning prefix; a
+    passing criterion's reasoning is ordinary judge prose and is not an error."""
+    verifier = tmp_path / "verifier"
+    verifier.mkdir()
+    (verifier / "reward-details.json").write_text(
+        json.dumps(
+            {
+                "score": 1.0,
+                "structured_subscores": [
+                    {"name": "accuracy", "reasoning": ""},
+                    {
+                        "name": "style",
+                        "reasoning": "The solution matches the expected output.",
+                    },
+                ],
+                "metadata": {"rubric_breakdown": [{"criterion": "accuracy"}]},
+            }
+        )
+    )
+
+    assert reference_module._grade_failure_detail(verifier) == ""
+
+
 def test_run_streaming_propagates_nonzero_returncode() -> None:
     rc, _ = _run_streaming(["bash", "-c", "exit 3"], timeout=30, label="unit")
     assert rc == 3
@@ -490,6 +640,51 @@ def test_collect_host_info_reports_hardware() -> None:
     assert "cpu_count" in info
     assert "mem_total_bytes" in info
     assert isinstance(info["gpus"], list)
+
+
+def _fake_nvidia_smi(monkeypatch, stdout: str) -> None:
+    """Stub only the nvidia-smi call. ``platform.platform()`` also shells out,
+    so anything else has to reach the real subprocess.run."""
+    real_run = subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        if not (cmd and cmd[0] == "nvidia-smi"):
+            return real_run(cmd, **kwargs)
+        assert "--query-gpu=name,memory.total,driver_version,compute_cap" in cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(
+        reference_module.shutil, "which", lambda name: f"/usr/bin/{name}"
+    )
+    monkeypatch.setattr(reference_module.subprocess, "run", fake_run)
+
+
+def test_collect_host_info_records_gpu_driver_version(monkeypatch) -> None:
+    """The driver version decides which CUDA major a base image may target,
+    so a reviewer has to be able to read it off a reference run."""
+    _fake_nvidia_smi(monkeypatch, "NVIDIA H100 80GB HBM3, 81559, 550.54.15, 9.0\n")
+
+    assert collect_host_info()["gpus"] == [
+        {
+            "name": "NVIDIA H100 80GB HBM3",
+            "memory_total_mib": 81559,
+            "driver_version": "550.54.15",
+            "compute_cap": "9.0",
+        }
+    ]
+
+
+def test_collect_host_info_tolerates_short_nvidia_smi_output(monkeypatch) -> None:
+    _fake_nvidia_smi(monkeypatch, "Some GPU, 4096\n")
+
+    assert collect_host_info()["gpus"] == [
+        {
+            "name": "Some GPU",
+            "memory_total_mib": 4096,
+            "driver_version": None,
+            "compute_cap": None,
+        }
+    ]
 
 
 def test_manifest_records_host_hardware(monkeypatch, tmp_path: Path) -> None:

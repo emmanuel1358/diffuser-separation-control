@@ -7,10 +7,12 @@ import importlib.util
 import inspect
 import math
 import os
+import re
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from grading.calibration import PiecewiseLinearCurve
 from grading.evaluation.context import EvaluationContext, workspace_artifact_digest
@@ -26,6 +28,7 @@ from grading.evaluation.lock import (
     load_calibration_lock,
 )
 from grading.evaluation.metrics import (
+    AnchorRationale,
     MetricTarget,
     measure_registered_targets,
     normalize_weights,
@@ -37,7 +40,7 @@ from grading.evaluation.result import (
     write_private_trace,
 )
 from grading.faults import AgentFault
-from grading.helpers import load_submission_or_fault, require_regular_file
+from grading.helpers import load_submission_or_fault
 from grading.policy_runner import load_submitted_policy
 
 
@@ -141,9 +144,79 @@ class PrivateTableChallenge:
         }
 
 
+_PROBE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+@dataclass(frozen=True)
+class WorkspaceProbe:
+    """One committed ready-to-measure no-information workspace."""
+
+    name: str
+    path: str
+    rationale: str
+
+    def __post_init__(self) -> None:
+        relative = Path(self.path)
+        if not _PROBE_NAME_RE.fullmatch(self.name):
+            raise ValueError(
+                "workspace probe name must use letters, numbers, dot, underscore, "
+                "or hyphen"
+            )
+        if (
+            not self.path
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:2] != ("baselines", "degenerate")
+            or len(relative.parts) < 3
+        ):
+            raise ValueError(
+                "workspace probe path must be task-relative under "
+                "baselines/degenerate/<probe>"
+            )
+        if len(self.rationale.strip()) < 20:
+            raise ValueError("workspace probe rationale must be at least 20 characters")
+
+    def spec_dict(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "path": self.path,
+            "rationale": self.rationale.strip(),
+        }
+
+
+@dataclass(frozen=True)
+class WorkspaceDegenerateProbes:
+    """Explicit no-information artifacts for opaque/non-tabular graders."""
+
+    probes: tuple[WorkspaceProbe, ...]
+
+    def __init__(
+        self, probes: list[WorkspaceProbe] | tuple[WorkspaceProbe, ...]
+    ) -> None:
+        normalized = tuple(probes)
+        if not normalized:
+            raise ValueError("workspace degenerate probes must be non-empty")
+        names = [probe.name for probe in normalized]
+        paths = [probe.path for probe in normalized]
+        if len(names) != len(set(names)):
+            raise ValueError("workspace probe names must be unique")
+        if len(paths) != len(set(paths)):
+            raise ValueError("workspace probe paths must be unique")
+        object.__setattr__(self, "probes", normalized)
+
+    def spec_dict(self) -> dict[str, Any]:
+        return {
+            "type": "workspace_degenerate_probes.v1",
+            "probes": [
+                probe.spec_dict() for probe in sorted(self.probes, key=lambda p: p.name)
+            ],
+        }
+
+
 @dataclass(frozen=True)
 class GeneratedCalibration:
     filename: str = DEFAULT_LOCK_FILENAME
+    degenerate_probes: WorkspaceDegenerateProbes | None = None
 
     def __post_init__(self) -> None:
         if self.filename != DEFAULT_LOCK_FILENAME:
@@ -152,11 +225,29 @@ class GeneratedCalibration:
             )
 
     def spec_dict(self) -> dict[str, Any]:
-        return {"type": "generated_lock.v1", "filename": self.filename}
+        payload: dict[str, Any] = {
+            "type": "generated_lock.v1",
+            "filename": self.filename,
+        }
+        if self.degenerate_probes is not None:
+            payload["degenerate_probes"] = self.degenerate_probes.spec_dict()
+        return payload
 
 
 RawEvaluator = Callable[[Any, Any], Mapping[str, Any]]
 PRODUCTION_EVALUATION_ENV = "LBX_EVALUATION_PRODUCTION"
+CALIBRATION_SEED_ENV = "LBX_CALIBRATION_SEED"
+
+
+@dataclass(frozen=True)
+class CalibrationMeasureContext:
+    """Shared deterministic case-selection context for calibration strategies."""
+
+    seed: int = 0
+
+    def derive_seed(self, label: str) -> int:
+        payload = f"continuous-calibration.v1\0{self.seed}\0{label}".encode()
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
 
 @dataclass(frozen=True)
@@ -174,6 +265,7 @@ class ContinuousTask:
     evidence: IIDPermutationEvidence | None
     naive_score_min: float
     naive_score_max: float
+    naive_at_floor: AnchorRationale | None
 
     @classmethod
     def calibrated(
@@ -186,6 +278,7 @@ class ContinuousTask:
         evidence: IIDPermutationEvidence | None = None,
         naive_score_min: float = 1e-6,
         naive_score_max: float = 0.10,
+        naive_at_floor: AnchorRationale | None = None,
     ) -> "ContinuousTask":
         """Compose generated calibration with fully hand-authored evaluation."""
         return cls._create(
@@ -200,6 +293,7 @@ class ContinuousTask:
             evidence=evidence or IIDPermutationEvidence(),
             naive_score_min=naive_score_min,
             naive_score_max=naive_score_max,
+            naive_at_floor=naive_at_floor,
         )
 
     @classmethod
@@ -215,6 +309,7 @@ class ContinuousTask:
         evidence: IIDPermutationEvidence | None = None,
         naive_score_min: float = 1e-6,
         naive_score_max: float = 0.10,
+        naive_at_floor: AnchorRationale | None = None,
     ) -> "ContinuousTask":
         return cls._create(
             artifact=artifact,
@@ -228,6 +323,7 @@ class ContinuousTask:
             evidence=evidence or IIDPermutationEvidence(),
             naive_score_min=naive_score_min,
             naive_score_max=naive_score_max,
+            naive_at_floor=naive_at_floor,
         )
 
     @classmethod
@@ -243,6 +339,7 @@ class ContinuousTask:
         security_tier: str = "custom_reviewed",
         naive_score_min: float = 1e-6,
         naive_score_max: float = 0.10,
+        naive_at_floor: AnchorRationale | None = None,
     ) -> "ContinuousTask":
         if not callable(evaluate):
             raise TypeError("custom continuous evaluator must be callable")
@@ -258,6 +355,7 @@ class ContinuousTask:
             evidence=None,
             naive_score_min=naive_score_min,
             naive_score_max=naive_score_max,
+            naive_at_floor=naive_at_floor,
         )
 
     @classmethod
@@ -272,6 +370,7 @@ class ContinuousTask:
         evidence: IIDPermutationEvidence | None = None,
         naive_score_min: float = 1e-6,
         naive_score_max: float = 0.10,
+        naive_at_floor: AnchorRationale | None = None,
     ) -> "ContinuousTask":
         """Create a queryable model evaluated on a private post-commit bank."""
         return cls._create(
@@ -286,6 +385,7 @@ class ContinuousTask:
             evidence=evidence or IIDPermutationEvidence(),
             naive_score_min=naive_score_min,
             naive_score_max=naive_score_max,
+            naive_at_floor=naive_at_floor,
         )
 
     @classmethod
@@ -303,6 +403,7 @@ class ContinuousTask:
         evidence: IIDPermutationEvidence | None,
         naive_score_min: float,
         naive_score_max: float,
+        naive_at_floor: AnchorRationale | None,
     ) -> "ContinuousTask":
         normalized_targets = tuple(targets)
         if not normalized_targets:
@@ -352,6 +453,17 @@ class ContinuousTask:
                 "naive qualification range must satisfy "
                 "0 <= min < max < reference score 0.5"
             )
+        if naive_at_floor is not None:
+            if naive_at_floor.kind != "reviewed_exception":
+                raise ValueError(
+                    "naive_at_floor must use an AnchorRationale with "
+                    "kind='reviewed_exception'"
+                )
+            if naive_score_min != 0.0:
+                raise ValueError(
+                    "naive_at_floor requires naive_score_min=0 so only the null "
+                    "boundary becomes inclusive"
+                )
         return cls(
             artifact=artifact,
             challenge=challenge,
@@ -364,6 +476,7 @@ class ContinuousTask:
             evidence=evidence,
             naive_score_min=float(naive_score_min),
             naive_score_max=float(naive_score_max),
+            naive_at_floor=naive_at_floor,
         )
 
     def spec_dict(self) -> dict[str, Any]:
@@ -381,10 +494,18 @@ class ContinuousTask:
             "measurement_mode": (
                 "standard_adapter" if self.artifact is not None else "module_callback"
             ),
-            "naive_score_range": {
-                "exclusive_min": self.naive_score_min,
-                "inclusive_max": self.naive_score_max,
-            },
+            "naive_score_range": (
+                {
+                    "inclusive_min": self.naive_score_min,
+                    "inclusive_max": self.naive_score_max,
+                    "rationale": self.naive_at_floor.spec_dict(),
+                }
+                if self.naive_at_floor is not None
+                else {
+                    "exclusive_min": self.naive_score_min,
+                    "inclusive_max": self.naive_score_max,
+                }
+            ),
         }
 
     @property
@@ -451,7 +572,7 @@ class ContinuousTask:
                 f"{self.challenge.sample_size}"
             )
 
-        artifact_path = require_regular_file(workspace / self.artifact.path)
+        artifact_path = workspace / self.artifact.path
         try:
             committed_digest = workspace_artifact_digest(workspace)
         except (OSError, ValueError) as exc:
@@ -657,6 +778,11 @@ class ContinuousTask:
             input_digests=input_digests,
             naive_score_min=self.naive_score_min,
             naive_score_max=self.naive_score_max,
+            naive_at_floor=(
+                self.naive_at_floor.spec_dict()
+                if self.naive_at_floor is not None
+                else None
+            ),
         )
 
     def score_metrics(
@@ -669,6 +795,14 @@ class ContinuousTask:
         if lock.payload.get("evaluation_plan_sha256") != self.evaluation_plan.sha256:
             raise RuntimeError(
                 "calibration lock does not match the current evaluation plan"
+            )
+        expected_range = self.spec_dict()["naive_score_range"]
+        actual_range = (lock.payload.get("qualification") or {}).get(
+            "naive_score_range"
+        )
+        if actual_range != expected_range:
+            raise RuntimeError(
+                "calibration lock naive qualification range does not match the TASK"
             )
         normalized_weights = normalize_weights(self.targets)
         lock_targets = lock.payload.get("targets") or {}
@@ -910,6 +1044,7 @@ def _call_measurement_callback(
     *,
     workspace: Path,
     private: Path,
+    context: CalibrationMeasureContext | None,
 ) -> Mapping[str, Any]:
     signature = inspect.signature(callback)
     if not signature.parameters:
@@ -919,6 +1054,8 @@ def _call_measurement_callback(
         kwargs["workspace"] = workspace
     if "private" in signature.parameters:
         kwargs["private"] = private
+    if "context" in signature.parameters:
+        kwargs["context"] = context or CalibrationMeasureContext()
     if kwargs:
         return callback(**kwargs)
     return callback(workspace, private)
@@ -929,6 +1066,7 @@ def measure_task_module(
     *,
     workspace: Path,
     private: Path,
+    context: CalibrationMeasureContext | None = None,
 ) -> dict[str, float]:
     """Invoke custom module measurement or the optional standard adapter."""
     task = task_from_module(module)
@@ -948,6 +1086,7 @@ def measure_task_module(
         callback,
         workspace=workspace,
         private=private,
+        context=context,
     )
     if not isinstance(measured, Mapping):
         raise RuntimeError("measurement callback must return a metric mapping")
@@ -959,12 +1098,16 @@ def load_task_registration(grader_path: Path) -> ContinuousTask | None:
 
 
 __all__ = [
+    "CALIBRATION_SEED_ENV",
+    "PRODUCTION_EVALUATION_ENV",
+    "CalibrationMeasureContext",
     "ContinuousTask",
     "CsvRows",
     "GeneratedCalibration",
     "PrivateTableChallenge",
     "PythonPredictor",
-    "PRODUCTION_EVALUATION_ENV",
+    "WorkspaceDegenerateProbes",
+    "WorkspaceProbe",
     "load_task_module",
     "load_task_registration",
     "measure_task_module",

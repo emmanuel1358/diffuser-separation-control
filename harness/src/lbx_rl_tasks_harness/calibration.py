@@ -5,8 +5,10 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import os
 import shutil
+import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -26,7 +28,12 @@ from grading.evaluation import (
     load_task_registration,
     write_calibration_lock_atomic,
 )
+from grading.evaluation.context import (
+    MAX_COMMITTED_BYTES,
+    MAX_COMMITTED_FILES,
+)
 from grading.evaluation.lock import canonical_json_bytes
+from grading.evaluation.metrics import validate_metric_vector
 
 from lbx_rl_tasks_harness.models import HarnessProblem
 from lbx_rl_tasks_harness.runtimes.reference import (
@@ -69,11 +76,7 @@ class CalibrationGroundTruthResult:
 def _grader_source(problem: HarnessProblem) -> Path | None:
     if problem.source_problem_dir is None:
         return None
-    root = problem.source_problem_dir
-    test_file = root / "test_file.py"
-    if test_file.is_file():
-        return test_file
-    native = root / "scorer" / "compute_score.py"
+    native = problem.source_problem_dir / "scorer" / "compute_score.py"
     return native if native.is_file() else None
 
 
@@ -138,21 +141,18 @@ def calibration_input_digests(
     root = problem.source_problem_dir
     proof_path = root / PROOF_PATH
     proof = read_json(proof_path) if proof_path.is_file() else {}
-    reference_dir = root / (
-        "reference_solution" if (root / "reference_solution").is_dir() else "solution"
-    )
-    task_config = (
-        root / "task.toml" if (root / "task.toml").is_file() else root / "metadata.json"
-    )
-    return {
+    reference_dir = root / "solution"
+    inputs = {
         "task_spec": task.spec_sha256,
-        "task_config": _tree_sha256(task_config),
+        "task_config": _tree_sha256(root / "task.toml"),
         "environment": _tree_sha256(root / "environment"),
-        "dockerfile": _tree_sha256(root / "Dockerfile"),
-        "grader": _tree_sha256(_grader_source(problem) or root / "test_file.py"),
-        "data_generation": _tree_sha256(root / "data-generation"),
-        "public_data": _tree_sha256(root / "data" / "public"),
-        "private_data": _tree_sha256(root / "data" / "private"),
+        "dockerfile": _tree_sha256(root / "environment" / "Dockerfile"),
+        "grader": _tree_sha256(
+            _grader_source(problem) or root / "scorer" / "compute_score.py"
+        ),
+        "data_generation": _tree_sha256(root / "data_generation"),
+        "public_data": _tree_sha256(root / "data"),
+        "private_data": _tree_sha256(root / "scorer" / "data"),
         "reference_strategy": _tree_sha256(
             reference_dir, ignore_generated_strategy_outputs=True
         ),
@@ -162,6 +162,20 @@ def calibration_input_digests(
         "image": str(proof.get("image_digest") or ""),
         "base_image": str(proof.get("base_image_ref") or ""),
     }
+    provider = task.calibration.degenerate_probes
+    if provider is not None:
+        seen: dict[str, str] = {}
+        for probe in provider.probes:
+            probe_path = _validated_probe_source(root, probe.path)
+            digest = _secure_probe_digest(probe_path)
+            if digest in seen:
+                raise ValueError(
+                    f"degenerate probes {seen[digest]!r} and {probe.name!r} "
+                    "have identical workspace contents"
+                )
+            seen[digest] = probe.name
+            inputs[f"degenerate_probe:{probe.name}"] = digest
+    return inputs
 
 
 def calibration_cache_key(
@@ -245,10 +259,11 @@ def _read_grade_payload(verifier_dir: Path, score: float) -> dict[str, Any]:
     return {"score": score}
 
 
+_CALIBRATION_SEED = 0
 _DEGENERATE_SEED = 0
 
 
-def _measure_degenerate_family(
+def _measure_tabular_degenerate_family(
     problem: HarnessProblem,
     task: ContinuousTask,
     run_dir: Path,
@@ -267,10 +282,16 @@ def _measure_degenerate_family(
     import pandas as pd
 
     source = problem.source_problem_dir
-    public_dir = source / "data" / "public"
+    public_dir = source / "data"
     train_path = public_dir / "train.parquet"
     if not train_path.is_file():
         train_path = public_dir / "train.csv"
+    if not train_path.is_file():
+        raise ValueError(
+            "built-in tabular degenerate probes require data/train.parquet "
+            "or train.csv; declare GeneratedCalibration(degenerate_probes="
+            "WorkspaceDegenerateProbes(...)) for non-tabular tasks"
+        )
     train = (
         pd.read_parquet(train_path)
         if train_path.suffix == ".parquet"
@@ -278,13 +299,18 @@ def _measure_degenerate_family(
     )
     # Hand-authored (calibrated) tasks own submission loading and do not declare
     # a truth filename on TASK, so fall back to the conventional private target.
-    private_dir = source / "data" / "private"
+    private_dir = source / "scorer" / "data"
     if task.truth_filename is not None:
         truth_path = private_dir / task.truth_filename
     else:
         truth_path = private_dir / "test_target.parquet"
         if not truth_path.is_file():
             truth_path = private_dir / "test_target.csv"
+    if not truth_path.is_file():
+        raise ValueError(
+            "built-in tabular degenerate probes require a private truth table; "
+            "declare workspace degenerate probes for non-tabular tasks"
+        )
     truth = (
         pd.read_parquet(truth_path)
         if truth_path.suffix == ".parquet"
@@ -429,10 +455,231 @@ def _measure_degenerate_family(
             run_dir / "calibration" / f"degenerate-{name}-measure",
             run_dir / "calibration" / f"degenerate-{name}-measure.txt",
         )
-        measurements[name] = {
-            str(key): float(value) for key, value in measured["metrics"].items()
-        }
+        measurements[name] = _validated_measurement_metrics(
+            measured, task=task, label=f"degenerate probe {name!r}"
+        )
     return measurements
+
+
+def _validated_probe_source(task_root: Path, relative_path: str) -> Path:
+    source = task_root / relative_path
+    try:
+        info = os.lstat(source)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"degenerate probe workspace is missing: {relative_path}"
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError(
+            "degenerate probe root must be a real directory, not a symlink or "
+            f"special file: {relative_path}"
+        )
+    resolved = source.resolve(strict=True)
+    try:
+        resolved.relative_to(task_root.resolve(strict=True))
+    except ValueError as exc:
+        raise ValueError(
+            f"degenerate probe workspace escapes the task root: {relative_path}"
+        ) from exc
+    return resolved
+
+
+def _secure_probe_digest(source: Path) -> str:
+    """Hash a regular-file tree using no-follow file descriptors."""
+
+    entries: list[tuple[str, Path, os.stat_result]] = []
+    total_bytes = 0
+    for directory, dirnames, filenames in os.walk(source, followlinks=False):
+        directory_path = Path(directory)
+        for dirname in sorted(dirnames):
+            candidate = directory_path / dirname
+            if not stat.S_ISDIR(os.lstat(candidate).st_mode):
+                raise ValueError(
+                    "degenerate probe workspace contains a non-directory entry: "
+                    f"{candidate.relative_to(source).as_posix()}"
+                )
+        for filename in sorted(filenames):
+            candidate = directory_path / filename
+            info = os.lstat(candidate)
+            relative = candidate.relative_to(source).as_posix()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError(
+                    "degenerate probe workspace contains a non-regular entry: "
+                    f"{relative}"
+                )
+            total_bytes += int(info.st_size)
+            if total_bytes > MAX_COMMITTED_BYTES:
+                raise ValueError(
+                    f"degenerate probe workspace exceeds {MAX_COMMITTED_BYTES} bytes"
+                )
+            entries.append((relative, candidate, info))
+    if not entries:
+        raise ValueError(f"degenerate probe workspace is empty: {source}")
+    if len(entries) > MAX_COMMITTED_FILES:
+        raise ValueError(
+            f"degenerate probe workspace has {len(entries)} files, over limit "
+            f"{MAX_COMMITTED_FILES}"
+        )
+
+    digest = hashlib.sha256()
+    for relative, path, expected_info in sorted(entries):
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != expected_info.st_dev
+                or opened.st_ino != expected_info.st_ino
+                or opened.st_size != expected_info.st_size
+            ):
+                raise ValueError(f"degenerate probe changed while hashing: {relative}")
+            file_digest = hashlib.sha256()
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    file_digest.update(chunk)
+            relative_bytes = relative.encode("utf-8")
+            digest.update(len(relative_bytes).to_bytes(8, "big"))
+            digest.update(relative_bytes)
+            digest.update(int(opened.st_size).to_bytes(8, "big"))
+            digest.update(file_digest.digest())
+        finally:
+            os.close(fd)
+    return digest.hexdigest()
+
+
+def _secure_copy_probe_workspace(source: Path, destination: Path) -> str:
+    """Snapshot one committed probe without following non-regular entries."""
+
+    digest = _secure_probe_digest(source)
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        target = destination / relative
+        info = os.lstat(path)
+        if stat.S_ISDIR(info.st_mode):
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(
+                "degenerate probe workspace contains a non-regular entry: "
+                f"{relative.as_posix()}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError(
+                    "degenerate probe changed while being snapshotted: "
+                    f"{relative.as_posix()}"
+                )
+            with os.fdopen(fd, "rb", closefd=False) as source_handle:
+                with target.open("wb") as target_handle:
+                    shutil.copyfileobj(source_handle, target_handle)
+        finally:
+            os.close(fd)
+    if _secure_probe_digest(destination) != digest:
+        raise ValueError(f"degenerate probe snapshot digest changed: {source}")
+    return digest
+
+
+def _validated_measurement_metrics(
+    payload: dict[str, Any],
+    *,
+    task: ContinuousTask,
+    label: str,
+) -> dict[str, float]:
+    if payload.get("schema_version") != "raw-continuous-metrics.v1":
+        raise RuntimeError(f"{label} returned an unsupported raw-metric schema")
+    if payload.get("task_spec_sha256") != task.spec_sha256:
+        raise RuntimeError(f"{label} raw metrics were produced by a stale TASK")
+    if int(payload.get("calibration_seed", -1)) != _CALIBRATION_SEED:
+        raise RuntimeError(f"{label} did not use the shared calibration seed")
+    metrics = payload.get("metrics")
+    if not isinstance(metrics, dict):
+        raise RuntimeError(f"{label} raw metrics are missing")
+    return validate_metric_vector(task.targets, metrics)
+
+
+def _measure_workspace_degenerate_family(
+    problem: HarnessProblem,
+    task: ContinuousTask,
+    run_dir: Path,
+) -> dict[str, dict[str, float]]:
+    source_root = problem.source_problem_dir
+    if source_root is None or task.calibration.degenerate_probes is None:
+        raise ValueError("workspace degenerate probes are not configured")
+
+    measurements: dict[str, dict[str, float]] = {}
+    seen_digests: dict[str, str] = {}
+    for probe in sorted(
+        task.calibration.degenerate_probes.probes, key=lambda item: item.name
+    ):
+        source = _validated_probe_source(source_root, probe.path)
+        first_workspace = run_dir / "calibration" / f"degenerate-{probe.name}-first"
+        digest = _secure_copy_probe_workspace(source, first_workspace)
+        if digest in seen_digests:
+            raise ValueError(
+                f"degenerate probes {seen_digests[digest]!r} and {probe.name!r} "
+                "have identical workspace contents"
+            )
+        seen_digests[digest] = probe.name
+        first = measure_workspace_in_container(
+            problem,
+            first_workspace,
+            run_dir / "calibration" / f"degenerate-{probe.name}-first-measure",
+            run_dir / "calibration" / f"degenerate-{probe.name}-first-measure.txt",
+        )
+        first_metrics = _validated_measurement_metrics(
+            first, task=task, label=f"degenerate probe {probe.name!r}"
+        )
+
+        second_workspace = run_dir / "calibration" / f"degenerate-{probe.name}-second"
+        _secure_copy_probe_workspace(source, second_workspace)
+        second = measure_workspace_in_container(
+            problem,
+            second_workspace,
+            run_dir / "calibration" / f"degenerate-{probe.name}-second-measure",
+            run_dir / "calibration" / f"degenerate-{probe.name}-second-measure.txt",
+        )
+        second_metrics = _validated_measurement_metrics(
+            second, task=task, label=f"degenerate probe {probe.name!r} replay"
+        )
+        if any(
+            not math.isclose(
+                first_metrics[name],
+                second_metrics[name],
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            for name in first_metrics
+        ):
+            raise RuntimeError(
+                f"degenerate probe {probe.name!r} is nondeterministic under the "
+                "shared calibration context"
+            )
+        measurements[probe.name] = first_metrics
+    return measurements
+
+
+def _measure_degenerate_family(
+    problem: HarnessProblem,
+    task: ContinuousTask,
+    run_dir: Path,
+) -> dict[str, dict[str, float]]:
+    if task.calibration.degenerate_probes is not None:
+        return _measure_workspace_degenerate_family(problem, task, run_dir)
+    try:
+        return _measure_tabular_degenerate_family(problem, task, run_dir)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "built-in tabular degenerate probes could not construct numeric "
+            "submission tables; declare WorkspaceDegenerateProbes for this task"
+        ) from exc
 
 
 def _run_ml_calibrated_ground_truth_impl(
@@ -451,9 +698,7 @@ def _run_ml_calibrated_ground_truth_impl(
     if task is None:
         raise ValueError("problem does not define a v2 continuous TASK")
     source = problem.source_problem_dir
-    reference_strategy = source / (
-        "reference_solution" if (source / "reference_solution").is_dir() else "solution"
-    )
+    reference_strategy = source / "solution"
     naive_strategy = source / task.naive
     # Fail closed before any container solve: require train+weights+manifest and
     # an inference-only entrypoint. Never invoke training_entrypoint.
@@ -462,11 +707,7 @@ def _run_ml_calibrated_ground_truth_impl(
     )
     naive_contract = validate_ml_strategy_contract(naive_strategy, role="naive")
 
-    # Reference inference. ML metadata-mode tasks default "solution" to
-    # reference_solution; native tasks retain solution/solve.sh.
-    reference_dir = (
-        "reference_solution" if (source / "reference_solution").is_dir() else "solution"
-    )
+    reference_dir = "solution"
     reference_cache = (run_dir / "calibration" / "reference-cache").resolve()
     reference_problem = replace(
         problem,
@@ -497,6 +738,11 @@ def _run_ml_calibrated_ground_truth_impl(
         reference_artifacts,
         run_dir / "calibration" / "reference-measure",
         run_dir / "calibration" / "reference-measure.txt",
+    )
+    reference_metrics = _validated_measurement_metrics(
+        reference_measurement,
+        task=task,
+        label="reference strategy",
     )
 
     naive_workspace = run_dir / "calibration" / "naive-workspace"
@@ -532,14 +778,19 @@ def _run_ml_calibrated_ground_truth_impl(
         run_dir / "calibration" / "naive-measure",
         run_dir / "calibration" / "naive-measure.txt",
     )
+    naive_metrics = _validated_measurement_metrics(
+        naive_measurement,
+        task=task,
+        label="naive strategy",
+    )
 
     degenerate_measurements = _measure_degenerate_family(problem, task, run_dir)
 
     input_digests = calibration_input_digests(problem, task)
     cache_key = calibration_cache_key(problem, task)
     lock = task.build_lock(
-        reference_metrics=reference_measurement["metrics"],
-        naive_metrics=naive_measurement["metrics"],
+        reference_metrics=reference_metrics,
+        naive_metrics=naive_metrics,
         degenerate_metrics=degenerate_measurements,
         input_digests=input_digests,
     )
@@ -613,13 +864,9 @@ def _run_ml_calibrated_ground_truth_impl(
         cache_key=cache_key,
         input_digests=input_digests,
         reference_metrics={
-            str(key): float(value)
-            for key, value in reference_measurement["metrics"].items()
+            str(key): float(value) for key, value in reference_metrics.items()
         },
-        naive_metrics={
-            str(key): float(value)
-            for key, value in naive_measurement["metrics"].items()
-        },
+        naive_metrics={str(key): float(value) for key, value in naive_metrics.items()},
     )
 
 

@@ -33,8 +33,8 @@ STARTER_TEMPLATES = (
 # by the validator stage name (see TaskValidator.validate).
 STAGE_HINTS: dict[str, str] = {
     "schema": (
-        "task.toml / metadata.json shape problem. Confirm required files exist; "
-        "ml tasks must set allow_internet = false (locked off for ml)."
+        "task.toml shape problem. Confirm required files exist; ml tasks must "
+        "set allow_internet = false (locked off for ml)."
     ),
     "prompt_runtime_references": (
         "instruction.md references runtime details it shouldn't pin (e.g. exact "
@@ -56,7 +56,7 @@ STAGE_HINTS: dict[str, str] = {
         "Continuous ML strategies must commit train.py + trained weights + "
         "model.manifest.json, and solution.py/solve.sh must be inference-only "
         "(load committed model; never train on the seal/ground-truth path). "
-        "See docs/MLENVS_TASKS.md §4 and examples/mle-tabular-classification/."
+        "See docs/ML_TASKS.md §4 and examples/mle-tabular-classification/."
     ),
     "continuous_calibration": (
         "Continuous calibration lock/evidence failed. Regenerate with "

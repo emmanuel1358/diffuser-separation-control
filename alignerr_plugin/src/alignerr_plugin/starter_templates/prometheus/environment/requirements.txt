@@ -1,0 +1,13 @@
+# Agent-visible task dependencies, installed into /opt/lbx-runtime/.venv by
+# /opt/lbx-runtime/install-task-deps.sh. One pip spec per line.
+#
+# The base image already carries the shared ML and numerical-solver stack --
+# see docs/NUMERICAL_SOLVERS.md before adding anything. Declare what the base
+# does not have here; never edit base/.
+#
+# Grader-only packages go in scorer/requirements.txt and hidden-env-only
+# packages in scorer/env-requirements.txt, so their names stay out of the
+# agent-visible runtime venv. Apt packages go in environment/apt.txt.
+#
+# Example:
+# shapely

@@ -1,0 +1,6 @@
+# Agent-visible task dependencies, installed into the runtime venv.
+# pandas/pyarrow read the parquet inputs; scikit-learn is the baseline modeling
+# stack the reference and baselines train with.
+pandas
+pyarrow
+scikit-learn

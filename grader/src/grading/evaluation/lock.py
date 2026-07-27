@@ -7,9 +7,10 @@ import json
 import math
 import os
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from grading.calibration import PiecewiseLinearCurve
 from grading.evaluation.metrics import (
@@ -108,6 +109,48 @@ def _aggregate_progress(
     )
 
 
+def _validate_naive_at_floor_rationale(
+    rationale: Mapping[str, Any] | None,
+) -> dict[str, str] | None:
+    if rationale is None:
+        return None
+    if (
+        rationale.get("kind") != "reviewed_exception"
+        or not isinstance(rationale.get("summary"), str)
+        or len(str(rationale["summary"]).strip()) < 20
+    ):
+        raise ValueError(
+            "inclusive naive floor requires a reviewed_exception rationale "
+            "with a summary of at least 20 characters"
+        )
+    normalized = {
+        "kind": "reviewed_exception",
+        "summary": str(rationale["summary"]).strip(),
+    }
+    source = rationale.get("source")
+    if source is not None:
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("inclusive naive floor rationale source must be non-empty")
+        normalized["source"] = source.strip()
+    return normalized
+
+
+def _naive_ties_effective_floors(
+    targets: tuple[MetricTarget, ...],
+    ceilings: Mapping[str, float],
+    naive: Mapping[str, float],
+) -> bool:
+    return all(
+        math.isclose(
+            float(naive[target.name]),
+            effective_floor(target, float(ceilings[target.name])),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        )
+        for target in targets
+    )
+
+
 def build_calibration_lock(
     *,
     task_spec_sha256: str,
@@ -120,6 +163,7 @@ def build_calibration_lock(
     input_digests: Mapping[str, str],
     naive_score_min: float = 1e-6,
     naive_score_max: float = 0.10,
+    naive_at_floor: Mapping[str, Any] | None = None,
 ) -> CalibrationLock:
     """Build a canonical quality lock plus auditable no-information probes.
 
@@ -182,14 +226,30 @@ def build_calibration_lock(
     naive_quality_progress = _aggregate_progress(targets, naive)
     naive_progress = _aggregate_progress(qualification_targets, naive)
     naive_score = curve.score(naive_progress)
-    if not (
-        math.isfinite(naive_score) and naive_score_min < naive_score <= naive_score_max
-    ):
+    floor_rationale = _validate_naive_at_floor_rationale(naive_at_floor)
+    if floor_rationale is not None:
+        lower_ok = (
+            naive_score_min == 0.0
+            and math.isclose(naive_score, 0.0, abs_tol=1e-12)
+            and _naive_ties_effective_floors(targets, ceilings, naive)
+        )
+        interval = f"[{naive_score_min:.6g}, {naive_score_max:.6g}]"
+    else:
+        lower_ok = naive_score_min < naive_score
+        interval = f"({naive_score_min:.6g}, {naive_score_max:.6g}]"
+    if not (math.isfinite(naive_score) and lower_ok and naive_score <= naive_score_max):
         raise ValueError(
             "naive baseline must be weak but informative: expected score in "
-            f"({naive_score_min:.6g}, {naive_score_max:.6g}], got "
-            f"{naive_score:.6g}"
+            f"{interval}, got {naive_score:.6g}"
         )
+    naive_score_range: dict[str, Any] = {
+        (
+            "inclusive_min" if floor_rationale is not None else "exclusive_min"
+        ): naive_score_min,
+        "inclusive_max": naive_score_max,
+    }
+    if floor_rationale is not None:
+        naive_score_range["rationale"] = floor_rationale
 
     payload: dict[str, Any] = {
         "schema_version": CALIBRATION_LOCK_SCHEMA,
@@ -224,10 +284,7 @@ def build_calibration_lock(
             "naive_progress": naive_progress,
             "naive_quality_progress": naive_quality_progress,
             "naive_score": naive_score,
-            "naive_score_range": {
-                "exclusive_min": naive_score_min,
-                "inclusive_max": naive_score_max,
-            },
+            "naive_score_range": naive_score_range,
             "reference_score": curve.score(x_ref),
             "oracle_score": curve.score(1.0),
             "null_score": curve.score(0.0),
@@ -275,6 +332,91 @@ def _aggregate_from_payload(
         float(spec["weight"]) * _progress_from_spec(spec, float(metrics[name]))
         for name, spec in targets.items()
     )
+
+
+def _validate_naive_score_range(
+    qualification: Mapping[str, Any],
+    targets: Mapping[str, Mapping[str, Any]],
+    naive: Mapping[str, Any],
+    *,
+    naive_score: float,
+) -> None:
+    score_range = qualification.get("naive_score_range")
+    if not isinstance(score_range, Mapping):
+        raise ValueError("calibration lock is missing qualification.naive_score_range")
+    has_exclusive = "exclusive_min" in score_range
+    has_inclusive = "inclusive_min" in score_range
+    if has_exclusive == has_inclusive:
+        raise ValueError(
+            "calibration lock naive score range must declare exactly one of "
+            "exclusive_min or inclusive_min"
+        )
+    expected_keys = (
+        {"exclusive_min", "inclusive_max"}
+        if has_exclusive
+        else {"inclusive_min", "inclusive_max", "rationale"}
+    )
+    if set(score_range) != expected_keys:
+        raise ValueError(
+            "calibration lock naive score range has unexpected fields: "
+            f"{sorted(set(score_range) - expected_keys)}"
+        )
+    try:
+        minimum = float(
+            score_range["exclusive_min" if has_exclusive else "inclusive_min"]
+        )
+        maximum = float(score_range["inclusive_max"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("calibration lock naive score range must be numeric") from exc
+    if not (
+        math.isfinite(minimum)
+        and math.isfinite(maximum)
+        and 0.0 <= minimum < maximum < 0.5
+    ):
+        raise ValueError(
+            "calibration lock naive score range must satisfy "
+            "0 <= min < max < reference score 0.5"
+        )
+
+    if has_exclusive:
+        lower_ok = minimum < naive_score
+    else:
+        _validate_naive_at_floor_rationale(score_range.get("rationale"))
+        if minimum != 0.0:
+            raise ValueError(
+                "inclusive naive score minimum is allowed only at the zero boundary"
+            )
+        lower_ok = math.isclose(naive_score, minimum, abs_tol=1e-12)
+        ties = all(
+            math.isclose(
+                float(naive[name]),
+                (
+                    min(
+                        float(spec["raw_floor"]),
+                        float(spec["no_info_ceiling"]),
+                    )
+                    if str(spec["direction"]) == "lower"
+                    else max(
+                        float(spec["raw_floor"]),
+                        float(spec["no_info_ceiling"]),
+                    )
+                ),
+                rel_tol=1e-12,
+                abs_tol=1e-12,
+            )
+            for name, spec in targets.items()
+        )
+        if not ties:
+            raise ValueError(
+                "inclusive naive floor requires every naive metric to tie its "
+                "effective no-information floor"
+            )
+    if not (math.isfinite(naive_score) and lower_ok and naive_score <= maximum):
+        bracket = "[" if has_inclusive else "("
+        raise ValueError(
+            "calibration lock naive score does not satisfy its qualification "
+            f"range {bracket}{minimum:.6g}, {maximum:.6g}]"
+        )
 
 
 def validate_calibration_lock(
@@ -452,6 +594,12 @@ def validate_calibration_lock(
                 f"calibration lock qualification is missing {field}"
             ) from exc
         _close(actual, expected, field=f"qualification.{field}")
+    _validate_naive_score_range(
+        qualification,
+        targets,
+        naive,
+        naive_score=float(expected_qualification["naive_score"]),
+    )
 
     degenerate_scores = qualification.get("degenerate_scores")
     if not isinstance(degenerate_scores, Mapping) or set(degenerate_scores) != set(
@@ -474,11 +622,54 @@ def validate_calibration_lock(
     return CalibrationLock(payload=normalized, sha256=canonical_sha256(normalized))
 
 
-def resolve_calibration_lock_path(filename: str = DEFAULT_LOCK_FILENAME) -> Path:
+def calibration_lock_candidates(filename: str = DEFAULT_LOCK_FILENAME) -> list[Path]:
+    """Every path the sealed lock may legitimately occupy, most specific first.
+
+    The per-task image always has it at RUNTIME_LOCK_ROOT, but mothership's
+    agent-service lane ships it inside an uploaded bundle and the runner decides
+    where that bundle lands. The lane exported one absolute guess, the runner
+    extracted a level deeper, and every continuous task scored 0.0 with
+    "calibration lock is missing". Treat the exported path as the primary answer
+    and the bundle-root variants as fallbacks, so neither side has to know the
+    other's layout.
+
+    The two sets are deliberately disjoint. RUNTIME_LOCK_ROOT on a task image is
+    the author's own calibration, shipped beside an ``.author-source`` marker
+    precisely so it is never mistaken for a sealed one. A caller that named a
+    sealed bundle lock and did not get it must fail closed, not quietly grade
+    against author numbers, so an override searches only bundle locations.
+    """
+
+    name = Path(filename).name
+    candidates: list[Path] = []
     override = os.environ.get(CALIBRATION_LOCK_PATH_ENV)
     if override:
-        return Path(override)
-    return RUNTIME_LOCK_ROOT / Path(filename).name
+        primary = Path(override)
+        candidates.append(primary)
+        arc = Path(primary.parent.name) / name
+        assumed_root = primary.parent.parent
+        if str(assumed_root) not in {"", ".", "/"}:
+            # The runner extracts the bundle into a subdirectory of the root the
+            # lane assumed (/workspace -> /workspace/workspace).
+            candidates.append(assumed_root / assumed_root.name / arc)
+            # Or the lane over-qualified the path and the arc sits one up.
+            candidates.append(assumed_root.parent / arc)
+    else:
+        candidates.append(RUNTIME_LOCK_ROOT / name)
+
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def resolve_calibration_lock_path(filename: str = DEFAULT_LOCK_FILENAME) -> Path:
+    candidates = calibration_lock_candidates(filename)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
 
 
 def load_calibration_lock(
@@ -491,8 +682,13 @@ def load_calibration_lock(
     try:
         payload = json.loads(resolved.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
+        searched = (
+            [resolved] if path is not None else calibration_lock_candidates(filename)
+        )
+        locations = ", ".join(str(candidate) for candidate in searched)
         raise RuntimeError(
-            f"calibration lock is missing at {resolved}; run the ML ground-truth workflow"
+            f"calibration lock is missing (searched {locations}); "
+            "run the ML ground-truth workflow"
         ) from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(

@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from alignerr_plugin.local_runtime import SLIM_FALLBACK_TURN_BONUS
-
 from lbx_rl_tasks_harness.docker import (
     build_task_image,
     copy_output_from_container,
@@ -77,7 +75,6 @@ async def run_deepagents(
     transcript_path: Path,
     model_name: str | None = None,
     max_steps: int | None = None,
-    flavor: str = "auto",
 ) -> dict[str, Any]:
     task_model = problem.metadata.get("runner", {}).get("api_model_name")
     effective_model = model_name or default_model_from_env(
@@ -95,16 +92,8 @@ async def run_deepagents(
             "DeepAgents runtime dependencies are missing. Install with `uv sync`."
         ) from exc
 
-    build = build_task_image(problem, flavor=flavor)
+    build = build_task_image(problem)
     image_tag = build.image_tag
-    if build.flavor_fallback and max_steps is not None:
-        # Slim fallback: extend the step cap to offset runtime pip-install overhead.
-        max_steps = max_steps + SLIM_FALLBACK_TURN_BONUS
-        print(
-            f"[slim fallback] agent step budget bumped to {max_steps} "
-            f"(+{SLIM_FALLBACK_TURN_BONUS}).",
-            flush=True,
-        )
     started = start_task_container(image_tag)
     try:
         async with RubricMcpBridge(started.container_id) as bridge:

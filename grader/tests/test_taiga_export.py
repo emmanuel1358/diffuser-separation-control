@@ -18,6 +18,8 @@ import pytest
 from alignerr_plugin.ground_truth import sha256_file
 from alignerr_plugin.preloaded import PRELOADED_MANIFEST_PATH, manifest_entry
 from alignerr_plugin.exporters.taiga import (
+    QA_CPU_RESOURCE_ENV,
+    _accelerator_notice,
     _derive_resources_from_toml,
     _max_required_resources,
     _task_type_hint,
@@ -26,6 +28,7 @@ from alignerr_plugin.exporters.taiga import (
     build_job_payload,
     derive_taiga_resources,
     export_taiga,
+    qa_cpu_flavor_for,
 )
 from alignerr_plugin.schemas import (
     Difficulty,
@@ -101,9 +104,18 @@ to `/tmp/output/submission.csv` with a header row and columns `t1`, `t2`,
 """
 
 
-def _write_native_ml_task(problem_dir: Path) -> Path:
+def _write_native_ml_task(
+    problem_dir: Path,
+    *,
+    required_resources: str = "12vcpu+100gib+h100/2",
+    instruction: str = _NATIVE_ML_TASK_INSTRUCTION,
+) -> Path:
     problem_dir.mkdir(parents=True, exist_ok=True)
-    (problem_dir / "task.toml").write_text(_NATIVE_ML_TASK_TOML)
+    task_toml = _NATIVE_ML_TASK_TOML.replace(
+        'required_resources = "12vcpu+100gib+h100/2"',
+        f'required_resources = "{required_resources}"',
+    )
+    (problem_dir / "task.toml").write_text(task_toml)
     (problem_dir / "metadata.json").write_text(
         json.dumps(
             {
@@ -115,32 +127,11 @@ def _write_native_ml_task(problem_dir: Path) -> Path:
             }
         )
     )
-    (problem_dir / "instruction.md").write_text(_NATIVE_ML_TASK_INSTRUCTION)
-    return problem_dir
-
-
-def _write_mlenvs_ml_task(
-    problem_dir: Path,
-    *,
-    required_resources: str = "12vcpu+100gib+h100/2",
-    prompt: str = "Write /tmp/output/submission.csv.\n",
-) -> Path:
-    """Write a minimal ML_Envs-mode task; the export runs it through the real
-    conversion, so these tests exercise the production ml export path."""
-    problem_dir.mkdir(parents=True, exist_ok=True)
-    (problem_dir / "metadata.json").write_text(
-        json.dumps(
-            {
-                "ml_task_type": "dataset",
-                "required_resources": required_resources,
-                "domain": "scientific_discovery_computational_science",
-                "license": "CC0-1.0",
-                "license_source": "https://creativecommons.org/publicdomain/zero/1.0/",
-            }
-        )
+    (problem_dir / "instruction.md").write_text(instruction)
+    (problem_dir / "scorer").mkdir(exist_ok=True)
+    (problem_dir / "scorer" / "compute_score.py").write_text(
+        "def compute_score(workspace, trajectory, private):\n    return 0.0\n"
     )
-    (problem_dir / "prompt.md").write_text(prompt)
-    (problem_dir / "test_file.py").write_text("def compute_score():\n    return 0.0\n")
     return problem_dir
 
 
@@ -275,7 +266,7 @@ def test_export_cpu_task_runs_under_firecracker(template_examples: Path) -> None
 def test_export_gpu_task_runs_under_gvisor(tmp_path: Path) -> None:
     # Accelerator tasks must export gVisor, not the firecracker default (which
     # would fail on Taiga's GPU nodes).
-    problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-gvisor")
+    problem_dir = _write_native_ml_task(tmp_path / "mle-gvisor")
     p = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
     problem_set = p["problems_metadata"]["problem_set"]
     problem = problem_set["problems"][0]
@@ -297,7 +288,7 @@ def test_export_cpu_task_injects_tmux_notice_only(template_examples: Path) -> No
 
 
 def test_export_gpu_task_injects_gpu_and_tmux_notices(tmp_path: Path) -> None:
-    problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-no-runtime-guidance")
+    problem_dir = _write_native_ml_task(tmp_path / "mle-no-runtime-guidance")
     p = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
     problem = p["problems_metadata"]["problem_set"]["problems"][0]
     prompt = problem["task_prompt"]
@@ -307,7 +298,7 @@ def test_export_gpu_task_injects_gpu_and_tmux_notices(tmp_path: Path) -> None:
 
 
 def test_export_tpu_task_injects_tpu_notice(tmp_path: Path) -> None:
-    problem_dir = _write_mlenvs_ml_task(
+    problem_dir = _write_native_ml_task(
         tmp_path / "mle-tpu", required_resources="13vcpu+32gib+tpuv5e1x1"
     )
     p = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
@@ -341,9 +332,9 @@ def test_export_tpu_task_rejects_unsupported_resource_request(
 def test_export_accelerator_notice_appends_despite_authored_guidance(
     tmp_path: Path,
 ) -> None:
-    problem_dir = _write_mlenvs_ml_task(
+    problem_dir = _write_native_ml_task(
         tmp_path / "mle-with-guidance",
-        prompt="Use the GPU and keep long runs in tmux. Write /tmp/output/submission.csv.\n",
+        instruction="Use the GPU and keep long runs in tmux. Write /tmp/output/submission.csv.\n",
     )
     p = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
     problem = p["problems_metadata"]["problem_set"]["problems"][0]
@@ -353,10 +344,10 @@ def test_export_accelerator_notice_appends_despite_authored_guidance(
 
 
 def test_export_tpu_notice_not_suppressed_by_gpu_wording(tmp_path: Path) -> None:
-    problem_dir = _write_mlenvs_ml_task(
+    problem_dir = _write_native_ml_task(
         tmp_path / "mle-tpu-with-gpu-word",
         required_resources="13vcpu+32gib+tpuv5e1x1",
-        prompt="The starter mentions GPU in passing. Write /tmp/output/submission.csv.\n",
+        instruction="The starter mentions GPU in passing. Write /tmp/output/submission.csv.\n",
     )
     p = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
     problem = p["problems_metadata"]["problem_set"]["problems"][0]
@@ -365,9 +356,9 @@ def test_export_tpu_notice_not_suppressed_by_gpu_wording(tmp_path: Path) -> None
 
 
 def test_export_gpu_notice_not_suppressed_by_tpu_wording(tmp_path: Path) -> None:
-    problem_dir = _write_mlenvs_ml_task(
+    problem_dir = _write_native_ml_task(
         tmp_path / "mle-gpu-with-tpu-word",
-        prompt="This is not a TPU task. Write /tmp/output/submission.csv.\n",
+        instruction="This is not a TPU task. Write /tmp/output/submission.csv.\n",
     )
     p = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
     problem = p["problems_metadata"]["problem_set"]["problems"][0]
@@ -525,11 +516,10 @@ def test_prometheus_numerical_solver_taiga_export_uses_native_hint(
     }
 
 
-# The ml starter is ML_Envs mode (pinned /tmp/output, no per-task [[outputs]]),
-# so it is not part of this native [[outputs]] parametrization.
 @pytest.mark.parametrize(
     "starter_name",
     [
+        "ml",
         "mujoco",
         "cfd",
         "structures",
@@ -684,7 +674,7 @@ def test_build_job_payload_includes_redacted_ground_truth_evidence(
 def test_build_job_payload_omits_ground_truth_evidence_without_proof(
     tmp_path: Path,
 ) -> None:
-    problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-no-proof")
+    problem_dir = _write_native_ml_task(tmp_path / "mle-no-proof")
     p = build_job_payload(problem_dir, image_ref="gcr.io/example/img@sha256:abc")
 
     problem = p["problems_metadata"]["problem_set"]["problems"][0]
@@ -697,7 +687,7 @@ def test_trusted_export_rejects_continuous_task_without_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-missing-evidence")
+    problem_dir = _write_native_ml_task(tmp_path / "mle-missing-evidence")
     monkeypatch.setenv("LBX_REQUIRE_TRUSTED_CONTINUOUS_EVALUATION", "1")
 
     with pytest.raises(ValueError, match="requires trusted calibration"):
@@ -711,7 +701,7 @@ def test_build_job_payload_includes_calibration_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-calibration")
+    problem_dir = _write_native_ml_task(tmp_path / "mle-calibration")
     trusted_dir = tmp_path / "trusted-calibration"
     trusted_dir.mkdir()
     lock = {
@@ -822,7 +812,6 @@ def test_build_job_payload_rejects_stale_lock_for_continuous_task(
 def test_build_job_payload_includes_native_evaluation_plan(tmp_path: Path) -> None:
     problem_dir = _write_native_ml_task(tmp_path / "native-evaluation")
     scorer = problem_dir / "scorer"
-    scorer.mkdir()
     plan = {
         "schema_version": "continuous-evaluation-plan.v1",
         "security_tier": "sealed_challenge",
@@ -849,7 +838,7 @@ def test_build_job_payload_includes_native_evaluation_plan(tmp_path: Path) -> No
 def test_build_job_payload_uses_reward_type_for_continuous_ground_truth(
     tmp_path: Path,
 ) -> None:
-    problem_dir = _write_mlenvs_ml_task(tmp_path / "mle-gt")
+    problem_dir = _write_native_ml_task(tmp_path / "mle-gt")
     proof_dir = problem_dir / ".alignerr"
     proof_dir.mkdir(exist_ok=True)
     (proof_dir / "build_proof.json").write_text(
@@ -1012,3 +1001,117 @@ def test_export_taiga_writes_legacy_problems_metadata(
     assert sidecar["base_flavor"] == "cpu"
     assert sidecar["base_image"].endswith("/lbx-tasks-base")
     assert sidecar["base_image_ref"] == f"{sidecar['base_image']}:{sidecar['base_tag']}"
+
+
+# --- CPU QA lane: LBX_TAIGA_QA_CPU_RESOURCE override ------------------------
+
+QA_CPU_TIER = "8vcpu+64gib"
+
+
+def test_qa_cpu_flavor_for_maps_every_flavor_to_the_native_cpu_base():
+    # Every task now builds on a flagship native base, so the CPU QA lane has a
+    # single fallback: there is no accelerator-specific CPU variant to pick.
+    for flavor in (
+        "gpu",
+        "tpu",
+        "cuda-graphics",
+        "cpu",
+        "gpu-openroad",
+        "gpu-blackwell",
+    ):
+        assert qa_cpu_flavor_for(flavor) == "cpu"
+
+
+@pytest.mark.parametrize(
+    "tier,declared,flavor",
+    [
+        ("12vcpu+100gib+h100/2", "auto", "gpu"),
+        ("13vcpu+32gib+tpuv5e1x1", "auto", "tpu"),
+        ("4vcpu+16gib", "auto", "cpu"),
+        ("12vcpu+100gib+h100/2+graphics", "cuda-graphics", "cuda-graphics"),
+    ],
+)
+def test_no_override_leaves_the_declared_tier_untouched(
+    monkeypatch, tier, declared, flavor
+):
+    monkeypatch.delenv(QA_CPU_RESOURCE_ENV, raising=False)
+    resources = _derive_resources_from_toml(
+        _resource_task_toml(tier, base_flavor=declared)
+    )
+    assert resources["required_resources"] == tier
+    assert resources["base_flavor"] == flavor
+
+
+def test_override_forces_cpu_tier_and_native_cpu_base(monkeypatch):
+    monkeypatch.setenv(QA_CPU_RESOURCE_ENV, QA_CPU_TIER)
+    resources = _derive_resources_from_toml(
+        _resource_task_toml("13vcpu+32gib+tpuv5e1x1")
+    )
+    assert resources["required_resources"] == QA_CPU_TIER
+    assert resources["base_flavor"] == "cpu"
+    # The image/tag follow the swapped flavor, not the declared TPU one.
+    assert resources["base_image"].endswith("/lbx-tasks-base")
+    assert (
+        resources["base_image_ref"]
+        == f"{resources['base_image']}:{resources['base_tag']}"
+    )
+
+
+def test_override_swaps_an_explicit_accelerator_flavor_to_native_cpu(monkeypatch):
+    monkeypatch.setenv(QA_CPU_RESOURCE_ENV, QA_CPU_TIER)
+    # An explicitly declared accelerator flavor must not survive the CPU QA lane:
+    # the JAX-only tpu base has no CPU tier to run on.
+    resources = _derive_resources_from_toml(
+        _resource_task_toml("13vcpu+32gib+tpuv5e1x1", base_flavor="tpu")
+    )
+    assert resources["required_resources"] == QA_CPU_TIER
+    assert resources["base_flavor"] == "cpu"
+    assert resources["base_image"].endswith("/lbx-tasks-base")
+
+
+def test_override_rejects_an_accelerator_tier(monkeypatch):
+    # The QA lane is the one lane that submits without the deploy-to-taiga reviewer
+    # gate, so a misconfigured tier must refuse to export rather than quietly
+    # auto-submitting scarce compute.
+    for bad in ("12vcpu+100gib+h100/2", "13vcpu+32gib+tpuv5e1x1"):
+        monkeypatch.setenv(QA_CPU_RESOURCE_ENV, bad)
+        with pytest.raises(ValueError, match="must be a CPU required_resources tier"):
+            _derive_resources_from_toml(_resource_task_toml("12vcpu+100gib+h100/2"))
+
+
+def test_override_rejects_a_tier_outside_the_enum(monkeypatch):
+    monkeypatch.setenv(QA_CPU_RESOURCE_ENV, "999vcpu+1gib")
+    with pytest.raises(ValueError):
+        _derive_resources_from_toml(_resource_task_toml("4vcpu+16gib"))
+
+
+def test_blank_override_is_ignored(monkeypatch):
+    monkeypatch.setenv(QA_CPU_RESOURCE_ENV, "   ")
+    resources = _derive_resources_from_toml(_resource_task_toml("12vcpu+100gib+h100/2"))
+    assert resources["required_resources"] == "12vcpu+100gib+h100/2"
+    assert resources["base_flavor"] == "gpu"
+
+
+def test_override_still_validates_a_bogus_declared_flavor(monkeypatch):
+    # The declared flavor is resolved against the ORIGINAL tier first, so an
+    # author's mistake is not masked by the CPU swap.
+    monkeypatch.setenv(QA_CPU_RESOURCE_ENV, QA_CPU_TIER)
+    with pytest.raises(ValueError, match="unknown base_flavor"):
+        _derive_resources_from_toml(
+            _resource_task_toml("12vcpu+100gib+h100/2", base_flavor="not-a-flavor")
+        )
+
+
+def test_override_drops_the_agent_facing_accelerator_notice(monkeypatch):
+    # The prompt notice is derived from required_resources, so forcing CPU at this
+    # one point also stops promising the agent a GPU/TPU it will not have.
+    monkeypatch.setenv(QA_CPU_RESOURCE_ENV, QA_CPU_TIER)
+    resources = _derive_resources_from_toml(_resource_task_toml("12vcpu+100gib+h100/2"))
+    assert _accelerator_notice(resources["required_resources"]) == ""
+    assert _accelerator_notice("12vcpu+100gib+h100/2") != ""
+
+
+def test_override_switches_container_runtime_to_firecracker(monkeypatch):
+    monkeypatch.setenv(QA_CPU_RESOURCE_ENV, QA_CPU_TIER)
+    resources = _derive_resources_from_toml(_resource_task_toml("12vcpu+100gib+h100/2"))
+    assert _taiga_container_runtime(resources["required_resources"]) == "firecracker"

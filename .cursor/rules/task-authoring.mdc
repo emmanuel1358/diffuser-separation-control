@@ -25,10 +25,13 @@ alwaysApply: false
 - `task_type` values are `ml`, `mujoco`, `cfd`, `structures`; `domain` is scoped by task type and includes multiple values per type (see `alignerr_plugin.task_metadata`).
 - `reward_type` values are `continuous_scoring_function` (reference target `0.5 ± 0.05`) and `multi_deterministic_rubrics` (oracle target `1.0`).
 - `ml` tasks must declare `[difficulty].license`: a permissive SPDX id from `task_metadata.LICENSES` (MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unlicense, CC0-1.0, CC-BY-4.0, PDDL-1.0, UPL-1.0), or `not_applicable` for edge cases with no external dataset. Trace the license upstream; copyleft / non-commercial / research-only data is rejected. Other task types may omit it.
-- For ML_Envs-style tasks (dataset/CSV, model module, executable, HDF5, k-fold), read submissions via the sanctioned loaders and calibrate with `grading.calibration`; see `docs/MLENVS_TASKS.md`.
+- For continuous-scored ml tasks (dataset/CSV, model module, executable, HDF5,
+  k-fold), read submissions via sanctioned component-safe loaders (use
+  `open_submission_file_or_fault` for a custom parser) and calibrate with
+  `grading.calibration`; see `docs/ML_TASKS.md`.
 - Respect the reward-hacking mitigations in `docs/REWARD_HACKING.md`: never trust agent stdout, never exec/pickle agent artifacts in the grader, and use the AgentFault keep-vs-discard discipline. `lbx-rl-template validate` enforces the blocking `agent_fault` stage.
 - Select a base image with `[environment].base_flavor` (`auto` default, or compatible `cpu`/`gpu`/`gpu-openroad`/`cuda-graphics`/`tpu`). Use `gpu-openroad` only for EDA/OpenROAD tasks with a non-graphics H100 enum and `cuda-graphics` for rendering (hardware GL is not deployable under gVisor; CUDA-native raster is). Bases are tagged with a content drift hash by `base/build_and_push.sh`.
-- Mount large datasets / model weights with `[[preloaded_files]]` (a local `source` tree or an `hf_repo`) instead of baking them into the image; `scripts/sync_mount.sh` packs/uploads/stamps and the exporter emits the manifest. See `docs/MLENVS_TASKS.md`.
+- Mount large datasets / model weights with `[[preloaded_files]]` (a local `source` tree or an `hf_repo`) instead of baking them into the image; `scripts/sync_mount.sh` packs/uploads/stamps and the exporter emits the manifest. See `docs/ML_TASKS.md`.
 - For numerical-solver tasks (CFD/structures), use the in-base solver stack; see the `numerical-solvers` rule, `docs/NUMERICAL_SOLVERS.md`, `project_guidelines/cfd/cfd_environments.md`, and `examples/openfoam-hydrofoil-flap`.
 - `mujoco` tasks must declare `[ground_truth]` in `task.toml` and generate at least one required reviewer video.
 - Any task type (not just `mujoco`) can attach a reviewer video by declaring `[ground_truth].render_outputs` (named `rendering.mp4`, exactly `1280x720` h264). For tasks whose grader/renderer needs a base-image-only engine (OpenFOAM/SU2/Meep/OpenROAD), set `[ground_truth].in_container = true` so solve+grade+render run inside the task image.

@@ -63,6 +63,13 @@ def compute_score(workspace, trajectory, private):
     return score_from(env, action)
 ```
 
+If this grader uses `ContinuousTask.calibrated()` and generated locks (rather
+than `PolicyEvaluationTask` paired controls), declare task-specific committed
+no-op/fixed/open-loop/seeded-random output workspaces with
+`WorkspaceDegenerateProbes` under `baselines/degenerate/`. There is no generic
+hidden-env policy interface, so never ask the framework to infer these probes
+from `hidden_env` or `ml_task_type`.
+
 ## What runs where (don't fight it)
 
 - Boot: the rubric MCP server calls `supervise_if_enabled()`, reads

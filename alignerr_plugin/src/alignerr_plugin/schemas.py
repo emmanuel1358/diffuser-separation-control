@@ -1,5 +1,6 @@
 """Shared schemas for the universal task plugin."""
 
+import re
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
@@ -7,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from alignerr_plugin.delivery import normalize_delivery_platform
 from alignerr_plugin.taiga_resources import (
     TaigaRequiredResources,
+    is_tpu_resource,
     validate_required_resources,
 )
 
@@ -18,6 +20,25 @@ from alignerr_plugin.task_metadata import (
 # Accepted values for [environment].hidden_env (the env_server activation gate).
 # "" disables it; "env"/"hybrid" turn the hidden-environment RPC server on.
 HIDDEN_ENV_MODES: tuple[str, ...] = ("", "env", "hybrid")
+# Hugging Face hub cache root inside the flagship base images. Every flagship
+# Dockerfile sets HF_HOME=/tmp/hf-cache, and huggingface_hub resolves repos from
+# <HF_HOME>/hub/<repo_type>s--<org>--<name>, so mounting there makes
+# from_pretrained("org/name") work offline with no author-side path juggling.
+HF_HOME = "/tmp/hf-cache"
+HF_HUB_CACHE = f"{HF_HOME}/hub"
+HF_REPO_TYPES: tuple[str, ...] = ("model", "dataset")
+
+# A Hugging Face repo_id is `namespace/name`: exactly one slash, each component
+# starting alphanumeric and otherwise [A-Za-z0-9._-]. Matches the packer's
+# deploy-time validation so a malformed id fails at authoring time instead of
+# only fail-closed at deploy.
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def hf_hub_mount_path(repo_id: str, repo_type: str = "model") -> str:
+    """Canonical hub-cache mount path for an HF repo inside the task container."""
+    folder = f"{repo_type}s--" + repo_id.replace("/", "--")
+    return f"{HF_HUB_CACHE}/{folder}"
 
 
 class OutputSpec(BaseModel):
@@ -147,8 +168,8 @@ class GroundTruthSection(BaseModel):
 class ReferenceSection(BaseModel):
     """Local reference-solution runner configuration (author iteration loop).
 
-    Mirrors ML_Envs ``run_reference`` semantics: in-container execution,
-    persistent cache, and optional train/grade separation.
+    In-container execution, persistent cache, and optional train/grade
+    separation.
     """
 
     execution: Literal["auto", "host", "container"] = "auto"
@@ -159,11 +180,10 @@ class ReferenceSection(BaseModel):
 
 # Hour-scale per-stage runner timeouts (seconds) that **ML tasks** are pinned to.
 # Single source of truth for the ML "fair-chance" timeouts: the Taiga exporter
-# force-pins ``task_type == "ml"`` to these, and ML_Envs mode reuses them via
-# ``mlenvs.PINNED_TIMEOUTS``, so the numbers can never drift. Minutes-scale caps
-# make Boreal/Taiga finish before an agent (or a human building a reference
-# solution) can plausibly solve an ML task. Only ML tasks are pinned; other task
-# types keep the (author-overridable) RunnerTimeouts defaults below.
+# force-pins ``task_type == "ml"`` to these. Minutes-scale caps make Boreal/Taiga
+# finish before an agent (or a human building a reference solution) can plausibly
+# solve an ML task. Only ML tasks are pinned; other task types keep the
+# (author-overridable) RunnerTimeouts defaults below.
 ML_SETUP_TIMEOUT_SEC = 7200  # 2h — environment/setup phase
 ML_GRADING_TIMEOUT_SEC = 10800  # 3h — Taiga's maximum grading timeout
 ML_TOOL_TIMEOUT_SEC = 21600  # 6h — per tool-call budget
@@ -279,8 +299,12 @@ class PreloadedFile(BaseModel):
 
     * ``source`` -- a directory tree under the task dir, packed into a
       content-addressed squashfs and uploaded once (shared/deduped across tasks);
-    * ``hf_repo`` -- a Hugging Face repo (optionally pinned to ``hf_revision``),
-      fetched and packed so ``from_pretrained`` resolves it offline.
+    * ``hf_repo`` -- a Hugging Face repo (optionally pinned to ``hf_revision``,
+      narrowed by ``allow_patterns`` / ``ignore_patterns``), fetched and packed
+      in hub-cache layout so ``from_pretrained`` resolves it offline.
+
+    ``mount_path`` is optional for ``hf_repo`` mounts: it defaults to the
+    canonical hub-cache location derived from the repo id and ``repo_type``.
 
     The deploy pipeline (``scripts/sync_mount.sh``) packs/uploads and stamps the
     concrete ``remote_path`` into ``.alignerr/preloaded_files.json``; the
@@ -288,10 +312,20 @@ class PreloadedFile(BaseModel):
     avoid image bloat (one shared object, not one copy per task image).
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     source: str = ""
     hf_repo: str = ""
     hf_revision: str = ""
-    mount_path: str
+    # Selects the hub-cache folder prefix ("models--" / "datasets--"), which is
+    # what makes an offline from_pretrained / load_dataset resolve the mount.
+    repo_type: str = "model"
+    # Narrow the download; omitted allow_patterns means the whole repo. Packed
+    # objects are keyed by pattern too, so two tasks taking different slices of
+    # one repo do not collide in the shared cache.
+    allow_patterns: list[str] = Field(default_factory=list)
+    ignore_patterns: list[str] = Field(default_factory=list)
+    mount_path: str = ""
     read_only: bool = True
 
     @model_validator(mode="after")
@@ -300,6 +334,30 @@ class PreloadedFile(BaseModel):
             raise ValueError(
                 "[[preloaded_files]] requires exactly one of `source` or `hf_repo`"
             )
+        if self.hf_repo:
+            self.hf_repo = self.hf_repo.strip()
+            if not _HF_REPO_ID_RE.match(self.hf_repo):
+                raise ValueError(
+                    "[[preloaded_files]].hf_repo must look like 'org/name'; "
+                    f"got {self.hf_repo!r}"
+                )
+            if self.repo_type not in HF_REPO_TYPES:
+                raise ValueError(
+                    f"[[preloaded_files]].repo_type must be one of "
+                    f"{list(HF_REPO_TYPES)}; got {self.repo_type!r}"
+                )
+            if not self.mount_path:
+                self.mount_path = hf_hub_mount_path(self.hf_repo, self.repo_type)
+        else:
+            if self.allow_patterns or self.ignore_patterns:
+                raise ValueError(
+                    "[[preloaded_files]].allow_patterns/ignore_patterns only apply "
+                    "to `hf_repo` mounts"
+                )
+            if not self.mount_path:
+                raise ValueError(
+                    "[[preloaded_files]].mount_path is required for `source` mounts"
+                )
         if not PurePosixPath(self.mount_path).is_absolute():
             raise ValueError("[[preloaded_files]].mount_path must be an absolute path")
         return self
@@ -337,7 +395,12 @@ class TaskToml(BaseModel):
     Sections beyond `[task]` mostly have sensible defaults. `[difficulty]` is
     required in practice because task_type, domain, and reward_type are enum
     metadata used by validation and dashboards.
+
+    Unknown top-level sections are rejected, so a misspelled section fails loudly
+    instead of being silently dropped along with the checks it drives.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     schema_version: str = "1.1"
     task: TaskSection
@@ -353,6 +416,58 @@ class TaskToml(BaseModel):
     preloaded_files: list[PreloadedFile] = Field(default_factory=list)
     delivery: DeliverySection = Field(default_factory=DeliverySection)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_cross_section(self) -> "TaskToml":
+        issues: list[str] = []
+        issues.extend(self._hidden_env_issues())
+        issues.extend(self._preloaded_files_issues())
+        if issues:
+            raise ValueError("; ".join(issues))
+        return self
+
+    def _hidden_env_issues(self) -> list[str]:
+        """Cross-field checks for the hidden-environment RPC gate.
+
+        Applies to every task type, not just ml: the env server is a property of
+        ``[environment]``, so a non-ml task that switches it on is subject to the
+        same tier constraint.
+        """
+        if not self.environment.hidden_env:
+            return []
+        if is_tpu_resource(self.environment.required_resources):
+            return [
+                "[environment].hidden_env (the RPC env server) cannot run on a TPU "
+                f"tier; got {self.environment.required_resources!r}"
+            ]
+        return []
+
+    def _preloaded_files_issues(self) -> list[str]:
+        """Reject HF mounts on TPU tiers and duplicate repo/mount declarations."""
+        issues: list[str] = []
+        hf_entries = [entry for entry in self.preloaded_files if entry.hf_repo]
+        if hf_entries and is_tpu_resource(self.environment.required_resources):
+            issues.append(
+                "[[preloaded_files]].hf_repo mounts are not supported on a TPU tier "
+                f"(got {self.environment.required_resources!r})"
+            )
+        seen_repos: set[tuple[str, str]] = set()
+        for entry in hf_entries:
+            key = (entry.hf_repo, entry.repo_type)
+            if key in seen_repos:
+                issues.append(
+                    f"duplicate [[preloaded_files]] hf_repo {entry.hf_repo!r} "
+                    f"(repo_type {entry.repo_type!r}); declare it once"
+                )
+            seen_repos.add(key)
+        seen_mounts: set[str] = set()
+        for entry in self.preloaded_files:
+            if entry.mount_path in seen_mounts:
+                issues.append(
+                    f"duplicate [[preloaded_files]].mount_path {entry.mount_path!r}"
+                )
+            seen_mounts.add(entry.mount_path)
+        return issues
 
 
 class ProblemMetadata(BaseModel):

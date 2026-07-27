@@ -40,7 +40,7 @@
   "moat_capacity_in": 45.0,
   "moat_note": "The seismic moat (clearance to the surrounding retaining wall) is 45.0 in. If the worst-case isolator displacement exceeds the moat capacity the isolated building pounds against the wall; this is a distinct hard limit state from the displacement serviceability target and is applied as a multiplicative gate on the final score.",
   "recentering_capacity_in": 9.0,
-  "recentering_note": "Residual isolator displacement above 9.0 in prevents post-earthquake inspection and reoccupation without jacking the building. This distinct functionality limit is applied as a multiplicative recentering gate; residual displacement also receives continuous metric credit against its 8.3 in target.",
+  "recentering_note": "Residual isolator displacement above 9.0 in prevents post-earthquake inspection and reoccupation without jacking the building. This distinct functionality limit is applied as a multiplicative recentering gate; residual displacement also receives continuous metric credit against its 8.2 in target.",
   "scoring": {
     "aggregation": "For each metric, take the worst (maximum) value over the six private ground motions.",
     "metric_credit": "credit = lower_ratio_curve( worst_value / target ).",

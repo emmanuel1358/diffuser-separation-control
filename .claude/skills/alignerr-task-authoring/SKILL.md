@@ -5,7 +5,7 @@ description: Helps author Alignerr RL tasks in this repository. Use when creatin
 
 # Alignerr Task Authoring
 
-> **Authoring an ML task?** Prefer **ML_Envs mode** — the minimal contract (`metadata.json` + `prompt.md` + `test_file.py` + `data/{public,private}/`, no `task.toml` / per-task Dockerfile / `tests/test.sh`). See the `mlenvs-tasks` skill and `docs/MLENVS_TASKS.md`. The workflow below is the native contract for mujoco / cfd / structures.
+> **Authoring an ML task?** `task_type = "ml"` uses the same contract as everything below, plus the committed-strategy calibration gate. See the `ml-tasks` skill and `docs/ML_TASKS.md` first.
 
 ## Workflow
 
@@ -81,15 +81,19 @@ attach a reviewer video via `[ground_truth].render_outputs` (`rendering.mp4`,
 `1280x720` h264). See `docs/NUMERICAL_SOLVERS.md`,
 `project_guidelines/cfd/cfd_environments.md`, and `examples/openfoam-hydrofoil-flap`.
 
-## ML_Envs-style tasks and reward hacking
+## Continuous-scored tasks and reward hacking
 
 For dataset/CSV, model-module, executable, HDF5, or k-fold submissions scored by
-a continuous calibrated function of held-out truth, follow the `mlenvs-tasks`
-skill and `docs/MLENVS_TASKS.md`: read submissions via the sanctioned loaders
-(`helpers.load_submission_or_fault`, `run_model_module`,
-`run_submitted_executable`, `load_submission_h5_or_fault`, `score_kfold_cv`),
-calibrate with `grading.calibration` (FLOOR/REF/PERFECT), and ship `solution/`
-plus `baselines/`. Every scorer must respect `docs/REWARD_HACKING.md`: never
+a continuous calibrated function of held-out truth, follow the `ml-tasks`
+skill and `docs/ML_TASKS.md`: read submissions via the sanctioned loaders
+(`helpers.load_submission_or_fault`, `load_submission_npz_or_fault`,
+`open_submission_file_or_fault`, `run_model_module`,
+`run_submitted_executable`, `load_submission_h5_or_fault`, `score_kfold_cv`);
+never use raw `lstat` or leaf-only `O_NOFOLLOW`,
+calibrate with `ContinuousTask` + `GeneratedCalibration`, commit explicit
+model/strategy manifests, and for opaque artifacts declare ready-to-measure
+`WorkspaceDegenerateProbes` under `baselines/degenerate/`. Every scorer must
+respect `docs/REWARD_HACKING.md`: never
 trust agent stdout, never exec/pickle agent artifacts in the grader, and use the
 AgentFault keep-vs-discard discipline. `lbx-rl-template validate` enforces the
 blocking `agent_fault` stage.
@@ -99,7 +103,7 @@ blocking `agent_fault` stage.
 - `README.md`
 - `docs/AUTHORING.md`
 - `docs/GRADING.md`
-- `docs/MLENVS_TASKS.md`
+- `docs/ML_TASKS.md`
 - `docs/REWARD_HACKING.md`
 - `docs/NUMERICAL_SOLVERS.md`
 - `project_guidelines/mujoco_environments.md`

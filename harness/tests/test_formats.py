@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from _fixture_guard import requires_examples
+
 from alignerr_plugin.exporters.harbor import export_harbor
 from alignerr_plugin.exporters.taiga import export_taiga
 
@@ -16,9 +18,10 @@ ROOT = Path(__file__).resolve().parents[2]
 MUJOCO = ROOT / "examples" / "mujoco-pendulum"
 OPENSEES = ROOT / "examples" / "opensees-base-isolation"
 OPENFOAM = ROOT / "examples" / "openfoam-hydrofoil-flap"
-MLENVS = ROOT / "examples" / "mle-tabular-classification"
+TABULAR = ROOT / "examples" / "mle-tabular-classification"
 
 
+@requires_examples("mujoco-pendulum")
 def test_load_problem_dir() -> None:
     problem = load_problem_dir(MUJOCO)
     assert problem.id == "mujoco-pendulum"
@@ -35,6 +38,7 @@ def test_load_problem_dir() -> None:
     assert "test_file" in fields
 
 
+@requires_examples("opensees-base-isolation")
 def test_load_problem_dir_uses_structures_hint_not_prompt_prefix() -> None:
     problem = load_problem_dir(OPENSEES)
     fields = _extra_fields_for_mcp(problem, "local:test")
@@ -48,6 +52,7 @@ def test_load_problem_dir_uses_structures_hint_not_prompt_prefix() -> None:
     }
 
 
+@requires_examples("opensees-base-isolation")
 def test_export_taiga_uses_structures_hint_not_prompt_prefix(tmp_path: Path) -> None:
     metadata = tmp_path / "problems-metadata.json"
     export_taiga(OPENSEES, metadata, image_ref="local:test")
@@ -60,6 +65,7 @@ def test_export_taiga_uses_structures_hint_not_prompt_prefix(tmp_path: Path) -> 
     assert problem["hints"][0]["enabled"] is True
 
 
+@requires_examples("openfoam-hydrofoil-flap")
 def test_load_problem_dir_uses_cfd_hint_not_prompt_prefix() -> None:
     problem = load_problem_dir(OPENFOAM)
     fields = _extra_fields_for_mcp(problem, "local:test")
@@ -73,6 +79,7 @@ def test_load_problem_dir_uses_cfd_hint_not_prompt_prefix() -> None:
     assert problem.taiga_problem["hints"][0]["enabled"] is True
 
 
+@requires_examples("openfoam-hydrofoil-flap")
 def test_export_taiga_uses_cfd_hint_not_prompt_prefix(tmp_path: Path) -> None:
     metadata = tmp_path / "problems-metadata.json"
     export_taiga(OPENFOAM, metadata, image_ref="local:test")
@@ -85,6 +92,7 @@ def test_export_taiga_uses_cfd_hint_not_prompt_prefix(tmp_path: Path) -> None:
     assert problem["hints"][0]["enabled"] is True
 
 
+@requires_examples("mujoco-pendulum")
 def test_load_problem_dir_does_not_add_solver_hint_for_mujoco() -> None:
     problem = load_problem_dir(MUJOCO)
 
@@ -92,6 +100,7 @@ def test_load_problem_dir_does_not_add_solver_hint_for_mujoco() -> None:
     assert "hints" not in problem.taiga_problem
 
 
+@requires_examples("mujoco-pendulum")
 def test_load_taiga_metadata_with_source_problem(tmp_path: Path) -> None:
     metadata = tmp_path / "problems-metadata.json"
     export_taiga(MUJOCO, metadata, image_ref="local:test")
@@ -145,6 +154,7 @@ def test_load_taiga_metadata_recovers_exported_outputs(tmp_path: Path) -> None:
     assert problem.outputs[0].description == "MJCF XML model"
 
 
+@requires_examples("mujoco-pendulum")
 def test_load_harbor_dir_with_source_problem(tmp_path: Path) -> None:
     harbor_dir = tmp_path / "harbor"
     export_harbor(MUJOCO, harbor_dir, image_ref="local:test")
@@ -158,17 +168,17 @@ def test_load_harbor_dir_with_source_problem(tmp_path: Path) -> None:
     assert problem.taiga_problem is not None
 
 
-def test_load_harbor_dir_roundtrips_mlenvs_task(tmp_path: Path) -> None:
-    # ML_Envs harbor exports ship metadata.json + prompt.md + test_file.py and no
-    # task.toml/instruction.md; load_harbor_dir must synthesize the config instead
-    # of failing on the missing files.
+@requires_examples("mle-tabular-classification")
+def test_load_harbor_dir_roundtrips_continuous_ml_task(tmp_path: Path) -> None:
+    # A continuous ml task exports the same native envelope as every other task,
+    # and load_harbor_dir must read it back without the source problem dir.
     harbor_dir = tmp_path / "harbor"
-    export_harbor(MLENVS, harbor_dir)
+    export_harbor(TABULAR, harbor_dir)
 
-    assert not (harbor_dir / "task.toml").exists()
-    assert (harbor_dir / "prompt.md").exists()
+    assert (harbor_dir / "task.toml").exists()
+    assert (harbor_dir / "instruction.md").exists()
 
     problem = load_harbor_dir(harbor_dir)
 
     assert problem.source_format == "harbor"
-    assert problem.prompt == (harbor_dir / "prompt.md").read_text()
+    assert problem.prompt == (harbor_dir / "instruction.md").read_text()

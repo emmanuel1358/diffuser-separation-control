@@ -1,4 +1,4 @@
-"""Unit tests for the continuous-ML committed-model hard contract."""
+"""Unit tests for continuous-ML committed strategy contracts."""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import json
 from pathlib import Path
 
 import pytest
-
+from _fixture_guard import requires_examples
 from alignerr_plugin.ml_model_contract import (
     validate_committed_model_manifest,
+    validate_committed_strategy_manifest,
     validate_ml_strategy_contract,
     validate_problem_ml_model_contracts,
+    validate_problem_ml_strategy_contracts,
 )
 from alignerr_plugin.validators.task.validator import TaskValidator
 from grading.evaluation import (
@@ -73,30 +75,92 @@ def _write_valid_strategy(
     )
 
 
-def _write_mlenvs_problem(
+def _write_committed_strategy(root: Path, *, role: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    artifact = root / "policy.py"
+    artifact.write_text(
+        "def load_policy():\n"
+        "    class Policy:\n"
+        "        def act(self, observation, info=None):\n"
+        "            return 0\n"
+        "    return Policy()\n",
+        encoding="utf-8",
+    )
+    (root / "solution.py").write_text(
+        "from pathlib import Path\n"
+        "import shutil\n"
+        "POLICY = Path(__file__).with_name('policy.py')\n"
+        "out = Path('/tmp/output')\n"
+        "out.mkdir(parents=True, exist_ok=True)\n"
+        "shutil.copy2(POLICY, out / 'policy.py')\n",
+        encoding="utf-8",
+    )
+    (root / "strategy.manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "role": role,
+                "kind": "committed_artifact",
+                "inference_entrypoint": "solution.py",
+                "artifacts": [{"path": "policy.py", "sha256": _sha(artifact)}],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+_TASK_TOML = """\
+schema_version = "1.1"
+
+[task]
+name = "labelbox/demo-taiga"
+
+[environment]
+required_resources = "12vcpu+100gib+h100/2"
+
+[difficulty]
+task_type = "ml"
+domain = "scientific_discovery_computational_science"
+reward_type = "continuous_scoring_function"
+license = "CC0-1.0"
+license_source = "https://creativecommons.org/publicdomain/zero/1.0/"
+
+[[outputs]]
+path = "/tmp/output/model.json"
+required = true
+"""
+
+
+def _write_native_ml_problem(
     tmp_path: Path, *, inference_source: str | None = None
 ) -> Path:
     task_dir = tmp_path / "demo_taiga"
-    (task_dir / "data" / "public").mkdir(parents=True)
-    (task_dir / "data" / "private").mkdir(parents=True)
+    (task_dir / "data").mkdir(parents=True)
+    (task_dir / "scorer" / "data").mkdir(parents=True)
+    (task_dir / "task.toml").write_text(_TASK_TOML, encoding="utf-8")
     (task_dir / "metadata.json").write_text(
         json.dumps(
             {
-                "ml_task_type": "dataset",
-                "required_resources": "12vcpu+100gib+h100/2",
-                "domain": "scientific_discovery_computational_science",
-                "license": "CC0-1.0",
-                "license_source": "https://creativecommons.org/publicdomain/zero/1.0/",
+                "benchmark": "taiga_task",
+                "problem_data": {"instance_id": "demo-taiga"},
             }
         ),
         encoding="utf-8",
     )
-    (task_dir / "prompt.md").write_text("x" * 250, encoding="utf-8")
-    (task_dir / "test_file.py").write_text(
+    (task_dir / "instruction.md").write_text("x" * 250, encoding="utf-8")
+    (task_dir / "scorer" / "compute_score.py").write_text(
         "\n".join(
             [
-                "from grading.evaluation import AnchorRationale, ContinuousTask, FloorAnchor, GeneratedCalibration, SRETarget",
-                "FLOOR = FloorAnchor(1.0, AnchorRationale('theoretical', 'Population-standardized RMSE has a no-skill value of one.'))",
+                (
+                    "from grading.evaluation import AnchorRationale, "
+                    "ContinuousTask, FloorAnchor, GeneratedCalibration, SRETarget"
+                ),
+                (
+                    "FLOOR = FloorAnchor(1.0, AnchorRationale('theoretical', "
+                    "'Population-standardized RMSE has a no-skill value of one.'))"
+                ),
                 "TASK = ContinuousTask.calibrated(",
                 "  targets=[SRETarget.lower('y', weight=1.0, floor=FLOOR)],",
                 "  calibration=GeneratedCalibration(),",
@@ -109,10 +173,10 @@ def _write_mlenvs_problem(
         ),
         encoding="utf-8",
     )
-    train_csv = task_dir / "data" / "public" / "train.csv"
+    train_csv = task_dir / "data" / "train.csv"
     train_csv.write_text("x,y\n1,2\n", encoding="utf-8")
     _write_valid_strategy(
-        task_dir / "reference_solution",
+        task_dir / "solution",
         role="reference",
         training_data=train_csv,
         inference_source=inference_source,
@@ -177,6 +241,107 @@ def test_valid_strategy_contract_passes(tmp_path: Path) -> None:
     contract = validate_ml_strategy_contract(strategy, role="reference")
     assert contract.inference_entrypoint == "solution.py"
     assert contract.training_entrypoint == "train.py"
+    assert contract.kind == "trained_model"
+    assert contract.manifest_filename == "model.manifest.json"
+
+
+def test_committed_artifact_strategy_contract_passes(tmp_path: Path) -> None:
+    (tmp_path / "metadata.json").write_text("{}\n", encoding="utf-8")
+    strategy = tmp_path / "reference_solution"
+    _write_committed_strategy(strategy, role="reference")
+
+    manifest = validate_committed_strategy_manifest(strategy, role="reference")
+    assert manifest["kind"] == "committed_artifact"
+    contract = validate_ml_strategy_contract(strategy, role="reference")
+    assert contract.kind == "committed_artifact"
+    assert contract.training_entrypoint is None
+    assert contract.training_input_paths == ()
+    assert contract.artifact_paths == ("policy.py",)
+
+
+def test_committed_artifact_strategy_rejects_tampered_artifact(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "metadata.json").write_text("{}\n", encoding="utf-8")
+    strategy = tmp_path / "reference_solution"
+    _write_committed_strategy(strategy, role="reference")
+    (strategy / "policy.py").write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact digest mismatch"):
+        validate_ml_strategy_contract(strategy, role="reference")
+
+
+def test_trained_strategy_manifest_supports_multiple_digest_bound_inputs(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "metadata.json").write_text("{}\n", encoding="utf-8")
+    strategy = tmp_path / "reference_solution"
+    input_one = tmp_path / "data" / "public" / "env.py"
+    input_two = tmp_path / "train_config.json"
+    input_one.parent.mkdir(parents=True)
+    input_one.write_text("def make_env(): ...\n", encoding="utf-8")
+    input_two.write_text('{"seed":7}\n', encoding="utf-8")
+    _write_valid_strategy(strategy, role="reference", training_data=input_one)
+    (strategy / "model.manifest.json").unlink()
+    artifact = strategy / "model.json"
+    (strategy / "strategy.manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "role": "reference",
+                "kind": "trained_model",
+                "training_entrypoint": "train.py",
+                "inference_entrypoint": "solution.py",
+                "seed": 7,
+                "training_inputs": [
+                    {
+                        "path": str(input_one.relative_to(tmp_path)),
+                        "sha256": _sha(input_one),
+                    },
+                    {
+                        "path": str(input_two.relative_to(tmp_path)),
+                        "sha256": _sha(input_two),
+                    },
+                ],
+                "artifacts": [{"path": "model.json", "sha256": _sha(artifact)}],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    contract = validate_ml_strategy_contract(strategy, role="reference")
+    assert contract.kind == "trained_model"
+    assert set(contract.training_input_paths) == {
+        "data/public/env.py",
+        "train_config.json",
+    }
+
+
+def test_committed_artifact_strategy_rejects_training_fields(tmp_path: Path) -> None:
+    (tmp_path / "metadata.json").write_text("{}\n", encoding="utf-8")
+    strategy = tmp_path / "reference_solution"
+    _write_committed_strategy(strategy, role="reference")
+    manifest_path = strategy / "strategy.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["training_entrypoint"] = "solution.py"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not declare training fields"):
+        validate_ml_strategy_contract(strategy, role="reference")
+
+
+def test_strategy_contract_rejects_ambiguous_manifests(tmp_path: Path) -> None:
+    training = tmp_path / "train.csv"
+    training.write_text("x,y\n1,1\n", encoding="utf-8")
+    strategy = tmp_path / "reference_solution"
+    _write_valid_strategy(strategy, role="reference", training_data=training)
+    _write_committed_strategy(strategy, role="reference")
+    (tmp_path / "metadata.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly one"):
+        validate_ml_strategy_contract(strategy, role="reference")
 
 
 def test_manifest_rejects_digest_mismatch(tmp_path: Path) -> None:
@@ -240,22 +405,22 @@ def test_validator_stage_rejects_train_in_solution(tmp_path: Path) -> None:
         "if __name__ == '__main__':\n"
         "    main()\n"
     )
-    task_dir = _write_mlenvs_problem(tmp_path, inference_source=bad_inference)
+    task_dir = _write_native_ml_problem(tmp_path, inference_source=bad_inference)
     result = TaskValidator()._continuous_ml_model_contract(task_dir)
     assert result.passed is False
     assert any("training" in issue.lower() for issue in result.issues)
 
 
 def test_validator_stage_rejects_missing_manifest(tmp_path: Path) -> None:
-    task_dir = _write_mlenvs_problem(tmp_path)
-    (task_dir / "reference_solution" / "model.manifest.json").unlink()
+    task_dir = _write_native_ml_problem(tmp_path)
+    (task_dir / "solution" / "model.manifest.json").unlink()
     result = TaskValidator()._continuous_ml_model_contract(task_dir)
     assert result.passed is False
     assert any("manifest" in issue.lower() for issue in result.issues)
 
 
 def test_validator_accepts_valid_contract(tmp_path: Path) -> None:
-    task_dir = _write_mlenvs_problem(tmp_path)
+    task_dir = _write_native_ml_problem(tmp_path)
     result = TaskValidator()._continuous_ml_model_contract(task_dir)
     assert result.passed is True
     assert result.issues == []
@@ -263,16 +428,63 @@ def test_validator_accepts_valid_contract(tmp_path: Path) -> None:
     assert {c.role for c in contracts} == {"reference", "naive"}
 
 
+def test_policy_registration_requires_reference_but_not_naive(tmp_path: Path) -> None:
+    import shutil
+
+    task_dir = _write_native_ml_problem(tmp_path)
+    shutil.rmtree(task_dir / "solution")
+    shutil.rmtree(task_dir / "baselines")
+    _write_committed_strategy(task_dir / "solution", role="reference")
+    (task_dir / "scorer" / "compute_score.py").write_text(
+        "from grading.evaluation import PolicyEvaluationTask\n"
+        "TASK = PolicyEvaluationTask(scenarios=8)\n"
+        "def compute_score():\n"
+        "    return TASK.grade(workspace=None, rollout=None, controls={})\n",
+        encoding="utf-8",
+    )
+
+    result = TaskValidator()._continuous_ml_model_contract(task_dir)
+    assert result.passed is True, result.issues
+    contracts = validate_problem_ml_strategy_contracts(task_dir, include_naive=False)
+    assert [contract.role for contract in contracts] == ["reference"]
+
+
+def test_validator_rejects_unsupported_continuous_task_registration(
+    tmp_path: Path,
+) -> None:
+    task_dir = _write_native_ml_problem(tmp_path)
+    (task_dir / "scorer" / "compute_score.py").write_text(
+        "TASK = object()\n" "def compute_score():\n" "    return 0.0\n",
+        encoding="utf-8",
+    )
+
+    result = TaskValidator()._continuous_ml_model_contract(task_dir)
+    assert result.passed is False
+    assert any(
+        "ContinuousTask or PolicyEvaluationTask" in issue for issue in result.issues
+    )
+
+
 def test_example_tabular_passes_contract() -> None:
     example = (
         Path(__file__).resolve().parents[2] / "examples" / "mle-tabular-classification"
     )
-    if not (example / "reference_solution").is_dir():
+    if not (example / "solution").is_dir():
         pytest.skip("canonical mle-tabular-classification example not in this checkout")
     contracts = validate_problem_ml_model_contracts(
         example, naive_rel="baselines/naive"
     )
     assert {c.role for c in contracts} == {"reference", "naive"}
+    stage = TaskValidator()._continuous_ml_model_contract(example)
+    assert stage.passed is True, stage.issues
+
+
+@requires_examples("hidden-env-bandit")
+def test_hidden_env_policy_example_uses_committed_strategy_contract() -> None:
+    example = Path(__file__).resolve().parents[2] / "examples" / "hidden-env-bandit"
+    contracts = validate_problem_ml_strategy_contracts(example, include_naive=False)
+    assert len(contracts) == 1
+    assert contracts[0].kind == "committed_artifact"
     stage = TaskValidator()._continuous_ml_model_contract(example)
     assert stage.passed is True, stage.issues
 
@@ -363,6 +575,41 @@ def test_shell_invoking_train_py_is_rejected(tmp_path: Path) -> None:
         validate_ml_strategy_contract(strategy, role="reference")
 
 
+def test_committed_artifact_shell_cannot_invoke_training(tmp_path: Path) -> None:
+    (tmp_path / "metadata.json").write_text("{}\n", encoding="utf-8")
+    strategy = tmp_path / "reference_solution"
+    _write_committed_strategy(strategy, role="reference")
+    (strategy / "train.py").write_text("print('train')\n", encoding="utf-8")
+    (strategy / "solve.sh").write_text(
+        "#!/bin/bash\npython train.py\ncp policy.py /tmp/output/policy.py\n",
+        encoding="utf-8",
+    )
+    manifest_path = strategy / "strategy.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["inference_entrypoint"] = "solve.sh"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must not invoke"):
+        validate_ml_strategy_contract(strategy, role="reference")
+
+
+def test_shell_must_reference_declared_strategy_artifact(tmp_path: Path) -> None:
+    (tmp_path / "metadata.json").write_text("{}\n", encoding="utf-8")
+    strategy = tmp_path / "reference_solution"
+    _write_committed_strategy(strategy, role="reference")
+    (strategy / "solve.sh").write_text(
+        "#!/bin/bash\ncp generated.py /tmp/output/result.py\n",
+        encoding="utf-8",
+    )
+    manifest_path = strategy / "strategy.manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["inference_entrypoint"] = "solve.sh"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="declared strategy artifact"):
+        validate_ml_strategy_contract(strategy, role="reference")
+
+
 def test_open_write_to_committed_model_is_rejected(tmp_path: Path) -> None:
     training = tmp_path / "train.csv"
     training.write_text("x,y\n1,1\n", encoding="utf-8")
@@ -379,5 +626,5 @@ def test_open_write_to_committed_model_is_rejected(tmp_path: Path) -> None:
         strategy, role="reference", training_data=training, inference_source=inference
     )
     (tmp_path / "metadata.json").write_text("{}\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="overwrite committed model artifact"):
+    with pytest.raises(ValueError, match="overwrite committed strategy artifact"):
         validate_ml_strategy_contract(strategy, role="reference")

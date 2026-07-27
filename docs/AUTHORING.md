@@ -25,6 +25,21 @@ local base. CPU tasks use `lbx-tasks-base:runtime-ml-core-py313-local`; GPU
 tasks use `lbx-tasks-base-gpu:runtime-ml-core-py313-local`. The first Docker
 build can be slow because it downloads Python and ML dependencies.
 
+### Local base images
+
+The local tag is a fixed name, so the harness checks the cached image's
+`lbx.base.drift_hash` label — a content hash over every `base/` build input —
+against your working tree before reusing it. A cached base built from a
+different `base/` revision (or from before this repo labelled local bases) is
+rebuilt, and the harness prints why and what the rebuild costs (~16.5 GB and
+tens of minutes) before starting. Without this you would instead get the
+failure from inside your task's own Docker build, typically a missing
+`/opt/lbx-runtime/install-task-deps.sh`.
+
+Set `LBX_RL_TASKS_ALLOW_STALE_BASE=1` to reuse the cached base anyway. That is
+only safe when your task does not depend on the `base/` change in flight — for
+example while switching between worktrees at different `base/` revisions.
+
 ## Scaffold a task
 
 There is one starter per supported `task_type` (`ml`, `mujoco`, `cfd`,
@@ -104,9 +119,13 @@ problems/<task_id>/
 ├── metadata.json         # task identity and description metadata
 ├── instruction.md        # task prompt the agent sees
 ├── environment/
-│   └── Dockerfile        # FROM lbx-tasks-base, COPY scorer/ -> /mcp_server/grader/
+│   ├── Dockerfile        # FROM lbx-tasks-base, COPY scorer/ -> /mcp_server/grader/
+│   ├── requirements.txt  # optional: agent-visible pip deps
+│   └── apt.txt           # optional: agent-visible apt packages
 ├── scorer/
 │   ├── compute_score.py  # YOUR scorer (see docs/GRADING.md)
+│   ├── requirements.txt  # optional: grader-only pip deps (root-only)
+│   ├── env-requirements.txt # optional: hidden-env-only pip deps (root-only)
 │   └── data/             # private hidden test set
 ├── data/                 # public data the agent sees at /data/
 ├── solution/solve.sh     # required reference/oracle solution
@@ -130,6 +149,112 @@ availability and guidance to use the dedicated `tmux` tool for long-running
 training. You may write domain-specific accelerator guidance yourself; the
 exporter avoids duplicating notices when your prompt already mentions GPU/TPU or
 `tmux`.
+
+## Task Dependencies
+
+**Never add packages to `base/`.** The base images are shared by every task and
+are code-owner reviewed; a task that edits them changes every other task's
+environment. Anything your task needs beyond the base is declared in that task's
+own dependency channels.
+
+Dependencies are declared as **files**, not `task.toml` fields, so a private
+package name never reaches the agent-visible `/task/task.toml`. Each file is
+optional; `base/install-task-deps.sh` (shipped into every base image at
+`/opt/lbx-runtime/install-task-deps.sh`) routes each one:
+
+| File | Installs into | Readable by |
+| --- | --- | --- |
+| `environment/apt.txt` | system apt | agent |
+| `environment/requirements.txt` | `/opt/lbx-runtime/.venv` | agent |
+| `scorer/requirements.txt` | `/mcp_server/grading_deps` (0700 root) | grader only |
+| `scorer/env-requirements.txt` | `/mcp_server/env_deps` (0700 root) | hidden env server only |
+
+**Placement is the isolation boundary, not a filing convention.** The two
+private trees live under `/mcp_server`, which is `0700 root`, so the uid-1000
+agent cannot read them; the grader worker prepends `grading_deps` to `sys.path`
+before loading `compute_score`, and the hidden env server prepends `env_deps`
+before loading `env.py`. A reference implementation or simulator declared in
+`environment/requirements.txt` instead is importable by the agent, which is how
+a scoring library or a black-box env leaks. Validation rejects a package
+declared in both an agent-visible and a private channel, and rejects bare VCS
+URLs and local paths because they defeat that overlap check — use a named PyPI
+spec or the PEP 508 `name @ url` form. `scorer/env-requirements.txt` is only
+valid on a task that sets `[environment].hidden_env`; see
+[`HIDDEN_ENV.md`](HIDDEN_ENV.md).
+
+Every starter wires the channels up the same way, before the private-data COPY
+and permission-sealing steps (the installer re-seals `/mcp_server` itself):
+
+```dockerfile
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+```
+
+Check what is already in the base before declaring anything: the shared ML stack
+plus the numerical-solver stack (OpenSeesPy, OpenFOAM, SU2, CalculiX, Meep,
+aerosandbox, scikit-fem, PySpice, Cantera, and more) is listed in
+[`NUMERICAL_SOLVERS.md`](NUMERICAL_SOLVERS.md).
+
+### How the contract is enforced
+
+Validation checks the declaration two ways, and it is worth knowing which one
+is the real gate.
+
+**The image diff is authoritative.** After the local build, validation
+enumerates what is installed in the runtime venv, in `/mcp_server/grading_deps`,
+in `/mcp_server/env_deps`, and in apt, in both the base image and your built
+task image. Anything your image added must be accounted for by a channel. It
+compares outcomes, not Dockerfile text, so it does not matter how an install was
+spelled — `RUN sh -c 'pip install …'`, an alias, a shim, a variable, exec form —
+the package is either declared or it is not.
+
+Two consequences follow, both intended:
+
+- **Transitive dependencies need no declaration.** The dependency closure of
+  your declared packages is resolved from the metadata inside your built image,
+  so declaring `gymnasium` covers `cloudpickle` and `farama-notifications`
+  without listing them. Optional dependencies are only covered when you asked
+  for the extra: declare `gymnasium[box2d]`, not `gymnasium`, if you want
+  `box2d-py`.
+- **A pip install into a non-runtime interpreter is invisible and therefore
+  fine.** A conda solver env or `/opt/solver-envs/*/bin/pip` installs outside
+  the runtime venv, changes nothing the agent can import, and has no channel to
+  declare it in. For apt, only explicitly-installed packages are compared, so a
+  build toolchain installed and purged in one `RUN` leaves nothing behind.
+
+**The Dockerfile scan is a convenience.** Before the build, validation also
+reads the `environment/Dockerfile` and fails a direct `pip install`,
+`uv pip install`, or `apt-get install` with a line number and the channel to use
+instead — much more actionable than a package-name delta, and it costs nothing
+to produce. It is not what guarantees correctness, so a spelling it fails to
+recognise is a missing convenience rather than a way around the contract.
+
+### When a task needs something genuinely heavy
+
+A handful of engines have no channel: fragile source builds (XFOIL, AVL, PyNEC),
+CUDA extensions built against the base torch (DREAMPlace), and conda solver
+envs. Those stay per-task, built in `environment/Dockerfile` — see the per-task
+recipes in [`NUMERICAL_SOLVERS.md`](NUMERICAL_SOLVERS.md#still-per-task-not-baked-into-the-base).
+Split such a recipe: its apt build toolchain and any pip specs go in the
+channels, and only the un-channelable part (the fetch, the `make`, the
+`conda create`) stays in a `RUN`. A pip install aimed at a non-runtime
+interpreter — a conda solver env's `python` — is left alone by validation
+because no channel routes there.
+
+If the Dockerfile scan flags a `RUN` that genuinely has no channel, precede it
+with
+
+```dockerfile
+# lbx-allow-raw-install: <why this cannot use a channel>
+```
+
+which silences the scan for that one instruction. It does **not** waive the
+image diff, so it cannot be used to get an undeclared package into a task — if
+the install leaves a package behind, you still have to declare it. What it is
+for is the case where the scan is wrong: most often an apt build toolchain
+installed and purged in the same `RUN`, which the diff passes on its own.
+Reviewers read the reason.
 
 ## Task Metadata
 
@@ -224,6 +349,10 @@ from `required_resources`), or an explicit compatible `cpu` / `gpu` /
   it for rendering tasks: hardware GL/EGL does **not** work under Taiga's gVisor
   sandbox, so CUDA-native raster is the only deployable render path.
 - `tpu` ships `jax[tpu]` on Python 3.12.
+
+All three CUDA flavors (`gpu`, `gpu-blackwell`, `cuda-graphics`) share one
+matrix: CUDA 13.0.3 on Ubuntu 24.04, Python 3.13, torch 2.9.1+cu130. `cpu` is
+Python 3.13 too; only `tpu` differs.
 
 Base images are built and pushed with drift-hashed tags by
 `base/build_and_push.sh` (the tag is a content hash over every base build input,
@@ -433,11 +562,11 @@ cannot. Do not call LLM providers from `compute_score.py`.
 
 | Return shape | When to use |
 | --- | --- |
-| `float` in `[0, 1]` | ML_Envs-style continuous metric (RMSE/F1, anchor-mapped). Single number, no per-criterion breakdown. |
+| `float` in `[0, 1]` | Continuous metric (RMSE/F1, anchor-mapped). Single number, no per-criterion breakdown. |
 | `dict {score, subscores, weights, metadata}` | Custom anchor-mapped headline + diagnostic per-target rows in Boreal UI. The headline is `dict["score"]`, NOT a recomputed weighted average. |
 | `TASK = RubricTask(...)` | Mandatory declarative protocol for `multi_deterministic_rubrics`; shared APIs own loading, faults, aggregation, and traces. |
 
-### Bare float (simplest, ML_Envs migration)
+### Bare float (simplest)
 
 ```python
 # scorer/compute_score.py
@@ -448,14 +577,14 @@ def compute_score(workspace: Path, trajectory, private: Path) -> float:
     return anchor_map(f1, floor=0.0, perfect=1.0)
 ```
 
-This shape is intended for ML_Envs migrations where only the headline
+This shape is for scorers where only the headline
 score matters. See
 [`examples/mle-tabular-classification`](../examples/mle-tabular-classification/)
 for a complete continuous-scoring dataset task.
 
-For the full ML_Envs calibration pattern, including baseline/reference/perfect
+For the full calibration pattern, including baseline/reference/perfect
 anchors and difficulty targets for continuous reward functions, see
-[`docs/GRADING.md`](GRADING.md#continuous-reward-functions-from-ml_envs).
+[`docs/GRADING.md`](GRADING.md#continuous-reward-functions).
 
 ### Score dict (preserve a custom anchor map AND surface diagnostics)
 
@@ -473,7 +602,7 @@ The headline `score` stays exactly what you returned — the runtime does NOT
 recompute it from `subscores * weights`.
 
 Use this shape for continuous ML tasks when you want to preserve the
-original ML_Envs headline math and also expose diagnostic target
+original headline math and also expose diagnostic target
 progress values. This is still not a rubric: the subscores are
 continuous metrics, not pass/fail criteria.
 

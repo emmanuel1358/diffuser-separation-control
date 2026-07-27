@@ -7,11 +7,11 @@ description: Guides Alignerr RL task ground-truth/oracle submissions. Use when c
 
 ## Contract
 
-- Every native task needs `solution/solve.sh`; ML_Envs continuous tasks use `reference_solution/solution.py` instead.
+- Every task needs a reference under `solution/`: `solve.sh` for script-driven task types, or `solution.py` for a continuous ML strategy.
 - Every task must declare enum-backed `[difficulty].task_type`, `[difficulty].domain`, and `[difficulty].reward_type`; values live in `alignerr_plugin.task_metadata`.
 - `reward_type = "multi_deterministic_rubrics"` oracles must score `1.0` under the same `scorer/compute_score.py` used for agents.
 - `reward_type = "continuous_scoring_function"` references must score `0.5 ± 0.05`.
-- Continuous ML (`task_type=ml`) **must** commit train.py + trained weights + `model.manifest.json` and keep the solve path inference-only. Trusted CI / ground-truth never train. See `docs/MLENVS_TASKS.md` §4 / `docs/GROUND_TRUTH.md`.
+- Continuous ML (`task_type=ml`) commits an inference-only strategy plus digest manifest. Keep `model.manifest.json` for existing trained models; use `strategy.manifest.json` with explicit `trained_model` / `committed_artifact` kind for procedural training or hand-authored policies/static artifacts. Non-tabular calibration also commits `WorkspaceDegenerateProbes` under `baselines/degenerate/`. Trusted CI / ground-truth never train. See `docs/ML_TASKS.md` §4 / `docs/GROUND_TRUTH.md`.
 - If a MuJoCo task needs a trained policy/model, commit the trained artifact or deterministic exporter under `solution/`; full training code is optional provenance, not the validation path.
 - Reviewer video is required for `mujoco` tasks. Declare it in `[ground_truth]` and generate it with `solution/render.sh`.
 - Reviewer videos are MuJoCo-specific and must be 16:9 720p: exactly `1280x720`.

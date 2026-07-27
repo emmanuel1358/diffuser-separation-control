@@ -14,9 +14,8 @@ You do not need mothership repo access to use this repo. The normal workflow is:
    opens and shows it in the Tasks table. (Path + field are a contract with
    Labelbox; leave the file in place.)
 4. Create your own task in `problems/<task_id>/`.
-5. Implement the task grader: metadata-mode ML uses `test_file.py`; native
-   verticals use `scorer/compute_score.py`.
-6. For continuous ML, commit reproducible reference/naive models and compose
+5. Implement the task grader in `scorer/compute_score.py`.
+6. For continuous ML, commit reproducible reference/naive strategies and compose
    hand-authored evaluation logic with `grading.evaluation.ContinuousTask`.
 7. Optionally run the ground-truth verifier for local feedback.
 8. Commit reproducible task/model source and reviewed
@@ -55,7 +54,7 @@ lbx-rl-tasks-template/
 │   ├── TASK_MIGRATION.md      # migrate older tasks to sealed evaluation stack
 │   ├── GROUND_TRUTH.md        # oracle solution and reviewer video requirements
 │   ├── HIDDEN_ENV.md          # simulation/interaction tasks via the hidden-env RPC server
-│   ├── MLENVS_TASKS.md        # metadata-mode continuous ML authoring/calibration
+│   ├── ML_TASKS.md            # continuous ML authoring/calibration
 │   ├── REWARD_HACKING.md      # reward-hacking mitigations every scorer must respect
 │   ├── NUMERICAL_SOLVERS.md   # installed solver inventory + invocation guide
 │   ├── RUBRIC_EVALUATION.md   # mandatory declarative RubricTask protocol
@@ -66,8 +65,8 @@ lbx-rl-tasks-template/
     └── strctural_engineering/STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md
 ```
 
-The `grader/` package is installed into task Docker images so task-local
-`test_file.py` or `scorer/compute_score.py` can import `grading`. The `harness/`
+The `grader/` package is installed into task Docker images so a task-local
+`scorer/compute_score.py` can import `grading`. The `harness/`
 package lets you run a local Boreal-like LLM attempt before opening a PR.
 Template PR validation only requires the deterministic ground-truth proof in
 `problems/<task_id>/.alignerr/build_proof.json` plus any renderer artifacts
@@ -447,11 +446,10 @@ demonstrates:
   author-owned score/error plumbing.
 - Optional solution and baseline scripts.
 
-`examples/mle-tabular-classification/` is the canonical continuous
-ML_Envs-style reference. It demonstrates:
+`examples/mle-tabular-classification/` is the canonical continuous-scored ml
+reference. It demonstrates:
 
-- A tabular train/test task adapted from
-  `ML_Envs/examples/dataset-example-task_taiga`.
+- A synthetic tabular train/test task.
 - Public parquet files in `data/` and hidden ground truth in
   `scorer/data/`.
 - A queryable `predictor.py`, private challenge bank, `ContinuousTask.model()`,
@@ -470,7 +468,7 @@ Run the ground-truth verifier when you want pre-PR feedback:
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
 ```
 
-For v3 continuous ML, it validates reference/naive models, measures raw
+For v3 continuous ML, it validates reference/naive strategies, measures raw
 metrics, generates and replays the PWL calibration, and atomically updates
 ignored development state:
 
@@ -479,7 +477,8 @@ problems/<task_id>/calibration.lock.json
 problems/<task_id>/.alignerr/calibration.evidence.json
 ```
 
-Commit trained models/manifests, task source, and required reviewer artifacts;
+Commit strategy manifests/artifacts, task source, explicit non-tabular
+no-information workspaces, and required reviewer artifacts;
 do not commit generated calibration files. Trusted CI computes a semantic cache
 key, restores or regenerates the authoritative bundle from the immutable PR
 revision, and promotes that exact lock to Taiga as a read-only mount.
@@ -675,7 +674,7 @@ API secrets.
 - [`docs/GRADING.md`](docs/GRADING.md): detailed grader package guide.
 - [`docs/RUBRIC_EVALUATION.md`](docs/RUBRIC_EVALUATION.md): mandatory
   declarative rubric API, hardening, plans, fault semantics, and migration.
-- [`docs/MLENVS_TASKS.md`](docs/MLENVS_TASKS.md): authoring ML_Envs-style tasks
+- [`docs/ML_TASKS.md`](docs/ML_TASKS.md): authoring continuous-scored `ml` tasks
   (dataset/CSV, model module, executable, HDF5, k-fold) -- submission loaders,
   calibration, licensing, mounts, and base flavors.
 - [`docs/HIDDEN_ENV.md`](docs/HIDDEN_ENV.md): simulation / interaction tasks where

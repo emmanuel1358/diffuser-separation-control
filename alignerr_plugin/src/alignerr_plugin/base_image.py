@@ -14,12 +14,10 @@ from pathlib import Path
 BASE_TAG_PREFIX = "runtime-ml-core-py313"
 BLACKWELL_BASE_TAG_PREFIX = "runtime-ml-blackwell-py313"
 TPU_BASE_TAG_PREFIX = "runtime-ml-tpu-py312"
-# mlenvs-specific bases (py3.12), not shared with the native flavors.
-MLENVS_BASE_TAG_PREFIX = "runtime-mlenvs-py312"
-# Minimal py3.12 base (no heavy ML stack) for local harness runs on weak hosts.
-MLENVS_SLIM_BASE_TAG_PREFIX = "runtime-mlenvs-slim-py312"
-# cu128 / sm_120 overlays, local-dev only, NOT deployable on Taiga.
-MLENVS_BLACKWELL_BASE_TAG_PREFIX = "runtime-mlenvs-blackwell-py312"
+# The graphics base is py3.13 like the core one, but keeps a distinct prefix
+# (as blackwell does) so its tag names the flavor it was built from. It was
+# py3.12 until kaolin and open3d were dropped; see base/cuda-graphics/Dockerfile.
+GRAPHICS_BASE_TAG_PREFIX = "runtime-ml-graphics-py313"
 BLACKWELL_GPU_TYPES = frozenset({"b100", "b200", "gb200"})
 
 
@@ -50,53 +48,15 @@ BASE_FLAVORS: dict[str, BaseFlavor] = {
         tag_prefix=BLACKWELL_BASE_TAG_PREFIX,
     ),
     "cuda-graphics": BaseFlavor(
-        "cuda-graphics", "-cuda-graphics", "base/cuda-graphics/Dockerfile"
+        "cuda-graphics",
+        "-cuda-graphics",
+        "base/cuda-graphics/Dockerfile",
+        tag_prefix=GRAPHICS_BASE_TAG_PREFIX,
     ),
     "tpu": BaseFlavor(
         "tpu", "-tpu", "base/tpu/Dockerfile", tag_prefix=TPU_BASE_TAG_PREFIX
     ),
-    # --- mlenvs-specific flavors (not shared with native verticals) ----------
-    "mlenvs-slim": BaseFlavor(
-        "mlenvs-slim", "-mlenvs-slim", "base/mlenvs-slim/Dockerfile",
-        tag_prefix=MLENVS_SLIM_BASE_TAG_PREFIX,
-    ),
-    "mlenvs-gpu": BaseFlavor(
-        "mlenvs-gpu", "-mlenvs-gpu", "base/mlenvs-gpu/Dockerfile",
-        tag_prefix=MLENVS_BASE_TAG_PREFIX,
-    ),
-    "mlenvs-cuda-graphics": BaseFlavor(
-        "mlenvs-cuda-graphics", "-mlenvs-cuda-graphics",
-        "base/mlenvs-cuda-graphics/Dockerfile", tag_prefix=MLENVS_BASE_TAG_PREFIX,
-        parent="mlenvs-gpu",
-    ),
-    "mlenvs-tpu": BaseFlavor(
-        "mlenvs-tpu", "-mlenvs-tpu", "base/mlenvs-tpu/Dockerfile",
-        tag_prefix=MLENVS_BASE_TAG_PREFIX,
-    ),
-    # Blackwell overlays: local-dev only (cu128 / sm_120); never auto-selected.
-    "mlenvs-gpu-blackwell": BaseFlavor(
-        "mlenvs-gpu-blackwell", "-mlenvs-gpu-blackwell",
-        "base/mlenvs-gpu-blackwell/Dockerfile",
-        tag_prefix=MLENVS_BLACKWELL_BASE_TAG_PREFIX, parent="mlenvs-gpu",
-    ),
-    "mlenvs-cuda-graphics-blackwell": BaseFlavor(
-        "mlenvs-cuda-graphics-blackwell", "-mlenvs-cuda-graphics-blackwell",
-        "base/mlenvs-cuda-graphics-blackwell/Dockerfile",
-        tag_prefix=MLENVS_BLACKWELL_BASE_TAG_PREFIX, parent="mlenvs-cuda-graphics",
-    ),
 }
-
-# The mlenvs-mode flavors, in one place for the resolver / build tooling.
-MLENVS_FLAVORS: frozenset[str] = frozenset(
-    {
-        "mlenvs-slim",
-        "mlenvs-gpu",
-        "mlenvs-cuda-graphics",
-        "mlenvs-tpu",
-        "mlenvs-gpu-blackwell",
-        "mlenvs-cuda-graphics-blackwell",
-    }
-)
 
 # Globs (relative to repo root) whose file contents determine a base image.
 _HASH_GLOBS = (
@@ -247,32 +207,6 @@ def resolve_base_flavor_for_resource(
         raise ValueError(
             "[environment].base_flavor = 'gpu-blackwell' is not supported by "
             "the current Taiga required_resources enum"
-        )
-    # Blackwell overlays are local-dev only; not valid for any Taiga tier.
-    if value in {"mlenvs-gpu-blackwell", "mlenvs-cuda-graphics-blackwell"}:
-        raise ValueError(
-            f"[environment].base_flavor = {declared!r} is a local-only Blackwell "
-            "overlay and is not supported by the current Taiga required_resources "
-            "enum"
-        )
-    # mlenvs-gpu on non-graphics/non-TPU tiers; mlenvs-cuda-graphics on graphics;
-    # mlenvs-tpu on TPU. Mirrors the native gpu/cuda-graphics/tpu tier rules.
-    if value == "mlenvs-gpu" and (
-        is_graphics_resource(required_resources) or is_tpu_resource(required_resources)
-    ):
-        raise ValueError(
-            f"[environment].base_flavor = {declared!r} requires a non-graphics, "
-            f"non-TPU required_resources tier (got {required_resources!r})"
-        )
-    if value == "mlenvs-cuda-graphics" and not is_graphics_resource(required_resources):
-        raise ValueError(
-            f"[environment].base_flavor = {declared!r} requires a graphics "
-            f"required_resources tier (got {required_resources!r})"
-        )
-    if value == "mlenvs-tpu" and not is_tpu_resource(required_resources):
-        raise ValueError(
-            f"[environment].base_flavor = {declared!r} requires a TPU "
-            f"required_resources tier (got {required_resources!r})"
         )
     return value
 

@@ -1,7 +1,7 @@
 # Continuous Evaluation API
 
 This guide is the source of truth for continuous-scoring graders, including
-new sealed-challenge tasks and migrations from older ML_Envs or static
+new sealed-challenge tasks and migrations from older static
 `submission.csv` graders.
 
 This guide applies only to `continuous_scoring_function`. Deterministic rubric
@@ -134,7 +134,7 @@ def compute_score():
     return TASK.compute_score()
 ```
 
-`data/private/challenge.parquet` is root-only and contains the declared feature
+`scorer/data/challenge.parquet` is root-only and contains the declared feature
 columns plus every target truth column. It must have more rows than
 `sample_size`. The runtime:
 
@@ -245,6 +245,33 @@ reject it.
 `custom_static()` is Tier C because arbitrary callbacks do not expose trusted
 per-target evidence units.
 
+### Opaque/non-tabular calibration probes
+
+`ml_task_type` does not define one policy or artifact protocol. Do not infer a
+generic random policy from `dataset`, `sim_policy`, `env`, or `hybrid`.
+Callback-driven `ContinuousTask` tasks instead declare named
+`WorkspaceDegenerateProbes` under `baselines/degenerate/`. Each probe directory
+is a ready-to-measure output workspace in the task's real format and is scored
+through the same module callback as reference, naive, and production.
+
+Trusted calibration:
+
+- securely snapshots only regular bounded files;
+- binds every probe digest into cache, lock, and evidence;
+- measures every probe twice under one shared calibration context;
+- aborts on a missing, faulting, stale, incomplete, duplicate, or
+  nondeterministic probe;
+- never turns an `AgentFault` into authored floor metrics.
+
+Numeric tabular tasks with no explicit provider retain the framework-owned
+constant/jitter/shuffle/row-index/fixed-class family.
+
+Reference and naive strategies use explicit manifests. Existing
+`model.manifest.json` v1 remains valid for trained models.
+`strategy.manifest.json` supports `kind = "trained_model"` with digest-bound
+training inputs, or `kind = "committed_artifact"` for hand-authored policies and
+static artifacts that have no honest training dataset.
+
 ## Calibration lock v3
 
 `calibration.lock.json` is generated, never hand-edited. Schema v3 binds:
@@ -260,6 +287,14 @@ The v3 lock preserves reviewed floors for quality. Degenerate measurements are
 used to qualify/audit no-information behavior; grade-time evidence determines
 eligibility.
 
+The naive qualification range remains exclusive by default: the naive must be
+weak but informative. A task whose honest naive exactly ties every effective
+no-information floor may set `naive_score_min=0.0` and provide
+`naive_at_floor=AnchorRationale(kind="reviewed_exception", ...)`. This emits an
+inclusive zero bound and is accepted only for an exact tie—not for a strategy
+that underperforms the no-information family. It does not alter authored floors
+or grade-time quality scoring.
+
 For local score feedback after changing data, metrics, targets, models,
 challenge protocol, or grader:
 
@@ -272,7 +307,8 @@ uv run lbx-rl-harness run \
 This writes a development `calibration.lock.json` and
 `.alignerr/calibration.evidence.json`. They are local cache state for
 `problems/**` and must not be hand-edited or committed. Commit the reproducible
-reference/naive models, manifests, data provenance, and task source.
+reference/naive strategies, manifests, explicit probe workspaces, data
+provenance, and task source.
 
 For a task that tracked generated evidence under the previous workflow, remove
 it from Git once; local files remain available and are ignored afterward:

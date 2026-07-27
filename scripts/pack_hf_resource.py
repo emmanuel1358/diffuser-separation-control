@@ -3,17 +3,18 @@
 as that repo's HF hub cache folder, for read-only mounting into a task container.
 
 Packs the huggingface_hub cache folder (models--<org>--<name>/{refs,snapshots,
-blobs}) so that, mounted at /tmp/.cache/huggingface/hub/<folder>, an agent can
-from_pretrained("<org>/<name>") entirely offline. Content-addressed by the repo's
-immutable commit sha, resolved from a cheap repo_info metadata call so the cache
-can be checked before paying for a multi-GB download.
+blobs}) so that, mounted at /tmp/hf-cache/hub/<folder> (the flagship bases' HF_HOME),
+an agent can from_pretrained("<org>/<name>") entirely offline. Content-addressed by
+the repo's immutable commit sha, resolved from a cheap repo_info metadata call so the
+cache can be checked before paying for a multi-GB download.
 
 Subcommands (selected by flags; each prints one JSON object, or for --list one
 JSON object per line, to stdout; all human progress goes to stderr):
 
-  --metadata <metadata.json> --list
-      Read metadata.json:hf_resources, normalize each entry, and print one
-      normalized resource object per line. No network.
+  --task-dir <problem-dir> --list
+      Read the task.toml [[preloaded_files]] entries that declare hf_repo,
+      normalize each, and print one normalized resource object per line. No
+      network.
 
   --resource '<json>' --resolve-only
       Resolve the repo's commit sha and derived names. One small metadata call,
@@ -27,9 +28,11 @@ JSON object per line, to stdout; all human progress goes to stderr):
 
 A "resource" is either a string ("org/name") or an object:
   {"repo_id": "org/name", "revision": "main", "repo_type": "model",
-   "allow_patterns": ["*.safetensors", "*.json"], "ignore_patterns": ["*.bin"]}
+   "allow_patterns": ["*.safetensors", "*.json"], "ignore_patterns": ["*.bin"],
+   "mount_path": "/tmp/hf-cache/hub/models--org--name"}
 
-revision defaults to "main", repo_type to "model". allow_patterns/ignore_patterns
+revision defaults to "main", repo_type to "model", and mount_path to the canonical
+hub-cache folder for the repo. allow_patterns/ignore_patterns
 narrow what is downloaded (and thus packed); when either is set the object name
 gets a short pattern-hash suffix so a narrowed variant is a distinct cache
 object from the full repo.
@@ -56,7 +59,8 @@ from typing import NoReturn
 VALID_REPO_TYPES = {"model", "dataset"}
 # A revision matching a 40-hex sha needs no live resolution -- it IS the address.
 _SHA_RE = re.compile(r"\A[0-9a-fA-F]{40}\Z")
-HF_HUB_CACHE_DIR = "/tmp/.cache/huggingface/hub"
+# Matches HF_HOME=/tmp/hf-cache in every flagship base image.
+HF_HUB_CACHE_DIR = "/tmp/hf-cache/hub"
 # Central cross-task cache prefix: each repo@sha is packed/uploaded once.
 REMOTE_PREFIX = "cache/huggingface"
 
@@ -109,7 +113,17 @@ def normalize_resource(entry: object) -> dict:
     allow_patterns = _patterns("allow_patterns")
     ignore_patterns = _patterns("ignore_patterns")
 
-    unknown = set(entry) - {"repo_id", "repo_type", "revision", "allow_patterns", "ignore_patterns"}
+    # An explicit mount_path overrides the canonical hub-cache location. Carried
+    # on the resource so one object flows through resolve/pack and the stamped
+    # mount always matches what task.toml declared.
+    mount_path = entry.get("mount_path", "")
+    if not isinstance(mount_path, str):
+        raise ValueError(f"hf_resources mount_path for {repo_id!r} must be a string")
+
+    unknown = set(entry) - {
+        "repo_id", "repo_type", "revision", "allow_patterns", "ignore_patterns",
+        "mount_path",
+    }
     if unknown:
         raise ValueError(f"hf_resources entry for {repo_id!r} has unknown keys {sorted(unknown)}")
 
@@ -119,6 +133,7 @@ def normalize_resource(entry: object) -> dict:
         "revision": revision,
         "allow_patterns": allow_patterns,
         "ignore_patterns": ignore_patterns,
+        "mount_path": mount_path.strip(),
     }
 
 
@@ -147,7 +162,7 @@ def derive_names(resource: dict, commit_sha: str) -> dict:
     remote_dir = f"{REMOTE_PREFIX}/{folder}"
     return {
         "repo_folder_name": folder,
-        "mount_local_path": f"{HF_HUB_CACHE_DIR}/{folder}",
+        "mount_local_path": resource.get("mount_path") or f"{HF_HUB_CACHE_DIR}/{folder}",
         "remote_dir": remote_dir,
         "remote_basename": f"{commit_sha}{suffix}.squashfs",
         "remote_name": f"{remote_dir}/{commit_sha}{suffix}.squashfs",
@@ -296,20 +311,32 @@ def _have(cmd: str) -> bool:
 
 # --- CLI --------------------------------------------------------------------
 
-def _load_resources_from_metadata(metadata_path: Path) -> list[dict]:
+def _load_resources_from_task_dir(task_dir: Path) -> list[dict]:
+    """Normalized HF resources from the task.toml [[preloaded_files]] hf_repo entries."""
+    import tomllib
+
+    metadata_path = task_dir / "task.toml"
     try:
-        data = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        with metadata_path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
         die(f"could not parse {metadata_path}: {exc}")
-    raw = data.get("hf_resources", []) if isinstance(data, dict) else []
-    if raw in (None, []):
-        return []
+    raw = data.get("preloaded_files", []) if isinstance(data, dict) else []
     if not isinstance(raw, list):
-        die(f"{metadata_path}:hf_resources must be a list")
+        die(f"{metadata_path}: [[preloaded_files]] must be a list")
     out = []
     for entry in raw:
+        if not isinstance(entry, dict) or not entry.get("hf_repo"):
+            continue
         try:
-            out.append(normalize_resource(entry))
+            out.append(normalize_resource({
+                "repo_id": entry["hf_repo"],
+                "repo_type": entry.get("repo_type", "model"),
+                "revision": entry.get("hf_revision") or "main",
+                **({"allow_patterns": entry["allow_patterns"]} if entry.get("allow_patterns") else {}),
+                **({"ignore_patterns": entry["ignore_patterns"]} if entry.get("ignore_patterns") else {}),
+                "mount_path": entry.get("mount_path", ""),
+            }))
         except ValueError as exc:
             die(f"{metadata_path}: {exc}")
     # Two entries for the same (repo_id, repo_type) mount at the same cache dir
@@ -319,7 +346,7 @@ def _load_resources_from_metadata(metadata_path: Path) -> list[dict]:
         key = (r["repo_id"], r["repo_type"])
         if key in seen:
             die(
-                f"{metadata_path}: hf_resources lists {r['repo_id']!r} "
+                f"{metadata_path}: [[preloaded_files]] lists {r['repo_id']!r} "
                 f"({r['repo_type']}) more than once; entries for the same repo "
                 "mount at the same HF cache dir and collide. Use a single entry "
                 "(combine allow_patterns, or omit them for the full repo)."
@@ -330,9 +357,9 @@ def _load_resources_from_metadata(metadata_path: Path) -> list[dict]:
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--metadata", help="path to a task metadata.json (with --list)")
+    ap.add_argument("--task-dir", help="path to a task directory (with --list)")
     ap.add_argument("--resource", help="a single resource as a JSON string")
-    ap.add_argument("--list", action="store_true", help="print normalized resources from --metadata")
+    ap.add_argument("--list", action="store_true", help="print normalized resources from --task-dir")
     ap.add_argument("--resolve-only", action="store_true", help="resolve sha + names; no download")
     ap.add_argument("--pack", action="store_true", help="resolve, download, and pack (needs --out-dir)")
     ap.add_argument("--out-dir", help="output directory for --pack")
@@ -340,14 +367,14 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     if args.list:
-        if not args.metadata:
-            die("--list requires --metadata")
-        for res in _load_resources_from_metadata(Path(args.metadata)):
+        if not args.task_dir:
+            die("--list requires --task-dir")
+        for res in _load_resources_from_task_dir(Path(args.task_dir)):
             print(json.dumps(res, sort_keys=True))
         return 0
 
     if not args.resource:
-        die("one of --list (with --metadata) or --resource is required")
+        die("one of --list (with --task-dir) or --resource is required")
     try:
         resource = normalize_resource(json.loads(args.resource))
     except (json.JSONDecodeError, ValueError) as exc:

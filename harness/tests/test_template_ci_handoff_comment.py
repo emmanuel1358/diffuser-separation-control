@@ -3,10 +3,18 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+from _fixture_guard import requires_repo_paths
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / ".github" / "scripts" / "template_ci_handoff_comment.py"
 TAIGA_DEPLOY_WORKFLOW = ROOT / ".github" / "workflows" / "dispatch-taiga-deploy.yml"
+
+# .github/ is not synced at all: consumer repos keep their own CI and never
+# receive this helper or the taiga-deploy workflow it drives.
+pytestmark = requires_repo_paths(
+    ".github/scripts/template_ci_handoff_comment.py",
+    ".github/workflows/dispatch-taiga-deploy.yml",
+)
 
 
 def _load_helper():

@@ -1,0 +1,6 @@
+# Agent-visible task dependencies, installed into /opt/lbx-runtime/.venv.
+# openseespy/numpy/matplotlib already ship in the base image; they are listed
+# here so this task's dependency set is declared rather than assumed.
+openseespy
+numpy
+matplotlib

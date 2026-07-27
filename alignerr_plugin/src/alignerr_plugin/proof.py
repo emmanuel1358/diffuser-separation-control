@@ -32,8 +32,8 @@ def write_build_proof(
 
     The ``task_dir_sha256`` field holds the *grading-inputs* hash
     (``grading_inputs_sha256``): only ``task.toml`` + ``solution/`` + ``scorer/``
-    + ``data_generation/`` + ``environment/`` count, so doc-only edits do not drop
-    a still-valid result.
+    + ``data/`` + ``data_generation/`` + ``baselines/`` + ``environment/`` count,
+    so doc-only edits do not drop a still-valid result.
     """
     path = problem_dir / PROOF_PATH
     task_hash = grading_inputs_sha256(problem_dir)

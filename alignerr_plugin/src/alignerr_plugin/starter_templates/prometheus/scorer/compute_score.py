@@ -1,9 +1,11 @@
 """Reference grader for the ml task template (continuous scoring)."""
 
+import os
 from pathlib import Path
 from typing import Any
 
 from grading import AgentFault
+from grading.helpers import open_submission_file_or_fault
 
 
 def compute_score(
@@ -12,13 +14,11 @@ def compute_score(
     """Return the continuous reference score when the expected output exists."""
     _ = trajectory, private
     answer = workspace / "answer.txt"
-    if not answer.exists():
+    if not os.path.lexists(answer):
         return 0.0
     try:
-        text = answer.read_text()
-    except OSError as exc:
-        # A directory/FIFO planted at answer.txt is an agent fault, not infra:
-        # raise the typed AgentFault so it is kept as a real 0.0 instead of
-        # crashing the grader (which would discard the score the agent earned).
+        with open_submission_file_or_fault(answer, allow_empty=True) as handle:
+            text = handle.read().decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise AgentFault(f"could not read answer.txt: {exc}") from exc
     return 0.5 if text.strip() else 0.0

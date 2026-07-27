@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from _fixture_guard import requires_examples
 from alignerr_plugin import ground_truth as plugin_ground_truth
 from alignerr_plugin.proof import write_build_proof
 from alignerr_plugin.schemas import StageResult
@@ -38,6 +39,7 @@ def test_cli_runtime_expansion() -> None:
     assert _expand_runtime("deepagents") == ["deepagents"]
 
 
+@requires_examples("mujoco-pendulum")
 def test_solution_runtime_scores_mujoco_example(monkeypatch, tmp_path: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("numpy")

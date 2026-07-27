@@ -12,7 +12,7 @@ Deep API references remain elsewhere:
 | --- | --- |
 | Deterministic rubrics | [`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md) |
 | Continuous / sealed challenges | [`CONTINUOUS_EVALUATION.md`](CONTINUOUS_EVALUATION.md) |
-| ML_Envs file layout ports | [`ML_ENVS_MIGRATION.md`](ML_ENVS_MIGRATION.md) |
+| Removed ML-only layout conversions | [`LEGACY_ML_LAYOUT.md`](LEGACY_ML_LAYOUT.md) |
 | Rubric design principles | [`RUBRIC_GUIDANCE.md`](RUBRIC_GUIDANCE.md) |
 | Reward-hacking expectations | [`REWARD_HACKING.md`](REWARD_HACKING.md) |
 
@@ -45,7 +45,7 @@ task.toml scoring.mode / return shape
         |
         +-- continuous_scoring_function  -->  Path B: ContinuousTask + calibration.lock.json
         |
-        +-- ML_Envs layout only           -->  Port files first (ML_ENVS_MIGRATION.md),
+        +-- removed ML-only layout        -->  Convert layout first (LEGACY_ML_LAYOUT.md),
                                               then Path B (or A if you convert to rubrics)
 ```
 
@@ -176,9 +176,10 @@ only regenerating one JSON file.
   calibration binding and final quality mapping.
 - **Unambiguous metrics:** SRE/F1 (and other registered kernels) are exact,
   versioned, and recorded in the lock.
-- **Reproducible models (mandatory):** reference/naive assets **must** include
-  training scripts, committed weights, `model.manifest.json` digests, and
-  inference-only `solution.py`. Trusted CI never trains.
+- **Reproducible strategies (mandatory):** trained reference/naive assets keep
+  training inputs/code and committed weights; hand-authored policies/static
+  artifacts use `strategy.manifest.json: kind=committed_artifact`. Every solve
+  path is inference-only. Trusted CI never trains.
 - **One-command finalization:** ground truth runs inference, measures metrics,
   generates the lock, verifies 0 / 0.5 / 1 anchors, and updates proof evidence.
 - **Automatic invalidation:** changes to data, models, metrics, rationales,
@@ -228,20 +229,27 @@ V2 locks are not patched in place — regenerate.
 
 1. Replace local metric and curve copies with registered targets +
    `GeneratedCalibration`.
-2. Commit the **mandatory** two-artifact model contract for
-   `reference_solution/` and `TASK.naive` (usually `baselines/naive/`):
-   - `train.py` (provenance only; never executed by validate / ground-truth /
-     Trusted CI seal)
-   - trained model artifact(s)
-   - `model.manifest.json` with matching SHA-256 digests
-   - inference-only `solution.py` that loads those weights into `/tmp/output`
+2. Commit a strategy contract for `reference_solution/` and `TASK.naive`
+   (usually `baselines/naive/`):
+   - trained strategy: `model.manifest.json` v1 or
+     `strategy.manifest.json: kind=trained_model`, training entrypoint,
+     digest-bound inputs/artifacts, and inference-only `solution.py`;
+   - hand-authored policy/static strategy:
+     `strategy.manifest.json: kind=committed_artifact`, artifact digests, and
+     inference-only `solution.py`.
 3. If the old reference **trained at run time** inside `solution.py` /
    `solve.sh`, split it: move fitting into `train.py`, commit the resulting
    weights + refreshed manifest, and leave `solution.py` as load→predict only.
-   A checked-in `submission.csv` alone does **not** satisfy the contract.
+   A checked-in artifact alone does not satisfy the contract; declare it in its
+   manifest.
 4. Add `TASK` (`ContinuousTask.model()` if possible).
 5. Wire production `compute_score()` to `TASK.grade(...)`.
-6. Run local ground truth for feedback; open/update the fork PR so Trusted CI
+6. For non-tabular callbacks, declare ready-to-measure no-information
+   workspaces with `WorkspaceDegenerateProbes`; do not invent CSV probes.
+7. If the honest naive exactly ties the effective no-information floor, add a
+   reviewed `naive_at_floor` exception; otherwise keep the strict weak-positive
+   default.
+8. Run local ground truth for feedback; open/update the fork PR so Trusted CI
    seals production evidence.
 
 #### B2. Calibration lock v2 → v3
@@ -352,7 +360,7 @@ Confirm:
 | Lock schema v2 + `TASK.score` | Lock v3 + `TASK.grade` |
 | Static CSV holdout only | Prefer `ContinuousTask.model()` + private challenge |
 | Fixed open-loop policy answer | Fresh post-commit policy challenge |
-| ML_Envs `_taiga` tree | [`ML_ENVS_MIGRATION.md`](ML_ENVS_MIGRATION.md) then Path B |
+| Removed ML-only layout | [`LEGACY_ML_LAYOUT.md`](LEGACY_ML_LAYOUT.md) then Path B |
 
 ## See also
 
@@ -361,5 +369,5 @@ Confirm:
 - [`CONTINUOUS_EVALUATION.md`](CONTINUOUS_EVALUATION.md) — tiers, lock v3, sealed
   challenges
 - [`RUBRIC_EVALUATION.md`](RUBRIC_EVALUATION.md) — declarative API and plan seal
-- [`ML_ENVS_MIGRATION.md`](ML_ENVS_MIGRATION.md) — layout/import port from ML_Envs
+- [`LEGACY_ML_LAYOUT.md`](LEGACY_ML_LAYOUT.md) — converting the removed ML-only layout
 - [`REWARD_HACKING.md`](REWARD_HACKING.md) — adversarial expectations

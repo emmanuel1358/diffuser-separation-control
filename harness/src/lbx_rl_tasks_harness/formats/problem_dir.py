@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from alignerr_plugin import mlenvs
 from alignerr_plugin.exporters.taiga import build_job_payload
 from alignerr_plugin.utils import load_metadata, load_task_toml, read_prompt, task_id
 
@@ -19,15 +18,9 @@ def load_problem_dir(problem_dir: Path) -> HarnessProblem:
     metadata = load_metadata(problem_dir)
     task_toml = load_task_toml(problem_dir)
     prompt = read_prompt(problem_dir)
-    # metadata-mode: grader is test_file.py at the root, truth under data/private/;
-    # native tasks use scorer/ + scorer/data/.
-    if mlenvs.is_mlenvs_task(problem_dir):
-        grader_dir = problem_dir
-        private_dir = problem_dir / "data" / "private"
-    else:
-        scorer_dir = problem_dir / "scorer"
-        grader_dir = scorer_dir
-        private_dir = scorer_dir / "data"
+    scorer_dir = problem_dir / "scorer"
+    grader_dir = scorer_dir
+    private_dir = scorer_dir / "data"
     taiga_problem = build_job_payload(problem_dir, image_ref="LOCAL_IMAGE")[
         "problems_metadata"
     ]["problem_set"]["problems"][0]

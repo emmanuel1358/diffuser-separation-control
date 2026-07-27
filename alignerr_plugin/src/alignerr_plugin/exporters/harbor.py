@@ -38,6 +38,11 @@ ENV UV_SYSTEM_PYTHON=1
 ENV PATH="/opt/lbx-runtime/.venv/bin:/usr/local/bin:${PATH}"
 ENV TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 ENV BASE_EXTRA_REQUIREMENTS=/tmp/base/requirements-cpu.txt
+# This image builds FROM python:3.13-slim rather than a native base, so it has
+# to repeat what every base/*/Dockerfile sets. [[preloaded_files]] derives its
+# HF mount paths from this root (schemas.HF_HOME), so without it an exported ML
+# task's offline from_pretrained/load_dataset looks in the wrong cache.
+ENV HF_HOME=/tmp/hf-cache
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
@@ -48,7 +53,7 @@ COPY grader/ /runtime/grading/
 COPY base/requirements-runtime.txt base/requirements-common.txt base/requirements-cpu.txt /tmp/base/
 COPY --chmod=0755 base/install-common.sh /tmp/base/install-common.sh
 RUN /tmp/base/install-common.sh
-
+@@TASK_EXTRAS@@
 COPY --chown=root:root scorer/data/ /mcp_server/data/
 COPY --chown=root:root scorer/ /mcp_server/grader/
 COPY data/ /workspace/data/
@@ -59,9 +64,10 @@ RUN rm -rf /data \
     && find /workspace/data -type f -exec chmod 0644 {} +
 COPY task.toml instruction.md /task/
 RUN rm -rf /mcp_server/grader/data \
-    && chown -R root:root /mcp_server/data /mcp_server/grader \
+    && chown -R root:root /mcp_server \
     && find /mcp_server/data /mcp_server/grader -type d -exec chmod 0700 {} + \
-    && find /mcp_server/data /mcp_server/grader -type f -exec chmod 0600 {} +
+    && find /mcp_server/data /mcp_server/grader -type f -exec chmod 0600 {} + \
+    && chmod 0700 /mcp_server
 
 WORKDIR /workdir
 
@@ -86,7 +92,7 @@ COPY grader/ /runtime/grading/
 COPY base/requirements-runtime.txt base/requirements-common.txt base/requirements-cpu.txt base/requirements-solvers.txt /tmp/base/
 COPY --chmod=0755 base/install-common.sh base/install-solvers-heavy.sh /tmp/base/
 RUN /tmp/base/install-common.sh
-
+@@TASK_EXTRAS@@
 COPY --chown=root:root scorer/data/ /mcp_server/data/
 COPY --chown=root:root scorer/ /mcp_server/grader/
 COPY data/ /workspace/data/
@@ -97,139 +103,15 @@ RUN rm -rf /data \
     && find /workspace/data -type f -exec chmod 0644 {} +
 COPY task.toml instruction.md /task/
 RUN rm -rf /mcp_server/grader/data \
-    && chown -R root:root /mcp_server/data /mcp_server/grader \
+    && chown -R root:root /mcp_server \
     && find /mcp_server/data /mcp_server/grader -type d -exec chmod 0700 {} + \
-    && find /mcp_server/data /mcp_server/grader -type f -exec chmod 0600 {} +
+    && find /mcp_server/data /mcp_server/grader -type f -exec chmod 0600 {} + \
+    && chmod 0700 /mcp_server
 
 WORKDIR /workdir
 
 CMD ["/bin/bash"]
 """
-
-
-# Self-contained Dockerfile TEMPLATE for ML_Envs-mode tasks. GPU-capable +
-# CPU-tolerant (cu121 torch wheels bundle the CUDA runtime, so `import torch`
-# works CPU-only and uses the GPU when Harbor grants NVIDIA runtime access).
-# ``_mlenvs_self_contained_dockerfile`` fills the @@APT@@ / @@DEPS@@ /
-# @@ENV_DEPS@@ / @@GRADING_DEPS@@ / @@HIDDEN_ENV@@ placeholders from metadata.json.
-_MLENVS_SELF_CONTAINED_TEMPLATE = """\
-FROM python:3.12-slim
-
-ENV UV_SYSTEM_PYTHON=1
-ENV PATH="/usr/local/nvidia/bin:/opt/lbx-runtime/.venv/bin:/usr/local/bin:${PATH}"
-ENV LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/nvidia/lib"
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
-ENV PYTHON_VERSION=3.12
-ENV SKIP_COMMON_REQUIREMENTS=1
-ENV BASE_EXTRA_REQUIREMENTS=/tmp/base/requirements-mlenvs-common.txt
-ENV TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
-ENV TORCH_PACKAGES="torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121"
-ENV TORCH_INDEX_STRATEGY=unsafe-best-match
-ENV HF_HOME=/tmp/.cache/huggingface
-ENV HF_HUB_OFFLINE=1
-ENV TRANSFORMERS_OFFLINE=1
-ENV HF_DATASETS_OFFLINE=1
-
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
-
-WORKDIR /mcp_server
-
-@@APT@@COPY taiga_runtime/rubric/ /mcp_server/
-COPY grader/ /runtime/grading/
-COPY base/requirements-runtime.txt base/requirements-mlenvs-common.txt /tmp/base/
-COPY --chmod=0755 base/install-common.sh /tmp/base/install-common.sh
-# NOTE: install-common installs requirements-mlenvs-common.txt, which pins the
-# plain `lightgbm` PyPI wheel (CPU). The registry mlenvs-gpu base instead builds
-# lightgbm from source with USE_GPU=ON, so a self-contained Harbor image gets
-# CPU LightGBM. A task that needs GPU LightGBM should deploy via the registry
-# base image (or add a from-source USE_GPU=ON build step here).
-RUN /tmp/base/install-common.sh
-
-@@DEPS@@@@ENV_DEPS@@@@GRADING_DEPS@@COPY --chown=root:root data/private/ /mcp_server/data/
-COPY --chown=root:root calibration.lock.json /mcp_server/calibration/calibration.lock.json
-COPY --chown=root:root test_file.py /mcp_server/grader/compute_score.py
-COPY data/public/ /workspace/data/
-RUN rm -rf /data \
-    && ln -s /workspace/data /data \
-    && chown -R root:root /workspace/data \
-    && find /workspace/data -type d -exec chmod 0755 {} + \
-    && find /workspace/data -type f -exec chmod 0644 {} +
-COPY prompt.md /task/prompt.md
-# Bake the env-server activation field so a hidden-env (env/hybrid) task's
-# supervisor can start; agent-visible, holds no held-out truth.
-RUN printf '[environment]\\nhidden_env = "@@HIDDEN_ENV@@"\\n' > /task/task.toml
-# Re-lock the held-out truth + grader and re-seal /mcp_server after the COPYs
-# above (install-common sealed it once; the COPYs re-added files).
-RUN printf 'author-image-fallback\\n' > /mcp_server/calibration/.author-source \\
-    && chown -R root:root /mcp_server/data /mcp_server/grader /mcp_server/calibration \\
-    && find /mcp_server/data /mcp_server/grader /mcp_server/calibration -type d -exec chmod 0700 {} + \\
-    && find /mcp_server/data /mcp_server/grader /mcp_server/calibration -type f -exec chmod 0600 {} + \\
-    && chmod 0700 /mcp_server \\
-    && mkdir -p /workdir /tmp/output \\
-    && chmod 0777 /workdir /tmp/output
-
-WORKDIR /workdir
-
-CMD ["/bin/bash"]
-"""
-
-
-def _mlenvs_self_contained_dockerfile(problem_dir: Path) -> str:
-    """Render the ML_Envs Harbor Dockerfile from the task's metadata.json, filling
-    the apt_extras / dependencies / env_dependencies / grading_dependencies /
-    hidden_env placeholders."""
-    from alignerr_plugin import mlenvs
-
-    meta = mlenvs.load_mlenvs_metadata(problem_dir)
-    apt = " ".join(meta.get("apt_extras", []) or [])
-    deps = " ".join(meta.get("dependencies", []) or [])
-    env_deps = " ".join(meta.get("env_dependencies", []) or [])
-    grading_deps = " ".join(meta.get("grading_dependencies", []) or [])
-    hidden_env = mlenvs.hidden_env_for_task_type(meta["ml_task_type"])
-
-    apt_block = (
-        "RUN apt-get update \\\n"
-        f"    && apt-get install -y --no-install-recommends {apt} \\\n"
-        "    && rm -rf /var/lib/apt/lists/*\n\n"
-        if apt
-        else ""
-    )
-    deps_block = (
-        "# Task dependencies (agent-visible) into the runtime venv.\n"
-        f"RUN uv pip install --python /opt/lbx-runtime/.venv/bin/python --no-cache {deps}\n\n"
-        if deps
-        else ""
-    )
-    env_deps_block = (
-        "# Env-server-only deps (env/hybrid): root-only /mcp_server/env_deps.\n"
-        "RUN mkdir -p /mcp_server/env_deps \\\n"
-        "    && uv pip install --python /opt/lbx-runtime/.venv/bin/python "
-        f"--target /mcp_server/env_deps --no-cache {env_deps} \\\n"
-        "    && chown -R root:root /mcp_server/env_deps \\\n"
-        "    && find /mcp_server/env_deps -type d -exec chmod 0700 {} + \\\n"
-        "    && find /mcp_server/env_deps -type f -exec chmod 0600 {} +\n\n"
-        if env_deps
-        else ""
-    )
-    grading_deps_block = (
-        "# Grader-only deps (any task type): root-only /mcp_server/grading_deps.\n"
-        "RUN mkdir -p /mcp_server/grading_deps \\\n"
-        "    && uv pip install --python /opt/lbx-runtime/.venv/bin/python "
-        f"--target /mcp_server/grading_deps --no-cache {grading_deps} \\\n"
-        "    && chown -R root:root /mcp_server/grading_deps \\\n"
-        "    && find /mcp_server/grading_deps -type d -exec chmod 0700 {} + \\\n"
-        "    && find /mcp_server/grading_deps -type f -exec chmod 0600 {} +\n\n"
-        if grading_deps
-        else ""
-    )
-    return (
-        _MLENVS_SELF_CONTAINED_TEMPLATE.replace("@@APT@@", apt_block)
-        .replace("@@DEPS@@", deps_block)
-        .replace("@@ENV_DEPS@@", env_deps_block)
-        .replace("@@GRADING_DEPS@@", grading_deps_block)
-        .replace("@@HIDDEN_ENV@@", hidden_env)
-    )
 
 
 _TEST_SH_DEFAULT = """\
@@ -270,13 +152,7 @@ exec python /tests/_runtime/run_grader.py \\
 
 def _grader_uses_llm(problem_dir: Path) -> bool:
     """Best-effort static check: does the task scorer call into the LLM judge?"""
-    from alignerr_plugin import mlenvs
-
-    grader_path = (
-        problem_dir / "test_file.py"
-        if mlenvs.is_mlenvs_task(problem_dir)
-        else problem_dir / "scorer" / "compute_score.py"
-    )
+    grader_path = problem_dir / "scorer" / "compute_score.py"
     if not grader_path.exists():
         return False
     try:
@@ -377,13 +253,57 @@ def _copytree_clean(source: Path, destination: Path) -> None:
     )
 
 
+_TASK_DEPS_BLOCK = """
+# Task-declared dependency channels. install-task-deps.sh routes each channel to
+# its isolation boundary: agent-visible packages into the runtime venv,
+# grader-only and hidden-env-only packages into root-only /mcp_server trees.
+COPY --chmod=0755 base/install-task-deps.sh /tmp/base/install-task-deps.sh
+COPY source_environment/ /tmp/task-deps/environment/
+COPY --chown=root:root scorer/ /tmp/task-deps/scorer/
+RUN /tmp/base/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+"""
+
+# The baked lock is the author's, not the trusted-CI promoted one. The
+# .author-source marker is what lets the rubric server refuse to grade with it
+# when the export declares requires_trusted_mount.
+_CALIBRATION_BLOCK = """
+COPY --chown=root:root calibration.lock.json \\
+    /mcp_server/calibration/calibration.lock.json
+RUN printf 'author-image-fallback\\n' > /mcp_server/calibration/.author-source \\
+    && chown -R root:root /mcp_server/calibration \\
+    && chmod 0700 /mcp_server/calibration \\
+    && chmod 0600 /mcp_server/calibration/calibration.lock.json \\
+    /mcp_server/calibration/.author-source
+"""
+
+_DEPENDENCY_CHANNEL_FILES = (
+    Path("environment") / "apt.txt",
+    Path("environment") / "requirements.txt",
+    Path("scorer") / "requirements.txt",
+    Path("scorer") / "env-requirements.txt",
+)
+
+
+def _task_extras_block(problem_dir: Path) -> str:
+    """Render the Dockerfile steps that depend on what the task actually ships."""
+    blocks = []
+    if any((problem_dir / rel).is_file() for rel in _DEPENDENCY_CHANNEL_FILES):
+        blocks.append(_TASK_DEPS_BLOCK)
+    if (problem_dir / "calibration.lock.json").is_file():
+        blocks.append(_CALIBRATION_BLOCK)
+    return "".join(blocks)
+
+
 def _native_self_contained_dockerfile(problem_dir: Path) -> str:
     """Return the self-contained Harbor Dockerfile for a native ISO task."""
     task_toml = load_task_toml(problem_dir)
     task_type = (task_toml.difficulty.task_type or "").strip().lower()
-    if task_type in _NUMERICAL_SOLVER_TASK_TYPES:
-        return _SOLVER_SELF_CONTAINED_DOCKERFILE
-    return _SELF_CONTAINED_DOCKERFILE
+    template = (
+        _SOLVER_SELF_CONTAINED_DOCKERFILE
+        if task_type in _NUMERICAL_SOLVER_TASK_TYPES
+        else _SELF_CONTAINED_DOCKERFILE
+    )
+    return template.replace("@@TASK_EXTRAS@@\n", _task_extras_block(problem_dir))
 
 
 def _prometheus_solver_instruction_hint(problem_dir: Path) -> str:
@@ -416,59 +336,35 @@ def _append_prometheus_solver_hint(problem_dir: Path, output_dir: Path) -> None:
 
 
 def _write_self_contained_environment(problem_dir: Path, output_dir: Path) -> None:
-    from alignerr_plugin import mlenvs
-
     environment_dir = output_dir / "environment"
     environment_dir.mkdir(parents=True, exist_ok=True)
 
-    if mlenvs.is_mlenvs_task(problem_dir):
-        # ML_Envs layout: prompt.md + test_file.py + data/{public,private}; no
-        # scorer/ or task.toml. Bake the image rendered from the task's metadata.
-        (environment_dir / "Dockerfile").write_text(
-            _mlenvs_self_contained_dockerfile(problem_dir)
-        )
-        for name in ("prompt.md", "test_file.py", "metadata.json"):
-            source = problem_dir / name
-            if source.exists():
-                shutil.copy2(source, environment_dir / name)
-        calibration_lock = problem_dir / "calibration.lock.json"
-        if calibration_lock.is_file():
-            shutil.copy2(calibration_lock, environment_dir / calibration_lock.name)
+    (environment_dir / "Dockerfile").write_text(
+        _native_self_contained_dockerfile(problem_dir)
+    )
+    for name in ("task.toml", "instruction.md", "calibration.lock.json"):
+        source = problem_dir / name
+        if source.exists():
+            shutil.copy2(source, environment_dir / name)
+    for name in ("data", "scorer"):
+        source = problem_dir / name
+        destination = environment_dir / name
+        if source.exists():
+            _copytree_clean(source, destination)
         else:
-            # Legacy ML graders do not read this placeholder; keeping the file
-            # present lets one self-contained Dockerfile serve both contracts.
-            (environment_dir / "calibration.lock.json").write_text("{}\n")
-        source_data = problem_dir / "data"
-        destination_data = environment_dir / "data"
-        if source_data.exists():
-            _copytree_clean(source_data, destination_data)
-        else:
-            destination_data.mkdir(parents=True, exist_ok=True)
-        for sub in ("public", "private"):
-            (destination_data / sub).mkdir(parents=True, exist_ok=True)
-    else:
-        (environment_dir / "Dockerfile").write_text(
-            _native_self_contained_dockerfile(problem_dir)
-        )
-        for name in ("task.toml", "instruction.md"):
-            source = problem_dir / name
-            if source.exists():
-                shutil.copy2(source, environment_dir / name)
-        for name in ("data", "scorer"):
-            source = problem_dir / name
-            destination = environment_dir / name
-            if source.exists():
-                _copytree_clean(source, destination)
-            else:
-                destination.mkdir(parents=True, exist_ok=True)
+            destination.mkdir(parents=True, exist_ok=True)
 
     _copytree_clean(_GRADER_DIR, environment_dir / "grader")
     _copytree_clean(_RUBRIC_DIR, environment_dir / "taiga_runtime" / "rubric")
     _copytree_clean(_BASE_DIR, environment_dir / "base")
 
+    # Always materialized: the task-deps block COPYs source_environment/ even for
+    # a task whose only declared channel lives under scorer/.
     original_environment = problem_dir / "environment"
     if original_environment.exists():
         _copytree_clean(original_environment, environment_dir / "source_environment")
+    else:
+        (environment_dir / "source_environment").mkdir(parents=True, exist_ok=True)
 
 
 def export_harbor(
@@ -491,17 +387,12 @@ def export_harbor(
       * ``solution/``            (optional Oracle solver)
       * ``tests/test.sh``        (shim that calls /runtime/run_grader.py)
     """
-    from alignerr_plugin import mlenvs
-
     _ = image_ref, standalone
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
 
-    if mlenvs.is_mlenvs_task(problem_dir):
-        top_level = ["prompt.md", "test_file.py", "metadata.json", "reference_solution"]
-    else:
-        top_level = ["task.toml", "instruction.md", "solution"]
+    top_level = ["task.toml", "instruction.md", "solution"]
     for name in top_level:
         source = problem_dir / name
         destination = output_dir / name

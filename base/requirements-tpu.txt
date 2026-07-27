@@ -22,3 +22,18 @@ flax==0.10.4
 optax==0.2.4
 orbax-checkpoint==0.11.1
 chex==0.1.89
+# RL / simulation ecosystem for TPU ML tasks. Pinned to the releases current at
+# the jax 0.5.2 cut (2025-03-05) so the resolve cannot drag in a build that
+# expects a newer jax than the libtpu pin above allows.
+equinox==0.11.12
+brax==0.12.1
+# Must track the mujoco C bindings from requirements-common.txt (mujoco==3.8.0).
+# mujoco-mjx 3.3.0 references mjtDisableBit.mjDSBL_PASSIVE, an enum removed in
+# mujoco 3.8.0, so `import mujoco.mjx` died at the base build's import smoke
+# check with "type object 'mujoco._enums.mjtDisableBit' has no attribute
+# 'mjDSBL_PASSIVE'". 3.8.0 resolves cleanly against the jax==0.5.2/jaxlib==0.5.1
+# libtpu pins above and no longer references the removed enum.
+mujoco-mjx==3.8.0
+gymnax==0.0.8
+statsmodels==0.14.4
+safetensors==0.5.3

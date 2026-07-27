@@ -1,15 +1,5 @@
 """Sealed and compatibility evaluation protocols for continuous tasks."""
 
-from grading.evaluation.author import (
-    ContinuousTask,
-    CsvRows,
-    GeneratedCalibration,
-    PrivateTableChallenge,
-    PythonPredictor,
-    load_task_module,
-    load_task_registration,
-    measure_task_module,
-)
 from grading.evaluation.artifacts import (
     JsonArtifact,
     NumericField,
@@ -17,6 +7,20 @@ from grading.evaluation.artifacts import (
     SubmittedFile,
     TextArtifact,
     TrustedJson,
+)
+from grading.evaluation.author import (
+    CALIBRATION_SEED_ENV,
+    CalibrationMeasureContext,
+    ContinuousTask,
+    CsvRows,
+    GeneratedCalibration,
+    PrivateTableChallenge,
+    PythonPredictor,
+    WorkspaceDegenerateProbes,
+    WorkspaceProbe,
+    load_task_module,
+    load_task_registration,
+    measure_task_module,
 )
 from grading.evaluation.context import EvaluationContext
 from grading.evaluation.decision import IIDPermutationEvidence
@@ -55,10 +59,12 @@ from grading.evaluation.rubric import (
 )
 
 __all__ = [
+    "CALIBRATION_LOCK_PATH_ENV",
+    "CALIBRATION_SEED_ENV",
     "AnchorRationale",
     "BinaryF1Target",
-    "CALIBRATION_LOCK_PATH_ENV",
     "CalibrationLock",
+    "CalibrationMeasureContext",
     "ContinuousTask",
     "CsvRows",
     "EvaluationContext",
@@ -69,21 +75,23 @@ __all__ = [
     "IIDPermutationEvidence",
     "JsonArtifact",
     "MetricTarget",
-    "PopulationSRETarget",
+    "NumericField",
     "PolicyEvaluationTask",
+    "PopulationSRETarget",
     "PrivateTableChallenge",
     "PythonPredictor",
-    "NumericField",
-    "RegularFileArtifact",
     "RegisteredMetric",
-    "SRETarget",
+    "RegularFileArtifact",
     "RubricContext",
     "RubricCriterion",
     "RubricEvaluation",
     "RubricTask",
+    "SRETarget",
     "SubmittedFile",
     "TextArtifact",
     "TrustedJson",
+    "WorkspaceDegenerateProbes",
+    "WorkspaceProbe",
     "build_calibration_lock",
     "check_evaluation_plan",
     "evaluation_plan_path",

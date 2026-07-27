@@ -35,7 +35,7 @@ QA checks this split:
 
 These engines are installed for **every** CPU and canonical ML GPU task — both
 the CPU base (`base/cpu/Dockerfile`, Debian `python:3.13-slim`) and the clean GPU
-base (`base/gpu/Dockerfile`, `nvidia/cuda:...ubuntu22.04`) run the same
+base (`base/gpu/Dockerfile`, `nvidia/cuda:...ubuntu24.04`) run the same
 [`../base/install-common.sh`](../base/install-common.sh), which installs
 [`../base/requirements-solvers.txt`](../base/requirements-solvers.txt). They are
 pinned, pip-installable, CPU-friendly, and deterministic. Each was verified to
@@ -82,35 +82,54 @@ via the most reliable cross-distro mechanism and exposed for scorers to call.
 | **SU2** | High-fidelity CFD (RANS) | conda env at `/opt/solver-envs/su2`; CLIs symlinked | `SU2_CFD config.cfg` (on PATH) | CPU + GPU |
 | **OpenFOAM** | High-fidelity CFD | conda env at `/opt/solver-envs/openfoam` | `bash -lc 'source /etc/solver-envs.d/openfoam.sh && blockMesh ... && checkMesh ...'` | CPU + GPU |
 | **CalculiX** | 3D continuum FEM | conda env; `ccx` symlinked onto PATH | `ccx jobname` (on PATH) | CPU + GPU |
-| **OpenROAD** | EDA placement/route | `gpu-openroad` overlay copies from `openroad/orfs` (+ `or-tools` libs) | `openroad -exit script.tcl` (on PATH) | **gpu-openroad only** |
+| **OpenROAD** | EDA placement/route | `gpu-openroad` overlay copies from `openroad/flow-ubuntu24.04-builder` (+ `or-tools` libs) | `openroad -exit script.tcl` (on PATH) | **gpu-openroad only** |
 
 Why these mechanics:
 
 - The CFD/EM engines conflict over MPI in a single conda env, so each gets its
   own isolated env — which also matches the determinism playbook's "run serial /
   fixed decomposition" rule (Meep is the `nompi` build).
-- OpenROAD ships only as a large Ubuntu-built tree (`icu70`, `libpython3.10`,
+- OpenROAD ships only as a large Ubuntu-built tree (`icu74`, `libpython3.12`,
   bundled `or-tools`/`scip`/`highs`). It is isolated in `gpu-openroad` so normal
   ML GPU tasks stay on the clean CUDA/PyTorch stack. EDA tasks opt in with
-  `base_flavor = "gpu-openroad"`.
+  `base_flavor = "gpu-openroad"`. Nothing is rebuilt in the overlay, so the
+  source image's Ubuntu release must match `base/gpu`'s — the overlay copies
+  from `openroad/flow-ubuntu24.04-builder` (noble) because `base/gpu` is noble.
+  Bumping `base/gpu`'s Ubuntu requires re-sourcing OpenROAD from the matching
+  `openroad/flow-ubuntu<release>-builder`; the overlay's `ldd` guard fails the
+  build if the two ever drift apart.
 
 ### Verify the stack
 
+The harness discards a local base whose `lbx.base.drift_hash` label does not
+match the current `base/` (see [AUTHORING.md](AUTHORING.md#local-base-images)),
+so stamp the hash when building one by hand or the next harness run rebuilds it.
+
 ```bash
+drift="$(python3 -c "
+from pathlib import Path
+import sys
+sys.path.insert(0, 'alignerr_plugin/src')
+from alignerr_plugin.base_image import base_drift_hash
+print(base_drift_hash(Path('.')))
+")"
+
 # CPU base -> 14/14 (OpenROAD reported as SKIP, it is GPU-only)
-docker build -f base/cpu/Dockerfile -t lbx-tasks-base:runtime-ml-core-py313-local .
+docker build -f base/cpu/Dockerfile --label "lbx.base.drift_hash=$drift" \
+    -t lbx-tasks-base:runtime-ml-core-py313-local .
 docker run --rm -v "$PWD/base/tests/test_solvers.py:/tmp/test_solvers.py:ro" \
     lbx-tasks-base:runtime-ml-core-py313-local python /tmp/test_solvers.py
 
 # Clean GPU base -> 14/14 (OpenROAD reported as SKIP). Builds without a GPU;
 # every engine in the smoke test is CPU, so it runs anywhere -- only CUDA
 # workloads need a GPU.
-docker build -f base/gpu/Dockerfile -t lbx-tasks-base-gpu:runtime-ml-core-py313-local .
+docker build -f base/gpu/Dockerfile --label "lbx.base.drift_hash=$drift" \
+    -t lbx-tasks-base-gpu:runtime-ml-core-py313-local .
 docker run --rm -v "$PWD/base/tests/test_solvers.py:/tmp/test_solvers.py:ro" \
     lbx-tasks-base-gpu:runtime-ml-core-py313-local python /tmp/test_solvers.py
 
 # OpenROAD overlay -> 15/15.
-docker build -f base/gpu-openroad/Dockerfile \
+docker build -f base/gpu-openroad/Dockerfile --label "lbx.base.drift_hash=$drift" \
     -t lbx-tasks-base-gpu-openroad:runtime-ml-core-py313-local .
 docker run --rm -v "$PWD/base/tests/test_solvers.py:/tmp/test_solvers.py:ro" \
     lbx-tasks-base-gpu-openroad:runtime-ml-core-py313-local python /tmp/test_solvers.py
@@ -120,15 +139,36 @@ Reference values (identical across arch, a good determinism signal):
 aerosandbox VLM `CL=0.4324`, pyspice `Vout=5.000V`, cantera `Tad=2225.5K`,
 coolprop water `Tsat=373.12K`, meep FDTD `Ez=-0.26517`.
 
-> Note: PySpice 1.5 prints `Unsupported Ngspice version 44` (on the Debian CPU
-> base) and a couple of `SyntaxWarning`s from its docstrings. Both are cosmetic
-> — the simulation runs and returns correct results.
+> Note: PySpice 1.5 prints `Unsupported Ngspice version 42`/`44` and a couple of
+> `SyntaxWarning`s from its docstrings. Both are cosmetic — the simulation runs
+> and returns correct results.
 >
-> The CPU base ships ngspice **44** (Debian) and the GPU base ships ngspice
-> **36** (Ubuntu 22.04). The divider smoke test returns `Vout=5.000V` on both.
-> This version skew is a non-issue for determinism because SPICE tasks should
+> The CPU base ships ngspice **44** (Debian trixie) and the GPU bases ship
+> ngspice **42** (Ubuntu 24.04; it was 36 on Ubuntu 22.04 before the CUDA 13
+> move). The divider smoke test returns `Vout=5.000V` on both.
+>
+> ngspice **42 specifically** needs a one-line fix applied by
+> [`../base/install-common.sh`](../base/install-common.sh), and it is worth
+> knowing why before touching either version. PySpice's
+> `NgSpiceShared._send_char` treats every stderr line that does not begin with
+> `Warning:` as a hard error, and 42 is the one release that announces its
+> direct linear solver on **stderr** at the start of every analysis
+> (`Using SPARSE 1.3 as Direct Linear Solver`). So a correct `.op` raised
+> `NgSpiceCommandError: Command 'run' failed` *after* producing its data rows.
+> jammy's 36 was built without KLU and wrote nothing to stderr; trixie's 44 is
+> KLU-enabled but no longer emits the banner there — 42 sits alone in the middle,
+> and the CUDA 13 move landed the GPU bases squarely on it. There is no version
+> escape: PySpice 1.5 (May 2021) is the final PyPI release and upstream master
+> holds no code past it, and 42+ds-3build1 is the only ngspice anywhere in the
+> noble archive (universe, updates, backports, security, proposed). Asking for
+> KLU with `.options klu` only changes the banner's wording, not its stream. So
+> `install-common.sh` teaches PySpice that the banner is informational; no
+> numerics change, and the patch asserts on its anchor so a PySpice bump fails
+> the build instead of silently breaking every SPICE solve.
+>
+> The 42-vs-44 skew is a non-issue for determinism because SPICE tasks should
 > pick a CPU `required_resources` enum and therefore build from the CPU base. If
-> you ever need a SPICE task on the GPU base, pin/verify ngspice behavior
+> you ever need a SPICE task on a GPU base, pin/verify ngspice behavior
 > explicitly.
 
 ### Solver-agnostic instructions with solver-backed oracles
@@ -167,9 +207,9 @@ automatically. Local harness runs already use the updated `base/` files
 directly, so no tag bump is needed for local authoring.
 
 Heads-up on size/time: the heavy engines (conda envs + OpenROAD copy) add
-several GB and minutes to each base build, and the GPU base now pulls
-`openroad/orfs` at build time. This is the cost of baking everything into the
-shared base rather than per-task layers.
+several GB and minutes to each base build, and the `gpu-openroad` overlay pulls
+`openroad/flow-ubuntu24.04-builder` (~1.6 GB compressed) at build time. This is
+the cost of baking everything into the shared base rather than per-task layers.
 
 ## Still per-task (not baked into the base)
 
@@ -184,7 +224,7 @@ are starting points; validate per task with
 | **XFOIL** | 2D airfoil viscous-inviscid | No maintained pip/conda CLI (`xfoil` pip is dead on py3.13); fragile gfortran build | build from `web.mit.edu/drela/.../xfoil6.99.tgz` with `gfortran` + `libx11-dev` |
 | **AVL** | Vortex-lattice (Drela) | Same Fortran/X11 build situation as XFOIL | build from `web.mit.edu/drela/.../avl3.36.tgz` |
 | **PyNEC** | EM antennas (MoM) | pip sdist drops its SWIG wrapper on py3.13; needs autotools + SWIG source build | build `github.com/tmolteno/necpp` (`./build.sh`, then `python/` bindings) |
-| **DREAMPlace** | EDA placement (GPU) | Custom CUDA ops; build + run require an actual GPU (can't verify in CI here) | GPU base + source build against the base's CUDA 12.4 torch |
+| **DREAMPlace** | EDA placement (GPU) | Custom CUDA ops; build + run require an actual GPU (can't verify in CI here) | GPU base + source build against the base's CUDA 13.0 torch |
 
 > AeroSandbox (VLM) + NeuralFoil (an ML XFOIL surrogate) are already in the base,
 > so most airfoil/wing aero tasks do not need the XFOIL/AVL CLIs.
@@ -195,6 +235,20 @@ are starting points; validate per task with
 
 ### Example: a task that needs XFOIL (built from source)
 
+Split the recipe: the apt build toolchain is an ordinary declared dependency, so
+it goes in `environment/apt.txt` and only the fetch-and-build stays in a `RUN`.
+Validation rejects a raw `apt-get install` in a task Dockerfile precisely
+because that half *does* have a channel (see
+[`AUTHORING.md`](AUTHORING.md#task-dependencies)).
+
+```text
+# environment/apt.txt
+gfortran
+make
+libx11-dev
+curl
+```
+
 ```dockerfile
 ARG BASE_IMAGE=lbx-tasks-base
 ARG BASE_TAG=runtime-ml-core-py313-local
@@ -202,15 +256,23 @@ ARG PROBLEM_DIR=problems/airfoil-xfoil-polar
 FROM ${BASE_IMAGE}:${BASE_TAG}
 ARG PROBLEM_DIR=problems/airfoil-xfoil-polar
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends gfortran make libx11-dev curl \
- && curl -fsSL https://web.mit.edu/drela/Public/web/xfoil/xfoil6.99.tgz | tar xz -C /opt \
- && echo "build /opt/Xfoil/plotlib then /opt/Xfoil/bin with FC=gfortran; cp xfoil /usr/local/bin" \
- && rm -rf /var/lib/apt/lists/*
 WORKDIR /workdir
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+# No channel routes a source build, so this part stays here.
+RUN curl -fsSL https://web.mit.edu/drela/Public/web/xfoil/xfoil6.99.tgz | tar xz -C /opt \
+ && echo "build /opt/Xfoil/plotlib then /opt/Xfoil/bin with FC=gfortran; cp xfoil /usr/local/bin"
 RUN mkdir -p /mcp_server/data /workdir /tmp/output && chown -R 1000:1000 /workdir /tmp/output
 # Copy task data, scorer/data, scorer/, and task metadata as in the starters.
 # The shared grading package is already installed in the selected base image.
 ```
+
+Keeping the toolchain out of the final image (`apt-get install ... && build &&
+apt-get purge`) is the one apt case a channel cannot express. Precede that `RUN`
+with `# lbx-allow-raw-install: <reason>` to silence the Dockerfile scan. The
+authoritative image diff needs no exemption here: a purged package leaves no
+trace in the built image, so there is nothing for it to object to.
 
 ### Example: a task that uses an in-base engine (no extra install)
 
@@ -221,9 +283,13 @@ ARG PROBLEM_DIR=problems/sallen-key-lowpass
 FROM ${BASE_IMAGE}:${BASE_TAG}
 ARG PROBLEM_DIR=problems/sallen-key-lowpass
 WORKDIR /workdir
-RUN mkdir -p /mcp_server/data /workdir /tmp/output && chown -R 1000:1000 /workdir /tmp/output
 # PySpice/ngspice, Cantera, scikit-fem, Meep, SU2, OpenFOAM, CalculiX,
-# OpenSeesPy are already in the base; nothing else to install.
+# OpenSeesPy are already in the base. Keep the channel hook anyway: it is where
+# anything else this task needs gets declared, and it is a no-op until then.
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+RUN mkdir -p /mcp_server/data /workdir /tmp/output && chown -R 1000:1000 /workdir /tmp/output
 COPY ${PROBLEM_DIR}/data/ /data/
 COPY --chown=root:root ${PROBLEM_DIR}/scorer/data/ /mcp_server/data/
 COPY --chown=root:root ${PROBLEM_DIR}/scorer/ /mcp_server/grader/
@@ -260,11 +326,11 @@ any base change.
 
 | Binary | Version | Source | Bases |
 | --- | --- | --- | --- |
-| `ngspice` / `libngspice0` | 44 (Debian CPU) / 36 (Ubuntu GPU) | apt | CPU + GPU |
+| `ngspice` / `libngspice0` | 44 (Debian CPU) / 42 (Ubuntu GPU) | apt | CPU + GPU |
 | `ccx` (CalculiX) | 2.23 | conda env, symlinked | CPU + GPU |
 | `SU2_CFD` / `SU2_SOL` / `SU2_DEF` | 8.5.0 | conda env, symlinked | CPU + GPU |
 | `simpleFoam` / `pimpleFoam` / `blockMesh` / `topoSet` / `createBaffles` (OpenFOAM) | v2412 | conda env (`source /etc/solver-envs.d/openfoam.sh`) | CPU + GPU |
-| `openroad` | 26Q2 | multi-stage copy from `openroad/orfs` | GPU only |
+| `openroad` | 26Q3 | multi-stage copy from `openroad/flow-ubuntu24.04-builder` | `gpu-openroad` only |
 
 ### Runtime venv — pip packages (`/opt/lbx-runtime/.venv`, 191 total)
 
@@ -487,5 +553,5 @@ zstandard==0.25.0
 
 </details>
 
-> The GPU base adds CUDA `torch` wheels and `openroad`; otherwise the solver
-> inventory matches the CPU base.
+> The GPU base adds CUDA `torch` wheels, and the `gpu-openroad` overlay on top of
+> it adds `openroad`; otherwise the solver inventory matches the CPU base.

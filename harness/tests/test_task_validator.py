@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import runpy
 import subprocess
+import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-
 from alignerr_plugin.ground_truth import sha256_file
 from alignerr_plugin.local_runtime import LocalBaseImage
+from alignerr_plugin.validators.task import image_deps
 from alignerr_plugin.validators.task import validator as validator_module
 from alignerr_plugin.validators.task.validator import (
-    TaskValidator,
     _PRIVATE_LAYOUT_PROBE,
+    TaskValidator,
     reward_hack_lint,
 )
+from grading import AgentFault
 
 _VALID_PROMPT = (
     "Train a classifier on the tabular dataset provided under /data/. "
@@ -95,7 +100,6 @@ domain = "{domain or _default_domain(task_type)}"
 reward_type = "{reward_type}"
 license = "MIT"
 license_source = "https://github.com/owner/dataset/blob/main/LICENSE"
-
 {ground_truth}
 [[outputs]]
 path = "/tmp/output/result.txt"
@@ -117,6 +121,16 @@ def _write_private_layout_problem(
     (problem_dir / "data").mkdir()
     (problem_dir / "scorer" / "data").mkdir()
     (problem_dir / "environment" / "Dockerfile").write_text(dockerfile_text)
+
+
+def _declare_hidden_env(problem_dir: Path, mode: str = "env") -> None:
+    """Turn the fixture into a hidden-env task (which runs an env server)."""
+    task_toml = problem_dir / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text().replace(
+            "[environment]\n", f'[environment]\nhidden_env = "{mode}"\n'
+        )
+    )
 
 
 def test_solution_answer_key_leak_flags_shell_reading_private_data(
@@ -905,6 +919,427 @@ def test_private_data_layout_accepts_hardened_dockerfile(tmp_path: Path) -> None
     assert stage.issues == []
 
 
+def test_private_data_layout_rejects_dep_in_agent_and_private_channels(
+    tmp_path: Path,
+) -> None:
+    """A private-channel package also in the runtime venv is agent-importable."""
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir)
+    (problem_dir / "environment" / "requirements.txt").write_text(
+        "# agent-visible\nscikit-learn==1.5.0\nSecret_Scorer[extra]>=2\n"
+    )
+    (problem_dir / "scorer" / "requirements.txt").write_text(
+        "secret-scorer==2.1\n--index-url https://example.invalid/simple\n"
+    )
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    overlap = [i for i in stage.issues if "scorer/requirements.txt" in i]
+    assert len(overlap) == 1, stage.issues
+    # Normalized across the extra, the case, and the underscore/dash spelling.
+    assert "'secret-scorer'" in overlap[0]
+    # The package declared in only one channel is not flagged.
+    assert "scikit-learn" not in overlap[0]
+
+
+def test_private_data_layout_rejects_env_channel_overlap(tmp_path: Path) -> None:
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir)
+    _declare_hidden_env(problem_dir)
+    (problem_dir / "environment" / "requirements.txt").write_text("gymnasium==1.0\n")
+    (problem_dir / "scorer" / "env-requirements.txt").write_text("gymnasium==1.0\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    assert any(
+        "scorer/env-requirements.txt" in issue and "gymnasium" in issue
+        for issue in stage.issues
+    ), stage.issues
+
+
+def test_private_data_layout_rejects_env_requirements_without_a_hidden_env(
+    tmp_path: Path,
+) -> None:
+    """Nothing imports /mcp_server/env_deps when no env server runs."""
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir)
+    (problem_dir / "scorer" / "env-requirements.txt").write_text("gymnasium==1.0\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    assert any(
+        "[environment].hidden_env is unset" in issue for issue in stage.issues
+    ), stage.issues
+
+
+def test_private_data_layout_allows_env_requirements_with_a_hidden_env(
+    tmp_path: Path,
+) -> None:
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir)
+    (problem_dir / "scorer" / "env-requirements.txt").write_text("gymnasium==1.0\n")
+    _declare_hidden_env(problem_dir)
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+def test_private_data_layout_rejects_unanalyzable_dependency_spec(
+    tmp_path: Path,
+) -> None:
+    """A bare VCS URL has no resolvable name, so overlap cannot be checked."""
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir)
+    (problem_dir / "scorer" / "requirements.txt").write_text(
+        "git+https://example.invalid/secret-scorer.git\n"
+    )
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    assert any("bare VCS URL or local path" in issue for issue in stage.issues)
+
+
+def test_private_data_layout_accepts_disjoint_dependency_channels(
+    tmp_path: Path,
+) -> None:
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir)
+    _declare_hidden_env(problem_dir)
+    (problem_dir / "environment" / "requirements.txt").write_text(
+        "# agent-visible\nscikit-learn==1.5.0\n"
+    )
+    (problem_dir / "scorer" / "requirements.txt").write_text(
+        "secret-scorer @ git+https://example.invalid/secret-scorer.git\n"
+    )
+    (problem_dir / "scorer" / "env-requirements.txt").write_text("gymnasium==1.0\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+def test_private_data_layout_rejects_raw_pip_install_in_dockerfile(
+    tmp_path: Path,
+) -> None:
+    """A raw pip install lands everything in the agent-visible runtime venv."""
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(
+        problem_dir,
+        _HARDENED_DOCKERFILE + "RUN env -u UV_SYSTEM_PYTHON uv pip install"
+        " --python /opt/lbx-runtime/.venv/bin/python --no-cache openseespy numpy\n",
+    )
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    raw = [i for i in stage.issues if "installs pip packages directly" in i]
+    assert len(raw) == 1, stage.issues
+    assert "environment/requirements.txt" in raw[0]
+    assert "scorer/requirements.txt" in raw[0]
+    assert "scorer/env-requirements.txt" in raw[0]
+
+
+def test_private_data_layout_rejects_raw_apt_install_in_dockerfile(
+    tmp_path: Path,
+) -> None:
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(
+        problem_dir,
+        _HARDENED_DOCKERFILE
+        + "RUN apt-get update && apt-get install -y --no-install-recommends ngspice\n",
+    )
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    raw = [i for i in stage.issues if "installs apt packages directly" in i]
+    assert len(raw) == 1, stage.issues
+    assert "environment/apt.txt" in raw[0]
+
+
+def test_private_data_layout_accepts_install_task_deps_dockerfile(
+    tmp_path: Path,
+) -> None:
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(
+        problem_dir,
+        """\
+FROM lbx-tasks-base:runtime-ml-core-py313-local
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+"""
+        + _HARDENED_DOCKERFILE.removeprefix(
+            "FROM lbx-tasks-base:runtime-ml-core-py313-local\n"
+        ),
+    )
+    (problem_dir / "environment" / "requirements.txt").write_text("openseespy\n")
+    (problem_dir / "environment" / "apt.txt").write_text("ngspice\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        (
+            "RUN micromamba create -y -p /opt/solver-envs/necpp -c conda-forge swig"
+            " \\\n    && /opt/solver-envs/necpp/bin/pip install ./necpp/python"
+        ),
+        "RUN conda run -n meep pip install ./meep/python",
+        "RUN micromamba run -n meep python -m pip install ./meep/python",
+        "RUN /opt/conda/envs/meep/bin/python -m pip install ./meep/python",
+        "RUN uv pip install --python /opt/solver-envs/su2/bin/python ./su2/python",
+        "RUN uv pip install --prefix /opt/conda/envs/meep ./meep/python",
+        "RUN /opt/solver-envs/meep/bin/pip3.13 install ./meep/python",
+        "RUN conda run -n meep python -m pip --no-cache-dir install ./meep/python",
+        # Not installs at all.
+        "RUN pip list && uv pip list",
+    ],
+)
+def test_private_data_layout_allows_pip_into_a_non_runtime_interpreter(
+    tmp_path: Path, run_line: str
+) -> None:
+    """A conda solver env has no dependency channel, so it stays a task recipe."""
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir, _HARDENED_DOCKERFILE + run_line + "\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        # base/install-common.sh symlinks both pip names into the runtime venv.
+        "RUN /usr/local/bin/pip install openseespy",
+        "RUN /usr/local/bin/pip3 install openseespy",
+        "RUN /usr/bin/pip install openseespy",
+        # ...and makes /usr/local/bin/python a wrapper exec'ing the venv python.
+        "RUN /usr/local/bin/python -m pip install openseespy",
+        "RUN /usr/local/bin/python3 -m pip install openseespy",
+        "RUN /usr/local/bin/python3.13 -m pip install openseespy",
+        "RUN uv pip install --python /usr/local/bin/python openseespy",
+        # PATH leads with the venv, so a resolved interpreter is the venv's.
+        "RUN $(which pip) install openseespy",
+        "RUN $(command -v python) -m pip install openseespy",
+        "RUN `which pip` install openseespy",
+        # A shim the task made itself, under a name of its own choosing.
+        "RUN /usr/local/bin/task-python -m pip install openseespy",
+        # A bare --python target is a PATH lookup, so it is the venv too.
+        "RUN uv pip install --python python3.13 openseespy",
+        "RUN uv pip install --python=python openseespy",
+        "RUN uv pip install --python $(which python) openseespy",
+        # Versioned pip entry points, and flags between the parts.
+        "RUN pip3.13 install openseespy",
+        "RUN /usr/local/bin/pip3.13 install openseespy",
+        "RUN python -m pip --no-cache-dir install openseespy",
+        "RUN uv --quiet pip install openseespy",
+        "RUN uv pip --no-cache install openseespy",
+    ],
+)
+def test_private_data_layout_rejects_pip_through_a_runtime_alias(
+    tmp_path: Path, run_line: str
+) -> None:
+    """An alias for the runtime venv is still an agent-visible install.
+
+    Spelling the interpreter as anything other than /opt/lbx-runtime must not
+    be mistaken for a separate environment that has no channel.
+    """
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir, _HARDENED_DOCKERFILE + run_line + "\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    assert any(
+        "installs pip packages directly" in i for i in stage.issues
+    ), stage.issues
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        'RUN ["pip", "install", "openseespy"]',
+        'RUN ["uv", "pip", "install", "openseespy"]',
+        'RUN ["/usr/local/bin/pip", "install", "openseespy"]',
+        'RUN ["apt-get", "install", "-y", "ngspice"]',
+        # Shell-through-exec: the -c argument is a shell body.
+        'RUN ["sh", "-c", "apt-get update && pip install openseespy"]',
+        'RUN ["/bin/bash", "-c", "uv pip install openseespy"]',
+    ],
+)
+def test_private_data_layout_rejects_exec_form_installs(
+    tmp_path: Path, run_line: str
+) -> None:
+    """Exec form is a syntax variant, not an exemption."""
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir, _HARDENED_DOCKERFILE + run_line + "\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    assert any("installs" in i and "directly" in i for i in stage.issues), stage.issues
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        'RUN ["/opt/solver-envs/meep/bin/pip", "install", "./meep/python"]',
+        'RUN ["conda", "run", "-n", "meep", "pip", "install", "./meep/python"]',
+        'RUN ["/opt/lbx-runtime/install-task-deps.sh", "/tmp/task-deps"]',
+        'RUN ["make", "-C", "/opt/Xfoil/bin"]',
+        # Not JSON at all, and a shell command that merely contains a list.
+        "RUN [ -d /opt/Xfoil ] && make -C /opt/Xfoil/bin",
+        'RUN python -c "print([1, 2])"',
+    ],
+)
+def test_private_data_layout_allows_exec_form_without_a_channel(
+    tmp_path: Path, run_line: str
+) -> None:
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir, _HARDENED_DOCKERFILE + run_line + "\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        "RUN sh -c 'pip install humanize'",
+        'RUN sh -c "pip install humanize"',
+        "RUN bash -lc 'apt-get install -y sl'",
+        "RUN bash -euxc 'apt-get install -y sl'",
+        "RUN /bin/sh -c 'pip install humanize'",
+        # The payload is only reachable after two unwraps.
+        "RUN sh -c \"sh -c 'pip install humanize'\"",
+        # Wrapped command reached through a separator in the outer body.
+        "RUN mkdir -p /opt/x && sh -c 'pip install humanize'",
+    ],
+)
+def test_private_data_layout_unwraps_shell_c_installs(
+    tmp_path: Path, run_line: str
+) -> None:
+    """`sh -c '...'` is the common way to hide an install from a text scan.
+
+    shlex keeps the payload as one token, so the command inside is invisible
+    until the payload is split as a shell body of its own. The image diff
+    catches these regardless; the static layer catching them too is what makes
+    the error point at a line number.
+    """
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir, _HARDENED_DOCKERFILE + run_line + "\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    assert any("installs" in i and "directly" in i for i in stage.issues), stage.issues
+
+
+@pytest.mark.parametrize(
+    "run_line",
+    [
+        # -c consumes the next word, so nothing here is a shell body.
+        "RUN sh -c 'make -C /opt/Xfoil/bin'",
+        "RUN bash -lc '/opt/solver-envs/meep/bin/pip install ./meep/python'",
+        "RUN bash -lc '/opt/lbx-runtime/install-task-deps.sh /tmp/task-deps'",
+        # A shell invoked on a script file, not an inline body.
+        "RUN sh /opt/build-solver.sh",
+    ],
+)
+def test_private_data_layout_allows_wrapped_commands_without_a_channel(
+    tmp_path: Path, run_line: str
+) -> None:
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(problem_dir, _HARDENED_DOCKERFILE + run_line + "\n")
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+def test_private_data_layout_allows_a_shim_that_does_not_install(
+    tmp_path: Path,
+) -> None:
+    """Pointing /usr/local/bin/python at the venv is a documented task pattern.
+
+    examples/opensees-base-isolation does exactly this; only an install through
+    the alias is a violation, not creating or using the alias.
+    """
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(
+        problem_dir,
+        _HARDENED_DOCKERFILE
+        + "RUN printf '#!/bin/sh\\nexec /opt/lbx-runtime/.venv/bin/python \"$@\"\\n'"
+        " > /usr/local/bin/python \\\n"
+        "    && chmod 0755 /usr/local/bin/python \\\n"
+        "    && /usr/local/bin/python -c \"import openseespy; print('ok')\"\n",
+    )
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+def test_private_data_layout_allows_source_build_without_a_channel(
+    tmp_path: Path,
+) -> None:
+    """Fetch + `make` recipes (XFOIL, AVL, PyNEC) have no channel to move to."""
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(
+        problem_dir,
+        _HARDENED_DOCKERFILE
+        + "RUN curl -fsSL https://example.invalid/xfoil6.99.tgz | tar xz -C /opt \\\n"
+        "    && make -C /opt/Xfoil/bin FC=gfortran\n",
+    )
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+def test_private_data_layout_honors_the_raw_install_opt_out(tmp_path: Path) -> None:
+    """The opt-out exempts one instruction and requires a written reason."""
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(
+        problem_dir,
+        _HARDENED_DOCKERFILE
+        + "# lbx-allow-raw-install: gfortran toolchain, purged in the same layer\n"
+        "RUN apt-get install -y gfortran && make -C /opt/Xfoil/bin"
+        " && apt-get purge -y gfortran\n",
+    )
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert stage.passed, stage.issues
+
+
+def test_private_data_layout_rejects_raw_install_opt_out_without_a_reason(
+    tmp_path: Path,
+) -> None:
+    problem_dir = tmp_path / "private-layout"
+    _write_private_layout_problem(
+        problem_dir,
+        _HARDENED_DOCKERFILE
+        + "# lbx-allow-raw-install:\nRUN apt-get install -y gfortran\n",
+    )
+
+    stage = TaskValidator()._private_data_layout(problem_dir)
+
+    assert not stage.passed
+    assert any("installs apt packages directly" in i for i in stage.issues)
+
+
 def test_private_data_layout_rejects_private_copy_to_public_data(
     tmp_path: Path,
 ) -> None:
@@ -1226,12 +1661,33 @@ def _write_build_proof_problem(tmp_path: Path) -> Path:
     return problem_dir
 
 
-def test_local_build_proof_runs_private_layout_and_agent_python_image_probes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    problem_dir = _write_build_proof_problem(tmp_path)
-    run_calls: list[list[str]] = []
-    proof_calls: list[dict[str, object]] = []
+def _package_probe_payload(
+    venv: tuple[str, ...] = (), apt: tuple[str, ...] = ()
+) -> str:
+    payload = {
+        "apt": list(apt),
+        "trees": {
+            label: {
+                "installed": (
+                    {name: "1.0" for name in venv} if label == "venv" else {}
+                ),
+                "closure": [],
+                "unparseable": [],
+            }
+            for label in ("venv", "grading", "env")
+        },
+    }
+    return f"{image_deps._PROBE_MARKER}{json.dumps(payload)}\n"
+
+
+def _fake_build_proof_docker(
+    run_calls: list[list[str]], probe_stdout: dict[str, str]
+) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """Stand-in for docker across the whole build-proof stage.
+
+    `probe_stdout` maps an image ref to that image's package-probe output, so a
+    test can pose a base and a task image that differ.
+    """
 
     def fake_run(
         args: list[str], **_kwargs: object
@@ -1239,9 +1695,19 @@ def test_local_build_proof_runs_private_layout_and_agent_python_image_probes(
         run_calls.append(args)
         if args[:3] == ["docker", "buildx", "build"]:
             Path(args[args.index("--iidfile") + 1]).write_text("sha256:local")
-            return subprocess.CompletedProcess(args, 0, "", "")
+        elif image_deps._PROBE_MARKER in args[-1]:
+            image_ref = args[-3]
+            return subprocess.CompletedProcess(
+                args, 0, probe_stdout.get(image_ref, _package_probe_payload()), ""
+            )
         return subprocess.CompletedProcess(args, 0, "", "")
 
+    return fake_run
+
+
+def _stub_build_proof_stage(
+    monkeypatch: pytest.MonkeyPatch, proof_calls: list[dict[str, object]]
+) -> None:
     monkeypatch.setattr(
         validator_module,
         "verify_build_proof",
@@ -1259,7 +1725,19 @@ def test_local_build_proof_runs_private_layout_and_agent_python_image_probes(
         "write_build_proof",
         lambda _problem_dir, **kwargs: proof_calls.append(kwargs),
     )
-    monkeypatch.setattr(validator_module.subprocess, "run", fake_run)
+
+
+def test_local_build_proof_runs_private_layout_and_agent_python_image_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    problem_dir = _write_build_proof_problem(tmp_path)
+    run_calls: list[list[str]] = []
+    proof_calls: list[dict[str, object]] = []
+
+    _stub_build_proof_stage(monkeypatch, proof_calls)
+    monkeypatch.setattr(
+        validator_module.subprocess, "run", _fake_build_proof_docker(run_calls, {})
+    )
 
     stage = TaskValidator()._local_build_proof(problem_dir)
 
@@ -1268,8 +1746,72 @@ def test_local_build_proof_runs_private_layout_and_agent_python_image_probes(
     assert [call[call.index("--user") + 1] for call in docker_runs] == [
         "root",
         "1000:1000",
+        # The dependency diff probes the base and the built image.
+        "root",
+        "root",
     ]
     assert proof_calls[0]["image_digest"] == "sha256:local"
+
+
+def test_local_build_proof_fails_on_a_package_the_channels_do_not_declare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate that no Dockerfile spelling can evade, wired end to end.
+
+    The task image simply has a package the base does not; how it got there is
+    never consulted.
+    """
+    problem_dir = _write_build_proof_problem(tmp_path)
+    run_calls: list[list[str]] = []
+    proof_calls: list[dict[str, object]] = []
+
+    _stub_build_proof_stage(monkeypatch, proof_calls)
+    monkeypatch.setattr(
+        validator_module.subprocess,
+        "run",
+        _fake_build_proof_docker(
+            run_calls,
+            {
+                "lbx-tasks-base:local": _package_probe_payload(venv=("numpy",)),
+                "local/private-layout:build-proof": _package_probe_payload(
+                    venv=("numpy", "humanize")
+                ),
+            },
+        ),
+    )
+
+    stage = TaskValidator()._local_build_proof(problem_dir)
+
+    assert not stage.passed
+    assert any("humanize" in issue for issue in stage.issues), stage.issues
+    assert proof_calls == []
+
+
+def test_local_build_proof_fails_when_the_dependency_probe_cannot_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unenforceable gate must not be mistaken for a passing one."""
+    problem_dir = _write_build_proof_problem(tmp_path)
+    proof_calls: list[dict[str, object]] = []
+
+    _stub_build_proof_stage(monkeypatch, proof_calls)
+
+    def fake_run(
+        args: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["docker", "buildx", "build"]:
+            Path(args[args.index("--iidfile") + 1]).write_text("sha256:local")
+        elif image_deps._PROBE_MARKER in args[-1]:
+            return subprocess.CompletedProcess(args, 1, "", "no such image")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(validator_module.subprocess, "run", fake_run)
+
+    stage = TaskValidator()._local_build_proof(problem_dir)
+
+    assert not stage.passed
+    assert any("could not compare task image" in issue for issue in stage.issues)
+    assert proof_calls == []
 
 
 def test_local_build_proof_reports_private_layout_image_probe_failure(
@@ -1715,8 +2257,8 @@ def test_agent_fault_flags_guarded_data_read_without_regular_file_guard() -> Non
 
 
 def test_agent_fault_accepts_sanctioned_loader() -> None:
-    # The sanctioned loader lstat's + rejects symlinks/non-regular files
-    # internally, so it is the accepted way to read an agent submission.
+    # The sanctioned loader pins every path component and parses immutable
+    # bytes, so it is the accepted way to read an agent submission.
     src = (
         "from grading.helpers import load_submission_or_fault\n"
         "\n"
@@ -1727,11 +2269,24 @@ def test_agent_fault_accepts_sanctioned_loader() -> None:
     assert validator_module._agent_fault_issues("scorer/compute_score.py", src) == []
 
 
+def test_agent_fault_rejects_privilege_drop_opt_out() -> None:
+    src = (
+        "from grading.policy_runner import PolicyWorker\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    worker = PolicyWorker(\n"
+        "        workspace / 'policy.py', drop_privileges=False\n"
+        "    )\n"
+        "    return float(worker.act({}))\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("drop_privileges=False" in issue for issue in issues)
+
+
 def test_agent_fault_flags_lstat_guarded_read_as_racy() -> None:
     # An os.lstat + stat.S_ISREG check is check-then-use on the PATH: a surviving
     # uid-1000 process races it (swaps a regular file for a symlink between the
-    # check and the read). It must NOT clear the symlink finding -- only an
-    # O_NOFOLLOW open (or a sanctioned loader) is race-free.
+    # check and the read). It must NOT clear the symlink finding.
     src = (
         "import os\n"
         "import stat\n"
@@ -1752,9 +2307,9 @@ def test_agent_fault_flags_lstat_guarded_read_as_racy() -> None:
     assert any("non-regular" in issue or "SYMLINK" in issue for issue in issues)
 
 
-def test_agent_fault_accepts_nofollow_handroll() -> None:
-    # os.open(..., O_NOFOLLOW) + a read of THAT descriptor is the race-free manual
-    # alternative to a sanctioned loader: a symlink leaf fails atomically at open.
+def test_agent_fault_rejects_leaf_only_nofollow_handroll() -> None:
+    # O_NOFOLLOW rejects only the leaf. A surviving process can replace
+    # /tmp/output or another parent directory with a symlink to private truth.
     src = (
         "import os\n"
         "import numpy as np\n"
@@ -1772,7 +2327,96 @@ def test_agent_fault_accepts_nofollow_handroll() -> None:
         "        fh.close()\n"
         "    return float(arr.size > 0)\n"
     )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("component-safe" in issue for issue in issues)
+
+
+def test_agent_fault_accepts_component_safe_file_object() -> None:
+    src = (
+        "import numpy as np\n"
+        "from grading.helpers import open_submission_file_or_fault\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    with open_submission_file_or_fault(\n"
+        "        workspace / 'submission.npy'\n"
+        "    ) as fh:\n"
+        "        arr = np.load(fh)\n"
+        "    return float(arr.size > 0)\n"
+    )
     assert validator_module._agent_fault_issues("scorer/compute_score.py", src) == []
+
+
+def test_agent_fault_rejects_pathname_snapshot_in_task_scorer() -> None:
+    src = (
+        "import pandas as pd\n"
+        "from grading.helpers import require_regular_file\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    snapshot = require_regular_file(workspace / 'submission.parquet')\n"
+        "    frame = pd.read_parquet(snapshot)\n"
+        "    return float(len(frame) > 0)\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("read_parquet" in issue for issue in issues)
+
+
+def test_agent_fault_rejects_direct_pathname_snapshot_expression() -> None:
+    src = (
+        "import pandas as pd\n"
+        "from grading.helpers import require_regular_file as pin\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    frame = pd.read_parquet(pin(workspace / 'submission.parquet'))\n"
+        "    return float(len(frame) > 0)\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("read_parquet" in issue for issue in issues)
+
+
+def test_agent_fault_rejects_pathname_snapshot_via_helpers_module() -> None:
+    src = (
+        "import pandas as pd\n"
+        "from grading import helpers\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    snapshot = helpers.require_regular_file(\n"
+        "        workspace / 'submission.parquet'\n"
+        "    )\n"
+        "    return float(len(pd.read_parquet(snapshot)) > 0)\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("read_parquet" in issue for issue in issues)
+
+
+def test_agent_fault_does_not_trust_local_snapshot_lookalike() -> None:
+    src = (
+        "import pandas as pd\n"
+        "\n"
+        "def require_regular_file(path):\n"
+        "    return path\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    snapshot = require_regular_file(workspace / 'submission.parquet')\n"
+        "    return float(len(pd.read_parquet(snapshot)) > 0)\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("read_parquet" in issue for issue in issues)
+
+
+def test_agent_fault_does_not_trust_shadowed_snapshot_import() -> None:
+    src = (
+        "import pandas as pd\n"
+        "from grading.helpers import require_regular_file\n"
+        "\n"
+        "def require_regular_file(path):\n"
+        "    return path\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    snapshot = require_regular_file(workspace / 'submission.parquet')\n"
+        "    return float(len(pd.read_parquet(snapshot)) > 0)\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("read_parquet" in issue for issue in issues)
 
 
 def test_agent_fault_comment_token_does_not_clear_symlink_finding() -> None:
@@ -1851,7 +2495,7 @@ def test_agent_fault_flags_unguarded_path_read_bytes_via_alias() -> None:
     assert any("no guard" in issue and "read_bytes" in issue for issue in issues)
 
 
-def test_agent_fault_accepts_guarded_path_read_text_with_agentfault() -> None:
+def test_agent_fault_rejects_guarded_path_read_text_with_agentfault() -> None:
     src = (
         "from grading import AgentFault\n"
         "\n"
@@ -1863,7 +2507,60 @@ def test_agent_fault_accepts_guarded_path_read_text_with_agentfault() -> None:
         "        raise AgentFault(str(exc)) from exc\n"
         "    return 0.5 if text.strip() else 0.0\n"
     )
-    assert validator_module._agent_fault_issues("scorer/compute_score.py", src) == []
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("component-safe" in issue and "read_text" in issue for issue in issues)
+
+
+def test_agent_fault_flags_path_open() -> None:
+    src = (
+        "def compute_score(workspace, trajectory, private):\n"
+        "    with (workspace / 'submission.bin').open('rb') as handle:\n"
+        "        return float(bool(handle.read(1)))\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("no guard" in issue and "open" in issue for issue in issues)
+
+
+def test_agent_fault_flags_os_open() -> None:
+    src = (
+        "import os\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    fd = os.open(workspace / 'submission.bin', os.O_RDONLY)\n"
+        "    try:\n"
+        "        return float(bool(os.read(fd, 1)))\n"
+        "    finally:\n"
+        "        os.close(fd)\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("no guard" in issue and "os.open" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    ("import_line", "reader"),
+    [
+        ("import os as fs", "fs.open"),
+        ("from os import open as raw_open", "raw_open"),
+        ("import builtins", "builtins.open"),
+        ("import gzip as compressed", "compressed.open"),
+    ],
+)
+def test_agent_fault_flags_aliased_open_readers(
+    import_line: str,
+    reader: str,
+) -> None:
+    src = (
+        f"{import_line}\n"
+        "\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        f"    handle = {reader}(workspace / 'submission.bin', 'rb')\n"
+        "    try:\n"
+        "        return float(bool(handle.read(1)))\n"
+        "    finally:\n"
+        "        handle.close()\n"
+    )
+    issues = validator_module._agent_fault_issues("scorer/compute_score.py", src)
+    assert any("no guard" in issue and "open" in issue for issue in issues)
 
 
 def test_agent_fault_ignores_private_path_read_text() -> None:
@@ -1932,6 +2629,30 @@ def test_shipped_scorers_pass_agent_fault_lint() -> None:
         if issues:
             offenders[path.relative_to(repo_root).as_posix()] = issues
     assert not offenders, f"shipped scorers fail the agent_fault lint: {offenders}"
+
+
+def test_prometheus_starter_empty_answer_scores_zero(tmp_path: Path) -> None:
+    scorer = (
+        Path(__file__).resolve().parents[2]
+        / "alignerr_plugin"
+        / "src"
+        / "alignerr_plugin"
+        / "starter_templates"
+        / "prometheus"
+        / "scorer"
+        / "compute_score.py"
+    )
+    compute_score = runpy.run_path(scorer)["compute_score"]
+    workspace = tmp_path / "output"
+    workspace.mkdir()
+    (workspace / "answer.txt").write_bytes(b"")
+
+    assert compute_score(workspace, None, tmp_path) == 0.0
+    (workspace / "answer.txt").unlink()
+    assert compute_score(workspace, None, tmp_path) == 0.0
+    (workspace / "answer.txt").mkdir()
+    with pytest.raises(AgentFault):
+        compute_score(workspace, None, tmp_path)
 
 
 def test_private_data_layout_requires_hardening_for_plain_private_copy(
@@ -2612,9 +3333,7 @@ def test_sanctioned_curve_flags_module_qualified_reference(tmp_path: Path) -> No
     assert any("deprecated exponential" in i for i in stage.issues)
 
 
-# The ml starter ships no per-task Dockerfile (hardened by the shared base, tested
-# below); only the native starters have one here.
-@pytest.mark.parametrize("template_name", ["mujoco", "cfd", "structures"])
+@pytest.mark.parametrize("template_name", ["ml", "mujoco", "cfd", "structures"])
 def test_starter_dockerfiles_harden_private_roots(template_name: str) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     dockerfile = (
@@ -2634,36 +3353,93 @@ def test_starter_dockerfiles_harden_private_roots(template_name: str) -> None:
     )
     assert "COPY --chown=root:root ${PROBLEM_DIR}/scorer/ /mcp_server/grader/" in text
     assert "rm -rf /mcp_server/grader/data" in text
-    assert "find /mcp_server/data /mcp_server/grader -type d -exec chmod 0700" in text
-    assert "find /mcp_server/data /mcp_server/grader -type f -exec chmod 0600" in text
+    assert "-type d -exec chmod 0700" in text
+    assert "-type f -exec chmod 0600" in text
 
 
-def test_mlenvs_base_dockerfile_hardens_private_roots() -> None:
-    # The shared base/task.mlenvs.Dockerfile stages data/private/ into the
-    # root-only /mcp_server/data and the grader into /mcp_server/grader.
+def test_ml_starter_dockerfile_hardens_the_calibration_lock() -> None:
+    # A continuous ml task additionally stages the calibration lock into the
+    # root-only tree. The glob keeps a freshly scaffolded task buildable before
+    # the author's first calibration run.
     repo_root = Path(__file__).resolve().parents[2]
-    text = (repo_root / "base" / "task.mlenvs.Dockerfile").read_text()
-    assert "/mcp_server/data" in text
+    text = (
+        repo_root
+        / "alignerr_plugin"
+        / "src"
+        / "alignerr_plugin"
+        / "starter_templates"
+        / "ml"
+        / "environment"
+        / "Dockerfile"
+    ).read_text()
     assert (
-        "COPY --from=task-src /calibration-src/calibration.lock.json "
-        "/mcp_server/calibration/calibration.lock.json" in text
+        "COPY --chown=root:root ${PROBLEM_DIR}/calibration.lock.jso[n] "
+        "/mcp_server/calibration/" in text
     )
     assert "/mcp_server/calibration/.author-source" in text
-    assert "0700" in text or "chmod 700" in text
-
-
-def test_mlenvs_base_dockerfile_installs_env_deps_root_only() -> None:
-    # env_dependencies (hidden-env server-only pip deps) install into the
-    # root-only /mcp_server/env_deps via --target, NOT system-wide, so the agent
-    # can't import them and bypass the RPC constraints.
-    repo_root = Path(__file__).resolve().parents[2]
-    text = (repo_root / "base" / "task.mlenvs.Dockerfile").read_text()
-    assert "ARG ENV_DEPENDENCIES" in text
-    assert "--target /mcp_server/env_deps" in text
-    # never installed system-wide (that would re-expose it to the agent)
-    assert "--system --break-system-packages --no-cache $ENV_DEPENDENCIES" not in text
-    # and it lives under the 0700 /mcp_server barrier (final chmod covers it)
+    assert (
+        "find /mcp_server/data /mcp_server/grader /mcp_server/calibration "
+        "-type d -exec chmod 0700" in text
+    )
+    assert (
+        "find /mcp_server/data /mcp_server/grader /mcp_server/calibration "
+        "-type f -exec chmod 0600" in text
+    )
     assert "chmod 0700 /mcp_server" in text
+
+
+def test_install_task_deps_installs_private_channels_root_only() -> None:
+    # scorer/env-requirements.txt (hidden-env server-only) and
+    # scorer/requirements.txt (grader-only) install into root-only --target dirs,
+    # NOT into the agent-visible runtime venv, so the agent can neither import
+    # env deps to bypass the RPC nor read the grader's scoring library.
+    repo_root = Path(__file__).resolve().parents[2]
+    text = (repo_root / "base" / "install-task-deps.sh").read_text()
+    assert 'install_private "${grading_file}" /mcp_server/grading_deps' in text
+    assert 'install_private "${env_file}" /mcp_server/env_deps' in text
+    # install_private seals each target; the agent-visible channel is the only
+    # one that reaches the runtime venv. Every channel must pin --python to the
+    # runtime interpreter and clear UV_SYSTEM_PYTHON (the CUDA bases export it):
+    # a private tree resolved against the system python installs wheels for the
+    # wrong ABI, which the grader/env server then cannot load.
+    assert (
+        "env -u UV_SYSTEM_PYTHON uv pip install \\\n"
+        '    --python "${VENV_PYTHON}" --target "${target}" '
+        '--no-cache -r "${requirements}"'
+    ) in text
+    assert 'find "${target}" -type d -exec chmod 0700 {} +' in text
+    assert 'find "${target}" -type f -exec chmod 0600 {} +' in text
+    assert (
+        'env -u UV_SYSTEM_PYTHON uv pip install --python "${VENV_PYTHON}" '
+        '--no-cache -r "${pip_file}"'
+    ) in text
+    assert "uv pip install --target" not in text
+    # and everything private lives under the 0700 /mcp_server barrier
+    assert "chmod 0700 /mcp_server" in text
+
+
+def test_every_base_flavor_ships_the_task_dep_installer() -> None:
+    # Task Dockerfiles call /opt/lbx-runtime/install-task-deps.sh unconditionally,
+    # so a flavor that neither stages the script nor inherits from one that does
+    # would break every task built on it at `RUN install-task-deps.sh`.
+    repo_root = Path(__file__).resolve().parents[2]
+    flavors = sorted(p.parent.name for p in (repo_root / "base").glob("*/Dockerfile"))
+    assert flavors, "no base flavors discovered"
+
+    stages_installer = set()
+    for flavor in flavors:
+        text = (repo_root / "base" / flavor / "Dockerfile").read_text()
+        if "base/install-task-deps.sh /tmp/base/" in text:
+            stages_installer.add(flavor)
+            continue
+        # An overlay inherits the installer from the flavor it builds on.
+        assert "FROM ${BASE_IMAGE}:${BASE_TAG}" in text, (
+            f"base/{flavor}/Dockerfile neither stages install-task-deps.sh nor "
+            "builds on a flavor that does"
+        )
+        assert "ARG BASE_IMAGE=lbx-tasks-base-gpu" in text
+
+    assert {"cpu", "gpu", "tpu"}.issubset(stages_installer)
 
 
 # ── prompt runtime-reference guard ─────────────────────────────────────────
@@ -3544,3 +4320,27 @@ def test_baseline_trio_advisory_scoped_to_ml_continuous(tmp_path: Path) -> None:
     mujoco = tmp_path / "mujoco-task"
     _write_problem(mujoco, task_type="mujoco")
     assert validator_module.baseline_trio_warnings(mujoco) == []
+
+
+def test_an_installed_grading_package_is_preferred_over_the_checkout_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork's vendored grader/src must not shadow the trusted install.
+
+    The validator put <repo_root>/grader/src at sys.path[0] unconditionally, so
+    any lane validating a fork imported that fork's snapshot of the shared
+    grading package, and graders failed on symbols that exist upstream. The
+    checkout copy is now only a fallback for when nothing else provides it.
+    """
+    assert validator_module._grading_already_importable() is True
+
+    monkeypatch.delitem(sys.modules, "grading", raising=False)
+    original_find_spec = importlib.util.find_spec
+
+    def without_grading(name: str, *args: object, **kwargs: object):
+        if name == "grading":
+            return None
+        return original_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", without_grading)
+    assert validator_module._grading_already_importable() is False

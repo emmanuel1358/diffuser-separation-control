@@ -12,16 +12,8 @@ def load_harbor_dir(
     task_dir: Path, source_problem_dir: Path | None = None
 ) -> HarnessProblem:
     task_dir = task_dir.resolve()
-    # ML_Envs harbor exports ship metadata.json + prompt.md + test_file.py and no
-    # task.toml/instruction.md, so synthesize the task config and read prompt.md.
-    from alignerr_plugin import mlenvs
-
-    if mlenvs.is_mlenvs_task(task_dir):
-        task_toml = mlenvs.synthesize_task_toml(task_dir)
-        prompt = (task_dir / "prompt.md").read_text()
-    else:
-        task_toml = load_task_toml(task_dir)
-        prompt = (task_dir / "instruction.md").read_text()
+    task_toml = load_task_toml(task_dir)
+    prompt = (task_dir / "instruction.md").read_text()
     source_problem = (
         load_problem_dir(source_problem_dir) if source_problem_dir else None
     )

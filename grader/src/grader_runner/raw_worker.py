@@ -4,9 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import traceback
 from pathlib import Path
 from typing import Any
+
+from grading.evaluation.author import (
+    CALIBRATION_SEED_ENV,
+    CalibrationMeasureContext,
+    measure_task_module,
+    task_from_module,
+)
 
 from grader_runner.worker import (
     _enter_pid_namespace,
@@ -14,7 +22,6 @@ from grader_runner.worker import (
     _import_grader,
     _resolve_grader_path,
 )
-from grading.evaluation.author import measure_task_module, task_from_module
 
 RAW_METRICS_SCHEMA = "raw-continuous-metrics.v1"
 
@@ -34,6 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--grader-dir", required=True, type=Path)
     parser.add_argument("--private-dir", required=True, type=Path)
     parser.add_argument("--result-path", required=True, type=Path)
+    parser.add_argument("--calibration-seed", default=0, type=int)
     args = parser.parse_args(argv)
 
     _enter_pid_namespace()
@@ -46,16 +54,27 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 f"{grader_path} does not define a grading.evaluation ContinuousTask as TASK"
             )
-        metrics = measure_task_module(
-            module,
-            workspace=args.workspace,
-            private=args.private_dir,
-        )
+        context = CalibrationMeasureContext(args.calibration_seed)
+        previous_seed = os.environ.get(CALIBRATION_SEED_ENV)
+        os.environ[CALIBRATION_SEED_ENV] = str(args.calibration_seed)
+        try:
+            metrics = measure_task_module(
+                module,
+                workspace=args.workspace,
+                private=args.private_dir,
+                context=context,
+            )
+        finally:
+            if previous_seed is None:
+                os.environ.pop(CALIBRATION_SEED_ENV, None)
+            else:
+                os.environ[CALIBRATION_SEED_ENV] = previous_seed
         _write(
             args.result_path,
             {
                 "schema_version": RAW_METRICS_SCHEMA,
                 "task_spec_sha256": task.spec_sha256,
+                "calibration_seed": args.calibration_seed,
                 "metrics": metrics,
             },
         )

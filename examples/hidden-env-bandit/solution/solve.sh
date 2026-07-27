@@ -1,46 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reference solution: submit a UCB learner. The grader commits this artifact,
-# then runs it on fresh hidden bandit seeds; no best-arm value is baked in.
-cat > /tmp/output/policy.py <<'PY'
-import math
-
-
-def load_policy():
-    class UCBPolicy:
-        def reset(self, n_arms, budget):
-            self.n_arms = int(n_arms)
-            self.budget = int(budget)
-            self.counts = [0] * self.n_arms
-            self.totals = [0.0] * self.n_arms
-            self.steps = 0
-
-        def choose(self):
-            for arm, count in enumerate(self.counts):
-                if count == 0:
-                    return arm
-            log_t = math.log(max(2, self.steps))
-            return max(
-                range(self.n_arms),
-                key=lambda arm: (
-                    self.totals[arm] / self.counts[arm]
-                    + math.sqrt(2.0 * log_t / self.counts[arm])
-                ),
-            )
-
-        def observe(self, arm, reward):
-            arm = int(arm)
-            self.counts[arm] += 1
-            self.totals[arm] += float(reward)
-            self.steps += 1
-
-        def recommend(self):
-            return max(
-                range(self.n_arms),
-                key=lambda arm: self.totals[arm] / max(1, self.counts[arm]),
-            )
-
-    return UCBPolicy()
-PY
+# Reference solution: package the committed UCB policy. The grader commits this
+# artifact, then runs it on fresh hidden bandit seeds; no best-arm value is
+# baked in.
+OUTPUT_DIR="${LBT_OUTPUT_DIR:-/tmp/output}"
+SOLUTION_DIR="${LBX_SOLUTION_DIR:-$(dirname "$0")}"
+mkdir -p "${OUTPUT_DIR}"
+cp "${SOLUTION_DIR}/policy.py" "${OUTPUT_DIR}/policy.py"
 echo "reference wrote a queryable UCB policy"

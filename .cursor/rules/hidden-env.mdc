@@ -34,3 +34,7 @@ artifact). `hidden_env` is orthogonal to `task_type`. Full guide:
   `scorer/data/env_config.json` to pin the create contract.
 - Apply the same AgentFault keep-vs-discard discipline as every grader: agent
   faults -> `raise AgentFault` (kept 0.0); author/infra faults propagate.
+- A hidden-env task using `ContinuousTask.calibrated()` declares its own
+  `WorkspaceDegenerateProbes` under `baselines/degenerate/` in the real policy
+  interface. Do not infer no-op/random policies from `hidden_env` or
+  `ml_task_type`; those fields do not define an action protocol.

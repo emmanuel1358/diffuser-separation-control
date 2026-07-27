@@ -23,7 +23,6 @@ from grading.evaluation import (
     SRETarget,
 )
 from grading.evaluation.author import GeneratedCalibration
-
 from lbx_rl_tasks_harness import calibration
 from lbx_rl_tasks_harness.models import HarnessProblem
 
@@ -64,8 +63,8 @@ def _task() -> ContinuousTask:
 
 def _problem(tmp_path: Path) -> HarnessProblem:
     source = tmp_path / "problem"
-    public = source / "data" / "public"
-    private = source / "data" / "private"
+    public = source / "data"
+    private = source / "scorer" / "data"
     public.mkdir(parents=True)
     private.mkdir(parents=True)
     # Train label majority is skewed to 1 (three 1s, one 0): constant-mean and
@@ -96,7 +95,8 @@ def test_family_includes_both_fixed_classes_independent_of_train_majority(
         }
         return {
             "schema_version": "raw-continuous-metrics.v1",
-            "task_spec_sha256": "fixture",
+            "task_spec_sha256": task.spec_sha256,
+            "calibration_seed": 0,
             "metrics": {
                 column: float(frame[column].mean()) for column in frame.columns
             },
@@ -141,8 +141,8 @@ def test_queryable_family_uses_production_challenge_row_count(
     monkeypatch, tmp_path
 ) -> None:
     source = tmp_path / "queryable-problem"
-    public = source / "data" / "public"
-    private = source / "data" / "private"
+    public = source / "data"
+    private = source / "scorer" / "data"
     public.mkdir(parents=True)
     private.mkdir(parents=True)
     public.joinpath("train.csv").write_text("value,label\n0.1,0\n0.3,0\n0.5,1\n0.7,1\n")

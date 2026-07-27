@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
-import os
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from grading.faults import AgentFault, GraderFault
 from grading.numeric import NumericContractError, finite_number
+from grading.secure_io import persistent_regular_file_snapshot, read_regular_bytes
 
 DEFAULT_MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_JSON_DEPTH = 64
@@ -30,9 +28,10 @@ class ArtifactSpec(Protocol):
 
 @dataclass(frozen=True)
 class SubmittedFile:
-    """A validated regular artifact path and immutable pre-read metadata."""
+    """An immutable grader-owned artifact plus its original submission path."""
 
     path: Path
+    original_path: Path
     size: int
 
 
@@ -72,47 +71,13 @@ def _read_regular_bytes(
     label: str,
     fault_type: type[Exception],
 ) -> bytes:
-    """Atomically reject symlink/FIFO/device and bound bytes before parsing."""
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    """Reject every symlink component and read one descriptor-pinned file."""
     try:
-        fd = os.open(path, flags)
+        return read_regular_bytes(path, max_bytes=max_bytes)
     except Exception as exc:
         raise fault_type(
-            f"{label} could not be opened as a regular file: {exc}"
+            f"{label} could not be read as a stable regular file: {exc}"
         ) from exc
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise fault_type(
-                f"{label} is not a regular file (mode={stat.filemode(info.st_mode)})"
-            )
-        if info.st_size == 0:
-            raise fault_type(f"{label} is empty")
-        if info.st_size > max_bytes:
-            raise fault_type(
-                f"{label} is {info.st_size} bytes, over the {max_bytes}-byte limit"
-            )
-        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
-        chunks: list[bytes] = []
-        remaining = max_bytes + 1
-        while remaining > 0:
-            chunk = os.read(fd, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-        if len(data) > max_bytes:
-            raise fault_type(f"{label} exceeds the {max_bytes}-byte read limit")
-        return data
-    except fault_type:
-        raise
-    except Exception as exc:
-        raise fault_type(
-            f"{label} could not be read: {type(exc).__name__}: {exc}"
-        ) from exc
-    finally:
-        os.close(fd)
 
 
 def _bounded_json_shape(
@@ -279,15 +244,20 @@ class RegularFileArtifact:
 
     def load(self, workspace: Path) -> SubmittedFile:
         path = Path(workspace) / _relative_artifact_path(self.path)
-        # Read once to make all malformed path/size outcomes typed. The policy or
-        # domain library may reopen the regular file after pre-grade quiescence.
-        data = _read_regular_bytes(
-            path,
-            max_bytes=self.max_bytes,
-            label=self.path,
-            fault_type=AgentFault,
+        try:
+            snapshot = persistent_regular_file_snapshot(
+                path,
+                max_bytes=self.max_bytes,
+            )
+        except OSError as exc:
+            raise AgentFault(
+                f"{self.path} could not be captured as a stable regular file: {exc}"
+            ) from exc
+        return SubmittedFile(
+            path=snapshot,
+            original_path=path,
+            size=snapshot.stat().st_size,
         )
-        return SubmittedFile(path=path, size=len(data))
 
     def spec_dict(self) -> dict[str, Any]:
         return {
@@ -342,8 +312,8 @@ def trusted_fixture_specs(
 
 
 __all__ = [
-    "ArtifactSpec",
     "DEFAULT_MAX_ARTIFACT_BYTES",
+    "ArtifactSpec",
     "JsonArtifact",
     "NumericField",
     "RegularFileArtifact",

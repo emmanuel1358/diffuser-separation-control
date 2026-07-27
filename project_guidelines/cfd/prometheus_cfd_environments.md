@@ -679,7 +679,18 @@ evidence for review.
 ## 12. AVL Per-Task Install Recipe
 
 AVL is a Fortran and X11 binary, not a base-image dependency. Build it in the
-task Dockerfile only for tasks that need it:
+task Dockerfile only for tasks that need it. The build toolchain is an ordinary
+declared dependency, so it goes in `environment/apt.txt` and only the
+fetch-and-build stays in a `RUN` -- validation rejects a raw `apt-get install`
+in a task Dockerfile (see `docs/AUTHORING.md`).
+
+```text
+# environment/apt.txt
+gfortran
+make
+libx11-dev
+curl
+```
 
 ```dockerfile
 ARG BASE_IMAGE=lbx-tasks-base
@@ -687,9 +698,11 @@ ARG BASE_TAG=runtime-ml-core-py313-local
 ARG PROBLEM_DIR=problems/<task-id>
 FROM ${BASE_IMAGE}:${BASE_TAG}
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      gfortran make libx11-dev curl && rm -rf /var/lib/apt/lists/* \
- && curl -fsSL https://web.mit.edu/drela/Public/web/avl/avl3.36.tgz | tar xz -C /opt \
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+# No channel routes a source build, so this part stays here.
+RUN curl -fsSL https://web.mit.edu/drela/Public/web/avl/avl3.36.tgz | tar xz -C /opt \
  && cd /opt/Avl \
  && make -C plotlib FC=gfortran CC=gcc \
  && make -C bin FC=gfortran FFLAGS="-O -fallow-argument-mismatch" avl \

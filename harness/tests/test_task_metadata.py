@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import shutil
 import sys
 from pathlib import Path
+
+import pytest
 
 from alignerr_plugin.task_metadata import (
     DOMAINS_BY_TASK_TYPE,
@@ -12,7 +15,12 @@ from alignerr_plugin.task_metadata import (
     expected_ground_truth_score,
     metadata_validation_issues,
 )
-from alignerr_plugin.utils import load_task_toml
+from alignerr_plugin.utils import (
+    LegacyTaskLayoutError,
+    load_metadata,
+    load_task_toml,
+    reject_legacy_layout,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -316,7 +324,6 @@ def test_task_toml_delivery_accepts_mixed_case_platform(tmp_path: Path) -> None:
     templates = (
         ROOT / "alignerr_plugin" / "src" / "alignerr_plugin" / "starter_templates"
     )
-    # A native starter (the ml starter has no task.toml).
     problem_dir = tmp_path / "mixed-case-prometheus"
     shutil.copytree(templates / "mujoco", problem_dir)
     task_toml = problem_dir / "task.toml"
@@ -325,3 +332,106 @@ def test_task_toml_delivery_accepts_mixed_case_platform(tmp_path: Path) -> None:
     )
 
     assert load_task_toml(problem_dir).delivery.platform == "prometheus"
+
+
+def test_reject_legacy_layout_accepts_a_native_task(tmp_path: Path) -> None:
+    problem_dir = tmp_path / "native"
+    problem_dir.mkdir()
+    (problem_dir / "task.toml").write_text('[task]\nname = "labelbox/demo"\n')
+    # The native Taiga envelope is also called metadata.json, so its presence
+    # must not be read as a legacy marker.
+    (problem_dir / "metadata.json").write_text(
+        '{"benchmark": "taiga_task", "problem_data": {"instance_id": "demo"}}'
+    )
+
+    reject_legacy_layout(problem_dir)
+
+
+def test_reject_legacy_layout_ignores_the_native_envelope(tmp_path: Path) -> None:
+    problem_dir = tmp_path / "envelope-only"
+    problem_dir.mkdir()
+    (problem_dir / "metadata.json").write_text(
+        '{"benchmark": "taiga_task", "problem_data": {"instance_id": "demo"}}'
+    )
+
+    # No task.toml, but nothing here says metadata-mode either -- that is a
+    # malformed native task, not a legacy one.
+    reject_legacy_layout(problem_dir)
+
+
+def test_reject_legacy_layout_flags_metadata_mode_config(tmp_path: Path) -> None:
+    """A part-converted tree can have only the metadata.json marker left."""
+    problem_dir = tmp_path / "half-converted"
+    problem_dir.mkdir()
+    # prompt.md and test_file.py already renamed; the config was not converted.
+    (problem_dir / "instruction.md").write_text("Do the thing.\n")
+    (problem_dir / "scorer").mkdir()
+    (problem_dir / "scorer" / "compute_score.py").write_text("score = 1.0\n")
+    (problem_dir / "metadata.json").write_text('{"ml_task_type": "dataset"}')
+
+    with pytest.raises(LegacyTaskLayoutError) as excinfo:
+        reject_legacy_layout(problem_dir)
+
+    assert "metadata.json with ml_task_type" in str(excinfo.value)
+    assert "docs/LEGACY_ML_LAYOUT.md" in str(excinfo.value)
+
+
+def test_reject_legacy_layout_sees_through_a_utf8_bom(tmp_path: Path) -> None:
+    """A BOM must not hide the marker behind a bare missing-task.toml failure.
+
+    Editors on Windows write metadata.json with a BOM, which makes a plain utf-8
+    read produce text json.loads rejects. The detector would swallow that as
+    "not legacy" and the author would lose the conversion guidance on precisely
+    the half-converted tree that needs it.
+    """
+    problem_dir = tmp_path / "bom-metadata"
+    problem_dir.mkdir()
+    (problem_dir / "metadata.json").write_text(
+        '{"ml_task_type": "dataset"}', encoding="utf-8-sig"
+    )
+
+    with pytest.raises(LegacyTaskLayoutError) as excinfo:
+        reject_legacy_layout(problem_dir)
+
+    assert "metadata.json with ml_task_type" in str(excinfo.value)
+
+
+def test_load_metadata_reads_a_bom_encoded_envelope(tmp_path: Path) -> None:
+    """The native envelope loader decodes the same file as the legacy detector."""
+    problem_dir = tmp_path / "bom-envelope"
+    problem_dir.mkdir()
+    (problem_dir / "task.toml").write_text(
+        '[task]\nname = "labelbox/bom"\n', encoding="utf-8"
+    )
+    (problem_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "benchmark": "taiga_task",
+                "problem_data": {"instance_id": "bom", "description": "d"},
+            }
+        ),
+        encoding="utf-8-sig",
+    )
+
+    assert load_metadata(problem_dir).problem_data["instance_id"] == "bom"
+
+
+def test_reject_legacy_layout_tolerates_unparseable_metadata(tmp_path: Path) -> None:
+    problem_dir = tmp_path / "broken-json"
+    problem_dir.mkdir()
+    (problem_dir / "metadata.json").write_text("{not json")
+
+    reject_legacy_layout(problem_dir)
+
+
+def test_reject_legacy_layout_flags_the_classic_markers(tmp_path: Path) -> None:
+    problem_dir = tmp_path / "classic"
+    problem_dir.mkdir()
+    (problem_dir / "prompt.md").write_text("Do the thing.\n")
+    (problem_dir / "test_file.py").write_text("def compute_score():\n    return 1.0\n")
+
+    with pytest.raises(LegacyTaskLayoutError) as excinfo:
+        reject_legacy_layout(problem_dir)
+
+    assert "prompt.md" in str(excinfo.value)
+    assert "test_file.py" in str(excinfo.value)

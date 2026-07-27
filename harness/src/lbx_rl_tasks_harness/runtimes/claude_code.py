@@ -11,8 +11,6 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
-from alignerr_plugin.local_runtime import SLIM_FALLBACK_TURN_BONUS
-
 from lbx_rl_tasks_harness.docker import (
     build_task_image,
     copy_output_from_container,
@@ -387,19 +385,10 @@ async def run_claude_code(
     transcript_path: Path,
     model_name: str | None = None,
     max_steps: int | None = None,
-    flavor: str = "auto",
 ) -> dict[str, Any]:
     effective_model = effective_model_name(model_name)
-    build = build_task_image(problem, flavor=flavor)
+    build = build_task_image(problem)
     image_tag = build.image_tag
-    if build.flavor_fallback:
-        # Slim fallback: agent pip-installs ML wheels at runtime, so add a turn bonus.
-        max_steps = (max_steps or DEFAULT_MAX_TURNS) + SLIM_FALLBACK_TURN_BONUS
-        print(
-            f"[slim fallback] agent turn budget bumped to {max_steps} "
-            f"(+{SLIM_FALLBACK_TURN_BONUS}).",
-            flush=True,
-        )
     started = start_task_container(image_tag)
     try:
         async with RubricMcpBridge(started.container_id) as bridge:

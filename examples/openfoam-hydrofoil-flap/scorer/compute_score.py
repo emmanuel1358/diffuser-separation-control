@@ -380,17 +380,6 @@ def _public_class_reasonableness(
     return _mean(parts)
 
 
-def _design_matches(
-    a: dict[str, Any] | None, b: dict[str, Any] | None, *, tol: float = 5e-5
-) -> bool:
-    if not isinstance(a, dict) or not isinstance(b, dict):
-        return False
-    try:
-        return all(abs(float(a[field]) - float(b[field])) <= tol for field in FIELDS)
-    except Exception:
-        return False
-
-
 def _normalize_public_probe_case(raw: dict[str, Any] | None) -> dict[str, Any]:
     raw = dict(raw or {})
     return {

@@ -465,7 +465,7 @@ A PR attempt is eligible for payment when it meets all of these before review:
   criteria**. Strong MuJoCo tasks should still aim for the 10+ criterion
   structure described above.
 - If the task uses a continuous reward, follow the
-  [continuous reward functions from ML_Envs](../docs/GRADING.md#continuous-reward-functions-from-ml_envs)
+  [continuous reward functions](../docs/GRADING.md#continuous-reward-functions)
   pattern. The scoring function should be calibrated so current model attempts
   score at or below the human/reference baseline, not near the perfect score.
   See the grading guide's

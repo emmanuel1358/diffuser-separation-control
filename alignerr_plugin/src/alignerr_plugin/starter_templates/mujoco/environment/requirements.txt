@@ -1,0 +1,7 @@
+# Agent-visible task dependencies, installed into /opt/lbx-runtime/.venv.
+# mujoco and numpy already ship in the base image; they are listed here so this
+# task's dependency set is declared rather than assumed. gymnasium is the one
+# package this starter genuinely adds.
+mujoco
+gymnasium
+numpy

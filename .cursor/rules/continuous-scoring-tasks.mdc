@@ -1,16 +1,22 @@
 ---
-description: Continuous ML_Envs-style scoring conventions
-globs: "{problems,examples}/**/scorer/compute_score.py,{problems,examples}/**/task.toml,{problems,examples}/**/test_file.py,{problems,examples}/**/metadata.json,{problems,examples}/**/reference_solution/**,{problems,examples}/**/baselines/**"
+description: Continuous scoring conventions
+globs: "{problems,examples}/**/scorer/**,{problems,examples}/**/task.toml,{problems,examples}/**/solution/**,{problems,examples}/**/baselines/**"
 alwaysApply: false
 ---
 
 # Continuous Scoring Tasks
 
-- Use this style for ML_Envs-style dataset tasks where score is a continuous function of submitted predictions, not a rubric. See `docs/MLENVS_TASKS.md`.
-- Set `[difficulty].task_type = "ml"` and `[difficulty].reward_type = "continuous_scoring_function"` (this template's enum has no `dataset` type; the submission paradigm is expressed via the loader you call, not the task_type). ML_Envs mode pins these via `metadata.json` synthesis.
-- `ml` tasks must declare `[difficulty].license` (or ML_Envs `license`): a permissive SPDX id from `task_metadata.LICENSES`, or `self_generated` for fully synthetic data.
-- Read agent artifacts only via the sanctioned loader (e.g. `helpers.load_submission_or_fault(workspace / "submission.csv", ...)`); read hidden targets from `private` (e.g. `private / "test_target.parquet"`). Prefer sealed `ContinuousTask.model()` / `TASK.grade(...)` over legacy hand curves.
-- **Committed-model hard contract (mandatory):** for `reference_solution/` (or native `solution/`) and every calibration-declared baseline (`TASK.naive`), commit `train.py` + trained weights + `model.manifest.json` + inference-only `solution.py`/`solve.sh`. Trusted CI / ground-truth / seal **never train**. Optional `submission.csv` is Tier-B additive only. Canonical example: `examples/mle-tabular-classification/`.
-- Reference must score `0.5 ± 0.05`; declared baselines must score clearly below it (learnability gate).
+- Use this style for dataset tasks where score is a continuous function of submitted predictions, not a rubric. See `docs/ML_TASKS.md`.
+- Set `[difficulty].task_type = "ml"` and `[difficulty].reward_type = "continuous_scoring_function"` (this template's enum has no `dataset` type; the submission shape is expressed via the loader you call, not the task_type).
+- `ml` tasks must declare `[difficulty].license`: a permissive SPDX id from `task_metadata.LICENSES`, or `self_generated` for fully synthetic data.
+- Read agent artifacts only via sanctioned component-safe loaders (for example
+  `helpers.load_submission_or_fault(...)`; use
+  `helpers.open_submission_file_or_fault(...)` for a custom file-like parser).
+  Never hand-roll `lstat` or leaf-only `O_NOFOLLOW`. Read hidden targets from
+  `private`. Prefer sealed `ContinuousTask.model()` / `TASK.grade(...)` over
+  legacy hand curves.
+- **Committed-strategy contract (mandatory):** every reference/naive declares digest-bound artifacts and an inference-only entrypoint. Existing trained models may keep `model.manifest.json`; use `strategy.manifest.json` with explicit `trained_model` or `committed_artifact` kind for procedural training and hand-authored policies/static artifacts. Never invent training data. Trusted CI / ground-truth / seal never train.
+- Numeric tabular tasks retain built-in no-information probes. Non-tabular callbacks declare deterministic ready-to-measure workspaces under `baselines/degenerate/` with `WorkspaceDegenerateProbes`; any missing/faulting/nondeterministic probe fails calibration.
+- Reference must score `0.5 ± 0.05`; naive is weak-positive by default. A naive that exactly ties every effective no-information floor needs `naive_score_min=0` plus a reviewed `naive_at_floor` rationale.
 - Do not introduce `RubricTask` / rubric criteria unless the task is actually decomposed into deterministic rubric checks (`reward_type = "multi_deterministic_rubrics"`).
 - Before opening or updating a PR, run `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` (inference-only; never shells out to `train.py`). While iterating, use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>`.

@@ -69,22 +69,42 @@ def _write_valid_strategy(root, *, role: str, training_data) -> None:
     )
 
 
+_TASK_TOML = """\
+schema_version = "1.1"
+
+[task]
+name = "labelbox/demo-taiga"
+
+[environment]
+required_resources = "12vcpu+100gib+h100/2"
+
+[difficulty]
+task_type = "ml"
+domain = "scientific_discovery_computational_science"
+reward_type = "continuous_scoring_function"
+license = "CC0-1.0"
+license_source = "https://creativecommons.org/publicdomain/zero/1.0/"
+
+[[outputs]]
+path = "/tmp/output/model.json"
+required = true
+"""
+
+
 def _write_v2_task(tmp_path):
     task_dir = tmp_path / "demo_taiga"
-    (task_dir / "data" / "public").mkdir(parents=True)
-    (task_dir / "data" / "private").mkdir(parents=True)
+    (task_dir / "data").mkdir(parents=True)
+    (task_dir / "scorer" / "data").mkdir(parents=True)
+    (task_dir / "task.toml").write_text(_TASK_TOML)
     (task_dir / "metadata.json").write_text(
         json.dumps(
             {
-                "ml_task_type": "dataset",
-                "required_resources": "12vcpu+100gib+h100/2",
-                "domain": "scientific_discovery_computational_science",
-                "license": "CC0-1.0",
-                "license_source": "https://creativecommons.org/publicdomain/zero/1.0/",
+                "benchmark": "taiga_task",
+                "problem_data": {"instance_id": "demo-taiga"},
             }
         )
     )
-    (task_dir / "prompt.md").write_text("x" * 250)
+    (task_dir / "instruction.md").write_text("x" * 250)
     source = "\n".join(
         [
             "from grading.evaluation import AnchorRationale, BinaryF1Target, ContinuousTask, FloorAnchor, GeneratedCalibration, SRETarget",
@@ -99,11 +119,11 @@ def _write_v2_task(tmp_path):
             "",
         ]
     )
-    (task_dir / "test_file.py").write_text(source)
-    training_data = task_dir / "data" / "public" / "train.csv"
+    (task_dir / "scorer" / "compute_score.py").write_text(source)
+    training_data = task_dir / "data" / "train.csv"
     training_data.write_text("x,y\n1,2\n")
     _write_valid_strategy(
-        task_dir / "reference_solution",
+        task_dir / "solution",
         role="reference",
         training_data=training_data,
     )
@@ -242,7 +262,7 @@ def test_calibration_stage_allows_missing_local_cache(tmp_path) -> None:
 
 def test_v2_calibration_stage_rejects_committed_score_artifacts(tmp_path) -> None:
     task_dir = _write_v2_task(tmp_path)
-    (task_dir / "reference_solution" / "results.txt").write_text("0.5\n")
+    (task_dir / "solution" / "results.txt").write_text("0.5\n")
 
     result = TaskValidator()._continuous_calibration(task_dir)
 
@@ -277,7 +297,7 @@ def test_v2_calibration_stage_rejects_missing_floor_rationale(tmp_path) -> None:
 
 def test_continuous_stage_rejects_scalar_only_production_bypass(tmp_path) -> None:
     task_dir = _write_v2_task(tmp_path)
-    grader = task_dir / "test_file.py"
+    grader = task_dir / "scorer" / "compute_score.py"
     grader.write_text(
         grader.read_text().replace(
             "return TASK.grade(None, None)",
@@ -293,7 +313,9 @@ def test_continuous_stage_rejects_scalar_only_production_bypass(tmp_path) -> Non
 
 def test_continuous_stage_hard_blocks_legacy_grader_without_task(tmp_path) -> None:
     task_dir = _write_v2_task(tmp_path)
-    (task_dir / "test_file.py").write_text("def compute_score():\n" "    return 0.25\n")
+    (task_dir / "scorer" / "compute_score.py").write_text(
+        "def compute_score(workspace, trajectory, private):\n    return 0.25\n"
+    )
 
     result = TaskValidator()._continuous_calibration(task_dir)
 
@@ -318,7 +340,7 @@ def _write_native_task(
     task_dir = tmp_path / f"{task_type}-{reward_type}"
     scorer = task_dir / "scorer"
     scorer.mkdir(parents=True)
-    license_fields = (
+    ml_fields = (
         '\nlicense = "self_generated"\n' 'license_source = "synthetic test fixture"\n'
         if task_type == "ml"
         else ""
@@ -333,7 +355,7 @@ required_resources = "2vcpu+6gib"
 task_type = "{task_type}"
 domain = "{_DOMAINS[task_type]}"
 reward_type = "{reward_type}"
-{license_fields}
+{ml_fields}
 """)
     (scorer / "compute_score.py").write_text(
         "def compute_score(workspace, trajectory, private):\n" "    return 0.25\n"

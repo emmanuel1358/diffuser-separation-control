@@ -1,0 +1,36 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/mle-tabular-classification"
+description = "Synthetic tabular regression plus classification scored by a continuous, calibrated grader over a private post-commit challenge."
+
+[environment]
+required_resources = "12vcpu+100gib+h100/2"
+storage_mb = 50000
+# LOCKED OFF: the sandbox runs offline. Data is baked at image-build time.
+allow_internet = false
+
+[agent]
+timeout_sec = 21600
+
+[verifier]
+# Taiga pins ml grading to its maximum regardless of this value; this only
+# bounds the local in-image verifier subprocess.
+timeout_sec = 10800
+user = "root"
+env = []
+
+[difficulty]
+task_type = "ml"
+domain = "scientific_discovery_computational_science"
+reward_type = "continuous_scoring_function"
+license = "CC0-1.0"
+license_source = "https://creativecommons.org/publicdomain/zero/1.0/"
+
+[ground_truth]
+continuous_score_epsilon = 0.05
+
+[[outputs]]
+path = "/tmp/output/predictor.py"
+required = true
+description = "Queryable predictor module defining load_predictor()"

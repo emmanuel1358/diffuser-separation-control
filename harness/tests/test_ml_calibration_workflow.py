@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
-
 from alignerr_plugin.proof import update_build_proof_result, write_build_proof
 from alignerr_plugin.utils import grading_inputs_sha256
+from grading.evaluation import (
+    GeneratedCalibration,
+    WorkspaceDegenerateProbes,
+    WorkspaceProbe,
+)
 from lbx_rl_tasks_harness import calibration
 from lbx_rl_tasks_harness.models import GroundTruthSpec, HarnessProblem, ReferenceSpec
 
@@ -54,16 +59,16 @@ def _write_strategy(root: Path, *, role: str, training_data: Path) -> None:
 def _problem(tmp_path: Path) -> HarnessProblem:
     source = tmp_path / "problem"
     source.mkdir(parents=True)
-    (source / "metadata.json").write_text("{}\n")
-    (source / "data" / "public").mkdir(parents=True)
-    (source / "data" / "private").mkdir(parents=True)
-    (source / "data" / "public" / "train.csv").write_text(
+    (source / "task.toml").write_text("[task]\nname = \"labelbox/demo\"\n")
+    (source / "data").mkdir(parents=True)
+    (source / "scorer" / "data").mkdir(parents=True)
+    (source / "data" / "train.csv").write_text(
         "x,y,value,label\n1,1,0.1,0\n2,2,0.3,0\n3,3,0.5,1\n4,4,0.7,1\n"
     )
-    (source / "data" / "private" / "test_target.csv").write_text("value,label\n0,0\n")
-    training_data = source / "data" / "public" / "train.csv"
+    (source / "scorer" / "data" / "test_target.csv").write_text("value,label\n0,0\n")
+    training_data = source / "data" / "train.csv"
     _write_strategy(
-        source / "reference_solution",
+        source / "solution",
         role="reference",
         training_data=training_data,
     )
@@ -72,14 +77,24 @@ def _problem(tmp_path: Path) -> HarnessProblem:
         role="naive",
         training_data=training_data,
     )
-    (source / "test_file.py").write_text(
+    (source / "scorer" / "compute_score.py").write_text(
         "\n".join(
             [
-                "from grading.evaluation import AnchorRationale, BinaryF1Target, ContinuousTask, FloorAnchor, GeneratedCalibration, SRETarget",
+                (
+                    "from grading.evaluation import AnchorRationale, "
+                    "BinaryF1Target, ContinuousTask, FloorAnchor, "
+                    "GeneratedCalibration, SRETarget"
+                ),
                 "LOW = FloorAnchor(0.0, AnchorRationale('metric_bound', 'Binary F1 is bounded below by zero.'))",
-                "HIGH = FloorAnchor(1.0, AnchorRationale('theoretical', 'Population-standardized RMSE has a no-skill value of one.'))",
+                (
+                    "HIGH = FloorAnchor(1.0, AnchorRationale('theoretical', "
+                    "'Population-standardized RMSE has a no-skill value of one.'))"
+                ),
                 "TASK = ContinuousTask.calibrated(",
-                "  targets=[SRETarget.lower('value', weight=.5, floor=HIGH), BinaryF1Target.higher('label', weight=.5, floor=LOW)],",
+                (
+                    "  targets=[SRETarget.lower('value', weight=.5, floor=HIGH), "
+                    "BinaryF1Target.higher('label', weight=.5, floor=LOW)],"
+                ),
                 "  calibration=GeneratedCalibration(),",
                 ")",
                 "def measure_submission(): return {'value': .2, 'label': .9}",
@@ -106,7 +121,7 @@ def _problem(tmp_path: Path) -> HarnessProblem:
         outputs=[],
         source_problem_dir=source,
         grader_dir=source,
-        private_dir=source / "data" / "private",
+        private_dir=source / "scorer" / "data",
         ground_truth=GroundTruthSpec(
             continuous_score_epsilon=0.05,
             zero_anchor_epsilon=0.01,
@@ -160,7 +175,7 @@ def test_calibration_cache_key_tracks_semantic_inputs_not_image_rebuilds(
         == first
     )
 
-    grader = problem.source_problem_dir / "test_file.py"
+    grader = problem.source_problem_dir / "scorer" / "compute_score.py"
     grader.write_text(grader.read_text() + "# semantic grader revision\n")
     updated_task = calibration.load_continuous_task(problem)
     assert updated_task is not None
@@ -176,6 +191,8 @@ def test_calibration_cache_key_tracks_semantic_inputs_not_image_rebuilds(
 
 def test_ml_ground_truth_generates_lock_and_replays(monkeypatch, tmp_path) -> None:
     problem = _problem(tmp_path)
+    registered_task = calibration.load_continuous_task(problem)
+    assert registered_task is not None
     source = problem.source_problem_dir
     assert source is not None
     invoked_entrypoints: list[str] = []
@@ -194,8 +211,8 @@ def test_ml_ground_truth_generates_lock_and_replays(monkeypatch, tmp_path) -> No
         invoked_entrypoints.append(f"{options.solution_dir}/{entrypoint}")
         assert "train" not in Path(entrypoint).name.lower()
         assert options.solution_dir.endswith(
-            ("reference_solution", "baselines/naive", "naive")
-        ) or options.solution_dir in {"reference_solution", "baselines/naive"}
+            ("solution", "baselines/naive", "naive")
+        ) or options.solution_dir in {"solution", "baselines/naive"}
         cache = Path(_problem.reference.cache_dir)
         if cache.exists():
             import shutil
@@ -218,7 +235,8 @@ def test_ml_ground_truth_generates_lock_and_replays(monkeypatch, tmp_path) -> No
             metrics = {"value": 0.98, "label": 0.0}
         return {
             "schema_version": "raw-continuous-metrics.v1",
-            "task_spec_sha256": "fixture",
+            "task_spec_sha256": registered_task.spec_sha256,
+            "calibration_seed": 0,
             "metrics": metrics,
         }
 
@@ -278,13 +296,13 @@ def test_ml_ground_truth_rejects_train_in_solution(tmp_path) -> None:
     problem = _problem(tmp_path)
     source = problem.source_problem_dir
     assert source is not None
-    (source / "reference_solution" / "solution.py").write_text(
+    (source / "solution" / "solution.py").write_text(
         "from sklearn.linear_model import LogisticRegression\n"
         "LogisticRegression().fit([[0], [1]], [0, 1])\n"
     )
 
     with pytest.raises(ValueError, match="looks like a training"):
-        validate_ml_strategy_contract(source / "reference_solution", role="reference")
+        validate_ml_strategy_contract(source / "solution", role="reference")
 
 
 def test_tier_b_submission_csv_participates_in_strategy_digest(tmp_path) -> None:
@@ -292,11 +310,155 @@ def test_tier_b_submission_csv_participates_in_strategy_digest(tmp_path) -> None
     task = calibration.load_continuous_task(problem)
     assert task is not None
     before = calibration.calibration_input_digests(problem, task)["reference_strategy"]
-    (problem.source_problem_dir / "reference_solution" / "submission.csv").write_text(
+    (problem.source_problem_dir / "solution" / "submission.csv").write_text(
         "value,label\n0,0\n"
     )
     after = calibration.calibration_input_digests(problem, task)["reference_strategy"]
     assert before != after
+
+
+def _task_with_workspace_probes(problem: HarnessProblem):
+    task = calibration.load_continuous_task(problem)
+    assert task is not None
+    provider = WorkspaceDegenerateProbes(
+        probes=[
+            WorkspaceProbe(
+                name="no-op",
+                path="baselines/degenerate/no-op",
+                rationale="A committed policy that always emits the neutral action.",
+            ),
+            WorkspaceProbe(
+                name="seeded-random",
+                path="baselines/degenerate/seeded-random",
+                rationale="A committed seeded policy with no learned state or signal.",
+            ),
+        ]
+    )
+    return replace(
+        task,
+        calibration=GeneratedCalibration(degenerate_probes=provider),
+    )
+
+
+def test_workspace_degenerate_probes_are_measured_and_digest_bound(
+    monkeypatch, tmp_path
+) -> None:
+    problem = _problem(tmp_path)
+    source = problem.source_problem_dir
+    assert source is not None
+    for name, action in (("no-op", 0), ("seeded-random", 1)):
+        workspace = source / "baselines" / "degenerate" / name
+        workspace.mkdir(parents=True)
+        (workspace / "policy.py").write_text(f"ACTION = {action}\n", encoding="utf-8")
+    task = _task_with_workspace_probes(problem)
+    calls: list[str] = []
+
+    def fake_measure(_problem, workspace, _output, _transcript):
+        del _problem, _output, _transcript
+        calls.append(workspace.name)
+        action = int(
+            (workspace / "policy.py").read_text(encoding="utf-8").split("=")[1]
+        )
+        return {
+            "schema_version": "raw-continuous-metrics.v1",
+            "task_spec_sha256": task.spec_sha256,
+            "calibration_seed": 0,
+            "metrics": {
+                "value": 1.0,
+                "label": float(action),
+            },
+        }
+
+    monkeypatch.setattr(calibration, "measure_workspace_in_container", fake_measure)
+    measured = calibration._measure_degenerate_family(problem, task, tmp_path / "run")
+
+    assert measured == {
+        "no-op": {"value": 1.0, "label": 0.0},
+        "seeded-random": {"value": 1.0, "label": 1.0},
+    }
+    assert len(calls) == 4
+    inputs = calibration.calibration_input_digests(problem, task)
+    assert set(key for key in inputs if key.startswith("degenerate_probe:")) == {
+        "degenerate_probe:no-op",
+        "degenerate_probe:seeded-random",
+    }
+    before = inputs["degenerate_probe:no-op"]
+    (source / "baselines" / "degenerate" / "no-op" / "policy.py").write_text(
+        "ACTION = 2\n", encoding="utf-8"
+    )
+    after = calibration.calibration_input_digests(problem, task)[
+        "degenerate_probe:no-op"
+    ]
+    assert before != after
+
+
+def test_workspace_degenerate_probe_rejects_nondeterminism(
+    monkeypatch, tmp_path
+) -> None:
+    problem = _problem(tmp_path)
+    source = problem.source_problem_dir
+    assert source is not None
+    for name in ("no-op", "seeded-random"):
+        workspace = source / "baselines" / "degenerate" / name
+        workspace.mkdir(parents=True)
+        (workspace / "policy.py").write_text("ACTION = 0\n", encoding="utf-8")
+    # Keep workspace digests distinct so nondeterminism is the first failure.
+    (source / "baselines" / "degenerate" / "seeded-random" / "seed.txt").write_text(
+        "7\n", encoding="utf-8"
+    )
+    task = _task_with_workspace_probes(problem)
+    count = 0
+
+    def fake_measure(_problem, workspace, _output, _transcript):
+        nonlocal count
+        del _problem, workspace, _output, _transcript
+        count += 1
+        return {
+            "schema_version": "raw-continuous-metrics.v1",
+            "task_spec_sha256": task.spec_sha256,
+            "calibration_seed": 0,
+            "metrics": {"value": 1.0 + count * 0.01, "label": 0.0},
+        }
+
+    monkeypatch.setattr(calibration, "measure_workspace_in_container", fake_measure)
+    with pytest.raises(RuntimeError, match="nondeterministic"):
+        calibration._measure_degenerate_family(problem, task, tmp_path / "run")
+
+
+def test_workspace_degenerate_probe_rejects_symlink(tmp_path) -> None:
+    problem = _problem(tmp_path)
+    source = problem.source_problem_dir
+    assert source is not None
+    for name in ("no-op", "seeded-random"):
+        workspace = source / "baselines" / "degenerate" / name
+        workspace.mkdir(parents=True)
+        (workspace / "policy.py").write_text("ACTION = 0\n", encoding="utf-8")
+    (source / "baselines" / "degenerate" / "no-op" / "leak").symlink_to(
+        source / "scorer" / "data" / "test_target.csv"
+    )
+    task = _task_with_workspace_probes(problem)
+
+    with pytest.raises(ValueError, match="non-regular"):
+        calibration._measure_degenerate_family(problem, task, tmp_path / "run")
+
+
+def test_workspace_degenerate_probe_rejects_symlinked_root(tmp_path) -> None:
+    problem = _problem(tmp_path)
+    source = problem.source_problem_dir
+    assert source is not None
+    external = tmp_path / "external-probe"
+    external.mkdir()
+    (external / "policy.py").write_text("ACTION = 0\n", encoding="utf-8")
+    degenerate = source / "baselines" / "degenerate"
+    degenerate.mkdir(parents=True)
+    (degenerate / "no-op").symlink_to(external, target_is_directory=True)
+    seeded = degenerate / "seeded-random"
+    seeded.mkdir()
+    (seeded / "policy.py").write_text("ACTION = 1\n", encoding="utf-8")
+    task = _task_with_workspace_probes(problem)
+
+    with pytest.raises(ValueError, match="real directory"):
+        calibration.calibration_input_digests(problem, task)
 
 
 def test_proof_hash_refreshes_after_generated_lock(tmp_path) -> None:

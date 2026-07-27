@@ -26,7 +26,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REGISTRY="${REGISTRY:-us-east1-docker.pkg.dev/gcp-taiga/labelbox}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 PUSH=false
-FLAVORS="cpu,gpu,gpu-openroad,gpu-blackwell"
+# Every flavor, because base_drift_hash() hashes all base inputs globally rather
+# than per flavor: editing any base file moves every flavor's tag, so a partial
+# default would leave the untouched flavors with no image at the new tag.
+# expand_base_flavors only pulls in parents, never children, so the omitted ones
+# were never picked up implicitly.
+FLAVORS="cpu,gpu,gpu-openroad,gpu-blackwell,cuda-graphics,tpu"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -123,11 +128,14 @@ for flavor in "${FLAVOR_LIST[@]}"; do
   echo ":: done ${ref}"
 done
 
-# Point the exporter at the freshly-built cpu/gpu/gpu-openroad/cuda-graphics tag.
-# Blackwell and TPU use distinct tag prefixes/env vars.
+# Point the exporter at the freshly-built cpu/gpu/gpu-openroad tag. Blackwell,
+# cuda-graphics and TPU use distinct tag prefixes/env vars.
 echo ":: export with: LBX_RL_TASKS_BASE_IMAGE_TAG=runtime-ml-core-py313-${DRIFT_HASH}"
 if printf '%s\n' "${FLAVOR_LIST[@]}" | grep -qx gpu-blackwell; then
   echo "::            and LBX_RL_TASKS_BLACKWELL_BASE_IMAGE_TAG=runtime-ml-blackwell-py313-${DRIFT_HASH}"
+fi
+if printf '%s\n' "${FLAVOR_LIST[@]}" | grep -qx cuda-graphics; then
+  echo "::            and LBX_RL_TASKS_GRAPHICS_BASE_IMAGE_TAG=runtime-ml-graphics-py313-${DRIFT_HASH}"
 fi
 if printf '%s\n' "${FLAVOR_LIST[@]}" | grep -qx tpu; then
   echo "::            and LBX_RL_TASKS_TPU_BASE_IMAGE_TAG=runtime-ml-tpu-py312-${DRIFT_HASH}"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import threading
@@ -8,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-
-from grading import helpers, score_kfold_cv
+from grading import helpers, runtime_hardening, score_kfold_cv
+from grading import kfold as kfold_module
 from grading.faults import AgentFault
 from grading.policy_runner import PolicyWorker
 
@@ -40,7 +41,9 @@ def test_executable_passes_args_and_returncode(tmp_path: Path) -> None:
 
 def test_executable_stdin_bytes_piped_to_child(tmp_path: Path) -> None:
     exe = _write_script(tmp_path / "cat.sh", "#!/bin/sh\ncat\n")
-    proc = helpers.run_submitted_executable([str(exe)], stdin_bytes=b"ping", timeout_s=10)
+    proc = helpers.run_submitted_executable(
+        [str(exe)], stdin_bytes=b"ping", timeout_s=10
+    )
     assert proc.stdout == b"ping"
 
 
@@ -108,9 +111,7 @@ def test_executable_capture_discards_stderr(tmp_path: Path) -> None:
 def test_executable_streaming_rejects_stdin_and_timeout(tmp_path: Path) -> None:
     exe = _write_script(tmp_path / "run.sh", "#!/bin/sh\necho hi\n")
     with pytest.raises(ValueError):
-        helpers.run_submitted_executable(
-            [str(exe)], streaming=True, stdin_bytes=b"x"
-        )
+        helpers.run_submitted_executable([str(exe)], streaming=True, stdin_bytes=b"x")
     with pytest.raises(ValueError):
         helpers.run_submitted_executable([str(exe)], streaming=True, timeout_s=5)
 
@@ -140,6 +141,23 @@ def test_h5_reads_regular_dataset(tmp_path: Path) -> None:
         f.create_dataset("preds", data=np.arange(4, dtype=float))
     out = helpers.load_submission_h5_or_fault(sub, datasets=["preds"])
     assert np.array_equal(out["preds"], np.arange(4, dtype=float))
+
+
+def test_h5_rejects_parent_symlink(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    private = tmp_path / "private"
+    private.mkdir()
+    with h5py.File(private / "submission.h5", "w") as handle:
+        handle.create_dataset("preds", data=np.arange(4, dtype=float))
+    workspace = tmp_path / "output"
+    workspace.mkdir()
+    os.symlink(private, workspace / "nested")
+
+    with pytest.raises(AgentFault):
+        helpers.load_submission_h5_or_fault(
+            workspace / "nested" / "submission.h5",
+            datasets=["preds"],
+        )
 
 
 def test_h5_rejects_external_link(tmp_path: Path) -> None:
@@ -180,6 +198,29 @@ def test_h5_reads_all_top_level_datasets_when_unspecified(tmp_path: Path) -> Non
     assert set(out) == {"a", "b"}
     assert np.array_equal(out["a"], np.arange(3, dtype=float))
     assert np.array_equal(out["b"], np.ones(2, dtype="int64"))
+
+
+def test_h5_enforces_dataset_count_and_logical_size_limits(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    sub = tmp_path / "submission.h5"
+    with h5py.File(sub, "w") as handle:
+        handle.create_dataset("a", data=np.arange(4, dtype="float32"))
+        handle.create_dataset("b", data=np.arange(4, dtype="float32"))
+
+    with pytest.raises(AgentFault, match="over limit"):
+        helpers.load_submission_h5_or_fault(sub, max_datasets=1)
+    with pytest.raises(AgentFault, match="per-dataset limit"):
+        helpers.load_submission_h5_or_fault(
+            sub,
+            datasets=["a"],
+            max_dataset_bytes=8,
+        )
+    with pytest.raises(AgentFault, match="aggregate limit"):
+        helpers.load_submission_h5_or_fault(
+            sub,
+            datasets=["a", "b"],
+            max_total_bytes=24,
+        )
 
 
 def test_h5_reads_large_multidim_dataset_via_file_transfer(tmp_path: Path) -> None:
@@ -231,31 +272,11 @@ def test_h5_read_runs_unprivileged_not_as_root(tmp_path: Path) -> None:
 # ── load_submission_h5ad_or_fault ─────────────────────────────────────────
 
 
-def test_h5ad_sanitizer_accepts_valid_anndata(tmp_path: Path) -> None:
-    anndata = pytest.importorskip("anndata")
-    pytest.importorskip("h5py")
-    src = tmp_path / "submission.h5ad"
-    anndata.AnnData(X=np.eye(3, dtype="float32")).write_h5ad(src)
-    out = tmp_path / "clean.h5ad"
-    result = helpers.load_submission_h5ad_or_fault(src, out_path=out)
-    assert result == out
-    assert out.exists() and out.stat().st_size > 0
-    # The sanitized copy round-trips back through anndata with the same X.
-    assert np.array_equal(anndata.read_h5ad(out).X, np.eye(3, dtype="float32"))
-
-
-def test_h5ad_sanitizer_rejects_malformed(tmp_path: Path) -> None:
-    pytest.importorskip("anndata")
-    src = tmp_path / "broken.h5ad"
-    src.write_bytes(b"this is not an HDF5 / AnnData file at all")
-    with pytest.raises(AgentFault):
-        helpers.load_submission_h5ad_or_fault(src, out_path=tmp_path / "out.h5ad")
-
-
-def test_h5ad_sanitizer_missing_file_raises_agent_fault(tmp_path: Path) -> None:
-    with pytest.raises(AgentFault):
+def test_h5ad_whole_object_handoff_is_disabled(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="whole-object H5AD loading is disabled"):
         helpers.load_submission_h5ad_or_fault(
-            tmp_path / "nope.h5ad", out_path=tmp_path / "out.h5ad"
+            tmp_path / "submission.h5ad",
+            out_path=tmp_path / "out.h5ad",
         )
 
 
@@ -263,6 +284,95 @@ def test_h5ad_sanitizer_missing_file_raises_agent_fault(tmp_path: Path) -> None:
 # The full cross-fold run wipes the agent roots between folds, so it is
 # exercised by integration tasks. These cover only the pre-flight validation
 # guards, which raise before any policy runs or any root is wiped.
+
+
+def test_kfold_quiesce_failure_does_not_continue(monkeypatch) -> None:
+    def fail_quiesce():
+        raise runtime_hardening.AgentProcessQuiesceError("respawning")
+
+    monkeypatch.setattr(
+        runtime_hardening,
+        "kill_pre_grade_agent_processes",
+        fail_quiesce,
+    )
+    monkeypatch.setattr(kfold_module.os, "geteuid", lambda: 0)
+    with pytest.raises(AgentFault, match="respawning"):
+        kfold_module._quiesce_agent_processes_between_folds()
+
+
+def test_kfold_tree_walk_error_fails_closed(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "wipe-root"
+    root.mkdir()
+    pristine = tmp_path / "pristine"
+    pristine.mkdir()
+    real_walk = os.walk
+    calls = 0
+
+    def fail_walk(*_args, onerror, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            onerror(OSError(errno.ENAMETOOLONG, "path exceeds PATH_MAX"))
+            return ()
+        return real_walk(*_args, onerror=onerror, **_kwargs)
+
+    monkeypatch.setattr(kfold_module.os, "walk", fail_walk)
+    with pytest.raises(AgentFault, match="PATH_MAX"):
+        kfold_module._capture_agent_tree([str(root)], str(pristine))
+
+
+def test_kfold_pathmax_cache_is_quarantined(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "wipe-root"
+    root.mkdir()
+    pristine = tmp_path / "pristine"
+    pristine.mkdir()
+    monkeypatch.setattr(kfold_module, "_AGENT_UID", os.getuid())
+
+    directory_fds = [os.open(root, os.O_RDONLY | os.O_DIRECTORY)]
+    names: list[str] = []
+    try:
+        for index in range(30):
+            name = f"{index:04d}-" + ("x" * 180)
+            names.append(name)
+            os.mkdir(name, dir_fd=directory_fds[-1])
+            next_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY,
+                dir_fd=directory_fds[-1],
+            )
+            directory_fds.append(next_fd)
+        cache_fd = os.open(
+            "labels.cache",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_fds[-1],
+        )
+        os.write(cache_fd, b"held-out labels")
+        os.close(cache_fd)
+        with pytest.raises(AgentFault, match="securely traverse"):
+            kfold_module._capture_agent_tree([str(root)], str(pristine))
+        quarantined = list(root.iterdir())
+        assert len(quarantined) == 1
+        assert stat.S_IMODE(quarantined[0].lstat().st_mode) == 0
+        if os.geteuid() == 0:
+            assert quarantined[0].lstat().st_uid == 0
+    finally:
+        if len(directory_fds) > 1:
+            os.fchmod(directory_fds[1], 0o700)
+        try:
+            os.unlink("labels.cache", dir_fd=directory_fds[-1])
+        except FileNotFoundError:
+            pass
+        for index in range(len(names) - 1, -1, -1):
+            os.rmdir(names[index], dir_fd=directory_fds[index])
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
 
 
 def _kfold_df() -> pd.DataFrame:
@@ -335,7 +445,9 @@ def test_npz_round_trips(tmp_path: Path) -> None:
     out = helpers.load_submission_npz_or_fault(tmp_path / "s.npz")
     assert np.array_equal(out["y"], np.arange(5))
     np.save(tmp_path / "s.npy", np.arange(4))
-    assert np.array_equal(helpers.load_submission_npz_or_fault(tmp_path / "s.npy"), np.arange(4))
+    assert np.array_equal(
+        helpers.load_submission_npz_or_fault(tmp_path / "s.npy"), np.arange(4)
+    )
 
 
 def test_npz_symlink_to_truth_is_agent_fault(tmp_path: Path) -> None:
@@ -347,6 +459,18 @@ def test_npz_symlink_to_truth_is_agent_fault(tmp_path: Path) -> None:
     os.symlink(truth, link)
     with pytest.raises(AgentFault):
         helpers.load_submission_npz_or_fault(link)
+
+
+def test_npz_parent_symlink_to_truth_is_agent_fault(tmp_path: Path) -> None:
+    private = tmp_path / "private"
+    private.mkdir()
+    np.savez(private / "predictions.npz", y=np.arange(99))
+    workspace = tmp_path / "output"
+    workspace.mkdir()
+    os.symlink(private, workspace / "nested")
+
+    with pytest.raises(AgentFault):
+        helpers.load_submission_npz_or_fault(workspace / "nested" / "predictions.npz")
 
 
 def test_npz_fifo_does_not_hang(tmp_path: Path) -> None:
@@ -369,6 +493,14 @@ def test_h5_readback_symlink_to_truth_is_agent_fault(tmp_path: Path) -> None:
     os.symlink(truth, link)
     with pytest.raises(AgentFault):
         helpers._np_load_regular_nofollow(str(link))
+
+
+def test_h5_readback_malformed_npy_is_agent_fault(tmp_path: Path) -> None:
+    malformed = tmp_path / "0.npy"
+    malformed.write_bytes(b"not a numpy file")
+
+    with pytest.raises(AgentFault, match="parsed safely"):
+        helpers._np_load_regular_nofollow(str(malformed))
 
 
 def test_h5_readback_fifo_does_not_hang(tmp_path: Path) -> None:
@@ -394,7 +526,9 @@ def test_h5_readback_fifo_does_not_hang(tmp_path: Path) -> None:
     assert isinstance(result.get("exc"), AgentFault)
 
 
-def test_npz_directory_and_oversize_and_missing_are_agent_faults(tmp_path: Path) -> None:
+def test_npz_directory_and_oversize_and_missing_are_agent_faults(
+    tmp_path: Path,
+) -> None:
     os.mkdir(tmp_path / "d.npz")
     with pytest.raises(AgentFault):
         helpers.load_submission_npz_or_fault(tmp_path / "d.npz")
@@ -415,7 +549,9 @@ def test_npz_decompression_bomb_is_agent_fault(tmp_path: Path) -> None:
     with pytest.raises(AgentFault):
         helpers.load_submission_npz_or_fault(bomb, max_uncompressed_bytes=1_000_000)
     # Under a generous cap the same archive loads fine (no false positive).
-    out = helpers.load_submission_npz_or_fault(bomb, max_uncompressed_bytes=64 * 1024 * 1024)
+    out = helpers.load_submission_npz_or_fault(
+        bomb, max_uncompressed_bytes=64 * 1024 * 1024
+    )
     assert out["y"].shape == (2_000_000,)
 
 
@@ -423,6 +559,16 @@ def test_npz_rejects_pickle_object_array_by_default(tmp_path: Path) -> None:
     np.save(tmp_path / "obj.npy", np.array({"a": 1}, dtype=object))
     with pytest.raises(AgentFault):
         helpers.load_submission_npz_or_fault(tmp_path / "obj.npy")  # allow_pickle=False
+
+
+def test_npz_rejects_allow_pickle_opt_out(tmp_path: Path) -> None:
+    np.save(tmp_path / "values.npy", np.arange(3))
+
+    with pytest.raises(ValueError, match="allow_pickle=True is forbidden"):
+        helpers.load_submission_npz_or_fault(
+            tmp_path / "values.npy",
+            allow_pickle=True,
+        )
 
 
 def test_npz_rejects_object_array_member(tmp_path: Path) -> None:
@@ -438,13 +584,20 @@ def test_npz_rejects_object_array_member(tmp_path: Path) -> None:
 # ── require_regular_file (the pre-read guard for hand-rolled reads) ─────────
 
 
-def test_require_regular_file_accepts_regular_returns_path(tmp_path: Path) -> None:
+def test_require_regular_file_returns_immutable_snapshot(tmp_path: Path) -> None:
     f = tmp_path / "f.txt"
     f.write_text("ok")
-    assert helpers.require_regular_file(f) == f
+    snapshot = helpers.require_regular_file(f)
+    assert snapshot != f
+    assert snapshot.read_text() == "ok"
+
+    f.write_text("changed")
+    assert snapshot.read_text() == "ok"
 
 
-def test_require_regular_file_rejects_symlink_fifo_dir_oversize_missing(tmp_path: Path) -> None:
+def test_require_regular_file_rejects_symlink_fifo_dir_oversize_missing(
+    tmp_path: Path,
+) -> None:
     real = tmp_path / "real.txt"
     real.write_text("x")
     link = tmp_path / "link.txt"

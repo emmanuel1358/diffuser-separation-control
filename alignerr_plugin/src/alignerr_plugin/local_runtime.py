@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 from alignerr_plugin.utils import load_task_toml
@@ -18,34 +18,34 @@ LOCAL_GPU_OPENROAD_BASE_IMAGE = "lbx-tasks-base-gpu-openroad"
 LOCAL_GPU_BLACKWELL_BASE_IMAGE = "lbx-tasks-base-gpu-blackwell"
 LOCAL_CUDA_GRAPHICS_BASE_IMAGE = "lbx-tasks-base-cuda-graphics"
 LOCAL_TPU_BASE_IMAGE = "lbx-tasks-base-tpu"
-LOCAL_MLENVS_SLIM_BASE_IMAGE = "lbx-tasks-base-mlenvs-slim"
-# mlenvs-specific bases (not shared with native flavors).
-LOCAL_MLENVS_GPU_BASE_IMAGE = "lbx-tasks-base-mlenvs-gpu"
-LOCAL_MLENVS_CUDA_GRAPHICS_BASE_IMAGE = "lbx-tasks-base-mlenvs-cuda-graphics"
-LOCAL_MLENVS_TPU_BASE_IMAGE = "lbx-tasks-base-mlenvs-tpu"
-# Blackwell overlays (local-only cu128 / sm_120 dev builds).
-LOCAL_MLENVS_GPU_BLACKWELL_BASE_IMAGE = "lbx-tasks-base-mlenvs-gpu-blackwell"
-LOCAL_MLENVS_CUDA_GRAPHICS_BLACKWELL_BASE_IMAGE = (
-    "lbx-tasks-base-mlenvs-cuda-graphics-blackwell"
-)
 LOCAL_BASE_TAG = "runtime-ml-core-py313-local"
 LOCAL_PLATFORM = "linux/amd64"
 
-# Compute base "flavor". "heavy" is the production-equivalent base; "slim" is the
-# local-only stripped mlenvs base for low-RAM dev hosts where the heavy image OOMs.
-# "auto" tries heavy and falls back to slim on a build-time OOM. Slim is only
-# meaningful for compute tasks (no GPU/graphics/TPU stack; the agent pip-installs
-# at runtime).
-VALID_FLAVORS = ("auto", "heavy", "slim")
-# Extra agent turns on a slim fallback, to offset the runtime pip-install overhead.
-SLIM_FALLBACK_TURN_BONUS = 50
+# The local tag is a fixed name, so freshness rides on the same labels
+# `base/build_and_push.sh` stamps onto the pushed bases: the drift hash is a
+# content hash over every base build input, so a cached image whose label does
+# not match the working tree was built from a different base/ and cannot be
+# reused. Without this an author whose cache predates a base/ change gets the
+# failure from inside the task's Docker build instead (e.g. a missing
+# /opt/lbx-runtime/install-task-deps.sh), which names nothing useful.
+LOCAL_BASE_DRIFT_LABEL = "lbx.base.drift_hash"
+LOCAL_BASE_FLAVOR_LABEL = "lbx.base.flavor"
+
+# Set to reuse a cached base that failed the drift check, for the case where an
+# author knows their task does not depend on the base/ change in flight.
+ALLOW_STALE_BASE_ENV = "LBX_RL_TASKS_ALLOW_STALE_BASE"
+
+# Quoted to the author before a rebuild starts; a full base is large and slow
+# enough (much slower under emulation) that triggering one unannounced is hostile.
+_BASE_REBUILD_COST = "~16.5 GB of image layers and tens of minutes"
 
 
 class BuildOOMError(RuntimeError):
     """A base-image build was killed by an out-of-memory signature.
 
-    Subclasses RuntimeError so callers catching RuntimeError still handle it; the
-    flavor orchestrator catches it specifically to fall back to the slim base.
+    Subclasses RuntimeError so callers catching RuntimeError still handle it;
+    raised separately from a generic build failure so the message can point at
+    host memory rather than at the failing install phase.
     """
 
 
@@ -69,12 +69,13 @@ _OOM_PATTERNS = (
 def _is_build_oom(output: str, returncode: int) -> bool:
     """Whether a failed build looks OOM-killed, by OUTPUT SIGNATURE not exit code.
 
-    A bare outer exit 137 is deliberately NOT treated as OOM (docker kill / timeout
-    / Ctrl-C also exit 137), so auto-mode never silently downgrades to slim on a
-    non-OOM interruption.
+    A bare outer exit 137 is deliberately NOT treated as OOM (docker kill /
+    timeout / Ctrl-C also exit 137), so a non-OOM interruption is never
+    misreported as an out-of-memory host.
     """
     _ = returncode  # kept for signature/back-compat; classification is by output
     return any(pattern in output for pattern in _OOM_PATTERNS)
+
 
 # Per-flavor (local image name, Dockerfile path).
 _LOCAL_BASE_BY_FLAVOR: dict[str, tuple[str, str]] = {
@@ -90,37 +91,23 @@ _LOCAL_BASE_BY_FLAVOR: dict[str, tuple[str, str]] = {
         "base/cuda-graphics/Dockerfile",
     ),
     "tpu": (LOCAL_TPU_BASE_IMAGE, "base/tpu/Dockerfile"),
-    "mlenvs-slim": (LOCAL_MLENVS_SLIM_BASE_IMAGE, "base/mlenvs-slim/Dockerfile"),
-    "mlenvs-gpu": (LOCAL_MLENVS_GPU_BASE_IMAGE, "base/mlenvs-gpu/Dockerfile"),
-    "mlenvs-cuda-graphics": (
-        LOCAL_MLENVS_CUDA_GRAPHICS_BASE_IMAGE,
-        "base/mlenvs-cuda-graphics/Dockerfile",
-    ),
-    "mlenvs-tpu": (LOCAL_MLENVS_TPU_BASE_IMAGE, "base/mlenvs-tpu/Dockerfile"),
-    "mlenvs-gpu-blackwell": (
-        LOCAL_MLENVS_GPU_BLACKWELL_BASE_IMAGE,
-        "base/mlenvs-gpu-blackwell/Dockerfile",
-    ),
-    "mlenvs-cuda-graphics-blackwell": (
-        LOCAL_MLENVS_CUDA_GRAPHICS_BLACKWELL_BASE_IMAGE,
-        "base/mlenvs-cuda-graphics-blackwell/Dockerfile",
-    ),
 }
 
 
-# LOCAL-ONLY: on a Blackwell dev GPU (compute cap >= 10.0) the cu121 bases can't
-# run their kernels, so swap in the cu128 overlay. Never touches the Taiga export.
+# LOCAL-ONLY: both bases are cu130 now, but base/gpu is the CUDA -runtime image
+# and exports no sm_120 arch flags, so on a Blackwell dev GPU (compute cap
+# >= 10.0) any task CUDA extension builds for the wrong architecture (or not at
+# all, with no nvcc). Swap in the blackwell overlay, which is -devel and pins
+# sm_120. Never touches the Taiga export.
 _LOCAL_BLACKWELL_OVERLAY: dict[str, str] = {
     "gpu": "gpu-blackwell",
-    "mlenvs-gpu": "mlenvs-gpu-blackwell",
-    "mlenvs-cuda-graphics": "mlenvs-cuda-graphics-blackwell",
 }
 
 _BLACKWELL_DETECTED: bool | None = None  # cached nvidia-smi probe result
 
 
 def local_gpu_is_blackwell() -> bool:
-    """Whether the local GPU needs a cu128 Blackwell base (compute cap >= 10.0).
+    """Whether the local GPU needs the sm_120 Blackwell base (compute cap >= 10.0).
 
     Cached; ``LBX_RL_TASKS_LOCAL_BLACKWELL=1``/``0`` forces it on/off. Any probe
     failure defaults to False.
@@ -164,31 +151,14 @@ class LocalBaseImage:
     image: str
     tag: str
     dockerfile: Path
-    # Resolved tier ("heavy" | "slim") and whether slim was reached via a heavy OOM.
-    flavor: str = "heavy"
-    flavor_fallback: bool = False
 
     @property
     def ref(self) -> str:
         return f"{self.image}:{self.tag}"
 
 
-def local_base_image_for_problem(
-    problem_dir: Path, *, flavor: str = "heavy"
-) -> LocalBaseImage:
-    """Return the repo-local base image required by a task.
-
-    ``flavor="heavy"`` resolves the task's compute base (with the local Blackwell
-    overlay swap); ``flavor="slim"`` short-circuits to the stripped ``mlenvs-slim``
-    base. ``flavor`` here is the resolved TIER; ``auto`` is decided one level up in
-    :func:`ensure_local_base_image`.
-    """
-    if flavor == "slim":
-        image, dockerfile = _LOCAL_BASE_BY_FLAVOR["mlenvs-slim"]
-        return LocalBaseImage(
-            image=image, tag=LOCAL_BASE_TAG, dockerfile=Path(dockerfile), flavor="slim"
-        )
-
+def local_base_image_for_problem(problem_dir: Path) -> LocalBaseImage:
+    """Return the repo-local flagship base image required by a task."""
     from alignerr_plugin.base_image import resolve_base_flavor_for_resource
 
     task_toml = load_task_toml(problem_dir)
@@ -201,96 +171,73 @@ def local_base_image_for_problem(
         overlay = _LOCAL_BLACKWELL_OVERLAY[resolved]
         print(
             f"Local Blackwell GPU detected: using {overlay} instead of {resolved} "
-            "for the local build (cu128 / sm_120).",
+            "for the local build (cu130 / sm_120).",
             flush=True,
         )
         resolved = overlay
     image, dockerfile = _LOCAL_BASE_BY_FLAVOR[resolved]
-    return LocalBaseImage(
-        image=image, tag=LOCAL_BASE_TAG, dockerfile=Path(dockerfile), flavor="heavy"
-    )
+    return LocalBaseImage(image=image, tag=LOCAL_BASE_TAG, dockerfile=Path(dockerfile))
 
 
-def _slim_available(problem_dir: Path) -> bool:
-    """Whether slim can substitute: an ML_Envs compute task (heavy base is
-    ``mlenvs-gpu`` / its Blackwell overlay). Graphics/TPU tasks need their heavy base."""
-    from alignerr_plugin import mlenvs
-
-    if not mlenvs.is_mlenvs_task(problem_dir):
-        return False
-    heavy = local_base_image_for_problem(problem_dir, flavor="heavy")
-    return heavy.image in {
-        LOCAL_MLENVS_GPU_BASE_IMAGE,
-        LOCAL_MLENVS_GPU_BLACKWELL_BASE_IMAGE,
-    }
-
-
-def _ensure_built(repo_root: Path, base: LocalBaseImage) -> None:
-    """Build ``base`` (and its parent chain) if it is not already present."""
-    if _docker_image_exists(base.ref):
-        return
-    _ensure_parent_base_image(repo_root, base)
-    _build_base_image(repo_root, base)
-
-
-def ensure_local_base_image(
-    repo_root: Path, problem_dir: Path, *, flavor: str = "auto"
-) -> LocalBaseImage:
-    """Build the task's local base image if absent, honoring the compute flavor.
-
-    ``auto`` builds heavy and, on a build-time OOM, falls back to slim (when
-    viable). ``heavy`` forces the production base; ``slim`` forces the stripped
-    base (rejected for GPU/graphics/TPU tasks).
-    """
+def ensure_local_base_image(repo_root: Path, problem_dir: Path) -> LocalBaseImage:
+    """Build the task's local base image (and its parent chain) if absent or stale."""
     if shutil.which("docker") is None:
         raise RuntimeError("docker is required for local harness runs")
-    if flavor not in VALID_FLAVORS:
-        raise ValueError(f"--flavor must be one of {list(VALID_FLAVORS)}; got {flavor!r}")
+    from alignerr_plugin.base_image import base_drift_hash
 
-    slim_ok = _slim_available(problem_dir)
+    base = local_base_image_for_problem(problem_dir)
+    drift = base_drift_hash(repo_root)
+    if _can_reuse_cached_base(base, drift):
+        return base
+    inherited = _ensure_parent_base_image(repo_root, base, drift)
+    _build_base_image(repo_root, base, inherited)
+    return base
 
-    if flavor == "slim":
-        if not slim_ok:
-            raise RuntimeError(
-                "--flavor slim is only available for ML_Envs compute tasks: the "
-                "mlenvs-slim base carries no GPU/graphics/TPU stack, so a "
-                "graphics / TPU (or non-ML_Envs) task must build its heavy base."
-            )
-        slim = local_base_image_for_problem(problem_dir, flavor="slim")
-        _ensure_built(repo_root, slim)
-        return slim
 
-    if flavor == "heavy":
-        heavy = local_base_image_for_problem(problem_dir, flavor="heavy")
-        _ensure_built(repo_root, heavy)
-        return heavy
+def _allow_stale_base() -> bool:
+    value = os.environ.get(ALLOW_STALE_BASE_ENV, "")
+    return value.strip().lower() not in ("", "0", "false", "no")
 
-    # auto: heavy first; on a build-time OOM fall back to slim when it is viable.
-    heavy = local_base_image_for_problem(problem_dir, flavor="heavy")
-    try:
-        _ensure_built(repo_root, heavy)
-        return heavy
-    except BuildOOMError:
-        if not slim_ok:
-            raise
-        bar = "=" * 72
+
+def _can_reuse_cached_base(base: LocalBaseImage, drift: str) -> bool:
+    """Whether the cached local base matches the working tree's base/ inputs.
+
+    Announces the reason and the cost before returning False for a stale cache,
+    so a rebuild is never a surprise.
+    """
+    cached = _cached_base_drift_hash(base.ref)
+    if cached is None:
+        return False  # never built here; the ordinary first-run build path
+    if cached == drift:
+        return True
+    reason = (
+        f"it was built from a different base/ revision "
+        f"(image {cached}, working tree {drift})"
+        if cached
+        else "it predates base-image drift labelling, so its contents "
+        "cannot be checked against the current base/"
+    )
+    if _allow_stale_base():
         print(
-            f"\n{bar}\n"
-            f"Heavy base {heavy.ref} OOMed while building. Falling back to the\n"
-            "local-only slim base; the agent installs ML wheels at runtime and\n"
-            f"gets +{SLIM_FALLBACK_TURN_BONUS} turns. Use --flavor heavy to force\n"
-            f"the production base on a larger host.\n{bar}",
+            f"WARNING: reusing stale local base image {base.ref} because "
+            f"{ALLOW_STALE_BASE_ENV} is set: {reason}. The task build will fail "
+            "if it reaches for anything the current base/ provides that this "
+            "image predates, such as /opt/lbx-runtime/install-task-deps.sh.",
             flush=True,
         )
-        slim = replace(
-            local_base_image_for_problem(problem_dir, flavor="slim"),
-            flavor_fallback=True,
-        )
-        _ensure_built(repo_root, slim)
-        return slim
+        return True
+    print(
+        f"Local base image {base.ref} is stale: {reason}.\n"
+        f"Rebuilding it so the task builds against the current base/ "
+        f"(costs {_BASE_REBUILD_COST}).\n"
+        f"Set {ALLOW_STALE_BASE_ENV}=1 to reuse the cached image instead, only "
+        "if your task does not depend on the base/ change.",
+        flush=True,
+    )
+    return False
 
 
-def _build_base_image(repo_root: Path, base: LocalBaseImage) -> None:
+def _build_base_image(repo_root: Path, base: LocalBaseImage, drift: str) -> None:
     dockerfile = repo_root / base.dockerfile
     if not dockerfile.exists():
         raise FileNotFoundError(f"local base Dockerfile not found: {dockerfile}")
@@ -308,6 +255,10 @@ def _build_base_image(repo_root: Path, base: LocalBaseImage) -> None:
             str(dockerfile),
             "--tag",
             base.ref,
+            "--label",
+            f"{LOCAL_BASE_FLAVOR_LABEL}={_flavor_for_base(base) or ''}",
+            "--label",
+            f"{LOCAL_BASE_DRIFT_LABEL}={drift}",
             str(repo_root),
         ],
         stdout=subprocess.PIPE,
@@ -340,7 +291,8 @@ def _build_base_image(repo_root: Path, base: LocalBaseImage) -> None:
         if _is_build_oom(output, returncode):
             raise BuildOOMError(
                 f"local base image build for {base.ref} was OOM-killed "
-                f"(exit {returncode}); output matched an out-of-memory signature."
+                f"(exit {returncode}); output matched an out-of-memory signature. "
+                "Raise the Docker VM memory limit or build on a larger host."
             )
         raise RuntimeError(
             f"local base image build failed for {base.ref}. "
@@ -361,33 +313,59 @@ def _flavor_for_base(base: LocalBaseImage) -> str | None:
     )
 
 
-def _ensure_parent_base_image(repo_root: Path, base: LocalBaseImage) -> None:
+def _ensure_parent_base_image(repo_root: Path, base: LocalBaseImage, drift: str) -> str:
     """Build the local parent-chain (bottom-up) before an overlay flavor that FROMs
-    it, stopping at the first ancestor image that already exists."""
+    it, stopping at the first ancestor image that is present and current.
+
+    Returns the drift hash the resulting chain actually represents, which is
+    ``drift`` unless an ancestor was stale and reused under
+    ``ALLOW_STALE_BASE_ENV``. Labelling the child with the current hash in that
+    case would launder the ancestor's staleness: the overlay would look current
+    forever after, and one override would permanently disarm the drift check for
+    it. Inheriting the stale hash instead keeps the next run honest.
+    """
     from alignerr_plugin.base_image import BASE_FLAVORS
 
     flavor = _flavor_for_base(base)
     if flavor is None:
-        return
+        return drift
     parent = BASE_FLAVORS[flavor].parent
     if not parent:
-        return
+        return drift
     parent_image, parent_dockerfile = _LOCAL_BASE_BY_FLAVOR[parent]
     parent_base = LocalBaseImage(
         image=parent_image, tag=base.tag, dockerfile=Path(parent_dockerfile)
     )
-    if _docker_image_exists(parent_base.ref):
-        return
-    _ensure_parent_base_image(repo_root, parent_base)
-    _build_base_image(repo_root, parent_base)
+    if _can_reuse_cached_base(parent_base, drift):
+        cached = _cached_base_drift_hash(parent_base.ref)
+        return drift if cached == drift else (cached or "")
+    inherited = _ensure_parent_base_image(repo_root, parent_base, drift)
+    _build_base_image(repo_root, parent_base, inherited)
+    return inherited
 
 
-def _docker_image_exists(image_ref: str) -> bool:
+def _cached_base_drift_hash(image_ref: str) -> str | None:
+    """Drift hash labelled on a locally cached base, or None when it isn't cached.
+
+    Returns an empty string for an image that exists but carries no drift label,
+    i.e. one built before this repo labelled local bases.
+    """
     completed = subprocess.run(
-        ["docker", "image", "inspect", image_ref],
+        [
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            f'{{{{index .Config.Labels "{LOCAL_BASE_DRIFT_LABEL}"}}}}',
+            image_ref,
+        ],
         check=False,
         text=True,
         capture_output=True,
         timeout=120,
     )
-    return completed.returncode == 0
+    if completed.returncode != 0:
+        return None
+    label = completed.stdout.strip()
+    # Go templates render a missing map key as "<no value>".
+    return "" if label == "<no value>" else label

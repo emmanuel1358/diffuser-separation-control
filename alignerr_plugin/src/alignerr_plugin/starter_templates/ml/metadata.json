@@ -1,8 +1,7 @@
 {
-  "ml_task_type": "dataset",
-  "required_resources": "12vcpu+100gib+h100/2",
-  "domain": "scientific_discovery_computational_science",
-  "license": "MIT",
-  "license_source": "https://REPLACE_ME-upstream-source-where-license-was-confirmed",
-  "description": "Replace with a one-line ML task description (continuous ML_Envs-style scoring)."
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "ml-replace-me",
+    "description": "Continuously scored ML modeling task"
+  }
 }

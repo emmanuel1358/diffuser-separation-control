@@ -43,3 +43,6 @@ problems/opensees-base-isolation.zip
 examples/opensees-base-isolation.zip
 .venv/
 __pycache__/
+
+# Base image package lists memoized by the dependency-channel image diff.
+.alignerr-cache/

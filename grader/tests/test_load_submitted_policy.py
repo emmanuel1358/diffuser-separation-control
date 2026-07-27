@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 
 import pytest
-
 from grading import load_env_module, load_submitted_policy
 from grading.faults import AgentFault
 
@@ -100,6 +99,18 @@ def test_directory_policy_raises_agent_fault(tmp_path: Path) -> None:
     d.mkdir()
     with pytest.raises(AgentFault, match="not a regular file"):
         load_submitted_policy(d)
+
+
+def test_parent_symlink_policy_raises_agent_fault(tmp_path: Path) -> None:
+    private = tmp_path / "private"
+    private.mkdir()
+    _write(private / "policy.py", "def load_policy():\n    return object()\n")
+    workspace = tmp_path / "output"
+    workspace.mkdir()
+    os.symlink(private, workspace / "nested")
+
+    with pytest.raises(AgentFault, match="not a regular file"):
+        load_submitted_policy(workspace / "nested" / "policy.py")
 
 
 def test_load_raise_is_agent_fault(tmp_path: Path) -> None:

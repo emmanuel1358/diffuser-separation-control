@@ -232,10 +232,11 @@ class RubricContext:
                 "context.policy() requires a RegularFileArtifact declaration"
             )
         return run_policy(
-            self.candidate.path,
+            self.candidate.original_path,
             timeout_s=timeout_s,
             first_call_timeout_s=first_call_timeout_s,
             cwd=cwd,
+            submitted_snapshot=self.candidate.path,
         )
 
 
