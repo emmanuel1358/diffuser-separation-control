@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from alignerr_plugin.exporters.taiga import build_job_payload
+from alignerr_plugin.schemas import TaskToml
 from alignerr_plugin.utils import load_metadata, load_task_toml, read_prompt, task_id
 
 from lbx_rl_tasks_harness.models import (
@@ -11,6 +12,19 @@ from lbx_rl_tasks_harness.models import (
     OutputSpec,
     ReferenceSpec,
 )
+
+
+def task_toml_metadata(task_toml: TaskToml) -> dict:
+    """Project every runtime-relevant task.toml section into harness metadata."""
+    return {
+        "task": task_toml.task.model_dump(),
+        "agent": task_toml.agent.model_dump(),
+        "verifier": task_toml.verifier.model_dump(),
+        "environment": task_toml.environment.model_dump(),
+        "runner": task_toml.runner.model_dump(),
+        "difficulty": task_toml.difficulty.model_dump(),
+        "delivery": task_toml.delivery.model_dump(),
+    }
 
 
 def load_problem_dir(problem_dir: Path) -> HarnessProblem:
@@ -61,17 +75,9 @@ def load_problem_dir(problem_dir: Path) -> HarnessProblem:
         source_problem_dir=problem_dir,
         grader_dir=grader_dir,
         private_dir=private_dir,
+        required_resources=task_toml.environment.required_resources,
         required_tools=list(task_toml.runner.required_tools),
-        metadata={
-            "benchmark": metadata.benchmark,
-            "task": task_toml.task.model_dump(),
-            "agent": task_toml.agent.model_dump(),
-            "verifier": task_toml.verifier.model_dump(),
-            "environment": task_toml.environment.model_dump(),
-            "runner": task_toml.runner.model_dump(),
-            "difficulty": task_toml.difficulty.model_dump(),
-            "delivery": task_toml.delivery.model_dump(),
-        },
+        metadata={"benchmark": metadata.benchmark, **task_toml_metadata(task_toml)},
         taiga_problem=taiga_problem,
     )
 

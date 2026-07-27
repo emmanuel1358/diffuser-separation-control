@@ -644,8 +644,20 @@ Common local commands:
 If you change `grader/`, `harness/`, or task helper packages, run the Python tests:
 
 ```bash
-uv run pytest
+uv sync --all-packages
+uv run --no-sync pytest -ra grader/tests harness/tests
 ```
+
+Both suites are named explicitly and the sync uses `--all-packages` so this
+runs the same way here and in the consumer repos that
+`sync-shared-from-template.yml` copies this README into. In this repo a bare
+`uv run pytest` happens to be equivalent, but downstream it is not: `pytest`
+with no arguments picks up that repo's own `testpaths` instead, and a plain
+`uv sync` installs neither `grader/` nor `harness/` — they are workspace
+members the root project there does not depend on — so both suites stop at
+collection with `ModuleNotFoundError` rather than running. `-ra` prints the
+reason for every skip, which downstream is how you tell a missing fixture apart
+from lost coverage.
 
 The root test configuration intentionally excludes `problems/` and
 `examples/` from pytest discovery and Ruff linting. Task-specific validation

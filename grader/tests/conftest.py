@@ -30,6 +30,33 @@ for _p in (GRADING_SRC, GRADER_RUNNER_SRC, ALIGNERR_PLUGIN_SRC, RUBRIC_SRC):
         sys.path.insert(0, str(_p))
 
 
+# GitHub Actions injects these into every step, and code that reads them behaves
+# differently when they are set: `GITHUB_ACTIONS` gates CI-only branches, and the
+# other four name files that code appends to, so a test reaching one of those code
+# paths would write into the environment of the job running it.
+#
+# Nothing under `grader/` reads any of them today, so clearing them changes no
+# current result. It is here for the same reason as the copy in
+# `harness/tests/conftest.py`, which does fix a real failure: both suites are
+# template-owned, and `sync-shared-from-template.yml` copies them into consumer
+# repos that run them under Actions, so neither should depend on whether a runner
+# is present. A test that wants the Actions branch sets the variable itself with
+# `monkeypatch`, because this fixture runs first.
+_RUNNER_ENV_VARS = (
+    "GITHUB_ACTIONS",
+    "GITHUB_ENV",
+    "GITHUB_OUTPUT",
+    "GITHUB_PATH",
+    "GITHUB_STEP_SUMMARY",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_runner_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _RUNNER_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="session")
 def template_examples() -> Path:
     """Path to the example tasks directory in this same repo."""

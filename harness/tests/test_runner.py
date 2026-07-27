@@ -43,8 +43,6 @@ def test_cli_runtime_expansion() -> None:
 def test_solution_runtime_scores_mujoco_example(monkeypatch, tmp_path: Path) -> None:
     pytest.importorskip("mujoco")
     pytest.importorskip("numpy")
-    if shutil.which("ffmpeg") is None:
-        pytest.skip("ffmpeg is required for ground-truth review video")
     monkeypatch.setattr(
         runner,
         "_run_rubric_quality_check",
@@ -498,6 +496,14 @@ def test_run_ground_truth_render_passes_agent_timeout_to_subprocess(
     problem_dir.mkdir()
     workspace.mkdir()
     run_dir.mkdir()
+    monkeypatch.setattr(ground_truth_module.sys, "platform", "linux")
+    for name in (
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "MUJOCO_GL",
+        "PYOPENGL_PLATFORM",
+    ):
+        monkeypatch.delenv(name, raising=False)
     captured: dict[str, object] = {}
 
     class Completed:
@@ -507,6 +513,7 @@ def test_run_ground_truth_render_passes_agent_timeout_to_subprocess(
 
     def fake_run(*_args, **kwargs):
         captured["timeout"] = kwargs["timeout"]
+        captured["env"] = kwargs["env"]
         output = Path(kwargs["env"]["LBT_OUTPUT_DIR"]) / "rendering.mp4"
         output.write_bytes(b"video")
         return Completed()
@@ -547,6 +554,23 @@ def test_run_ground_truth_render_passes_agent_timeout_to_subprocess(
     )
 
     assert captured["timeout"] == 7
+    assert captured["env"]["MUJOCO_GL"] == "osmesa"
+    assert captured["env"]["PYOPENGL_PLATFORM"] == "osmesa"
+
+
+def test_ground_truth_render_preserves_explicit_headless_backend(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(ground_truth_module.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setenv("MUJOCO_GL", "egl")
+    monkeypatch.setenv("PYOPENGL_PLATFORM", "egl")
+
+    env = ground_truth_module._ground_truth_render_env(tmp_path)
+
+    assert env["MUJOCO_GL"] == "egl"
+    assert env["PYOPENGL_PLATFORM"] == "egl"
 
 
 def test_render_failure_includes_stdout_and_stderr() -> None:

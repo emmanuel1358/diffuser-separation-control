@@ -4,10 +4,8 @@ import json
 from pathlib import Path
 
 from _fixture_guard import requires_examples
-
 from alignerr_plugin.exporters.harbor import export_harbor
-from alignerr_plugin.exporters.taiga import export_taiga
-
+from alignerr_plugin.exporters.taiga import build_job_payload, export_taiga
 from lbx_rl_tasks_harness.formats.harbor import load_harbor_dir
 from lbx_rl_tasks_harness.formats.problem_dir import load_problem_dir
 from lbx_rl_tasks_harness.formats.taiga import load_taiga_metadata
@@ -28,6 +26,7 @@ def test_load_problem_dir() -> None:
     assert problem.source_format == "problem-dir"
     assert problem.outputs[0].path == "/tmp/output/model.xml"
     assert problem.grader_dir == MUJOCO / "scorer"
+    assert problem.required_resources == "4vcpu+16gib"
     assert problem.taiga_problem is not None
     assert (
         problem.taiga_problem["startup_command"]
@@ -111,8 +110,34 @@ def test_load_taiga_metadata_with_source_problem(tmp_path: Path) -> None:
     assert problem.id == "mujoco-pendulum"
     assert problem.image == "local:test"
     assert problem.grader_dir == MUJOCO / "scorer"
+    assert problem.required_resources == "4vcpu+16gib"
+    assert problem.metadata["difficulty"]["task_type"] == "mujoco"
+    assert problem.metadata["difficulty"]["reward_type"] == "multi_deterministic_rubrics"
+    assert problem.metadata["runner"]["api_model_name"] == "claude-fable-5"
+    assert problem.ground_truth.render_command == "bash solution/render.sh"
+    assert problem.reference.execution == "auto"
     assert problem.metadata["grading_strategy"] == [{"type": "mcp", "weight": 1.0}]
     assert problem.taiga_problem is not None
+
+
+@requires_examples("mujoco-pendulum")
+def test_load_full_taiga_payload_recovers_standalone_runtime_contract(
+    tmp_path: Path,
+) -> None:
+    metadata = tmp_path / "job.json"
+    metadata.write_text(
+        json.dumps(build_job_payload(MUJOCO, image_ref="local:test")) + "\n"
+    )
+
+    problem = load_taiga_metadata(metadata)
+
+    assert problem.required_resources == "4vcpu+16gib"
+    assert problem.metadata["difficulty"]["task_type"] == "mujoco"
+    assert problem.metadata["difficulty"]["domain"] == "model_environment_construction"
+    assert problem.metadata["difficulty"]["reward_type"] == "multi_deterministic_rubrics"
+    assert problem.metadata["runner"]["api_model_name"] == "claude-fable-5"
+    assert problem.metadata["agent"]["timeout_sec"] == 3600
+    assert problem.metadata["verifier"]["timeout_sec"] == 600
     assert problem.taiga_problem["image"] == "local:test"
 
 
@@ -164,8 +189,31 @@ def test_load_harbor_dir_with_source_problem(tmp_path: Path) -> None:
     assert problem.source_format == "harbor"
     assert problem.id == "mujoco-pendulum"
     assert problem.grader_dir == MUJOCO / "scorer"
+    assert problem.required_resources == "4vcpu+16gib"
     assert (harbor_dir / "tests" / "test.sh").exists()
     assert problem.taiga_problem is not None
+
+
+@requires_examples("mujoco-pendulum")
+def test_load_standalone_harbor_preserves_native_runtime_contract(
+    tmp_path: Path,
+) -> None:
+    harbor_dir = tmp_path / "harbor"
+    export_harbor(MUJOCO, harbor_dir)
+
+    native = load_problem_dir(MUJOCO)
+    harbor = load_harbor_dir(harbor_dir)
+
+    assert harbor.required_resources == native.required_resources
+    assert harbor.required_tools == native.required_tools
+    assert harbor.metadata["agent"] == native.metadata["agent"]
+    assert harbor.metadata["verifier"] == native.metadata["verifier"]
+    assert harbor.metadata["environment"] == native.metadata["environment"]
+    assert harbor.metadata["runner"] == native.metadata["runner"]
+    assert harbor.metadata["difficulty"] == native.metadata["difficulty"]
+    assert harbor.metadata["delivery"] == native.metadata["delivery"]
+    assert harbor.ground_truth == native.ground_truth
+    assert harbor.reference == native.reference
 
 
 @requires_examples("mle-tabular-classification")
@@ -182,3 +230,11 @@ def test_load_harbor_dir_roundtrips_continuous_ml_task(tmp_path: Path) -> None:
 
     assert problem.source_format == "harbor"
     assert problem.prompt == (harbor_dir / "instruction.md").read_text()
+    assert problem.grader_dir == harbor_dir / "environment" / "scorer"
+    assert problem.private_dir == harbor_dir / "environment" / "scorer" / "data"
+    assert problem.required_resources == "12vcpu+100gib+h100/2"
+    assert problem.metadata["difficulty"]["reward_type"] == "continuous_scoring_function"
+    assert problem.metadata["runner"]["api_model_name"] == "claude-fable-5"
+    assert problem.metadata["agent"]["timeout_sec"] == 21600
+    assert problem.ground_truth.score_epsilon == 1e-9
+    assert problem.reference.execution == "auto"

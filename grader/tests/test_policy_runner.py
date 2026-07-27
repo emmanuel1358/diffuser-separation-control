@@ -175,12 +175,20 @@ def test_policy_worker_times_out(tmp_path: Path) -> None:
         "import time\ndef act(obs):\n    time.sleep(10)\n    return 0\n"
     )
 
-    # Pin the first-call budget too, otherwise the generous startup floor would
-    # mask the per-step timeout being exercised here.
-    with pytest.raises(TimeoutError) as excinfo:
-        with PolicyWorker(
-            policy_path, timeout_s=0.05, first_call_timeout_s=0.05
-        ) as policy:
+    # Only the per-step budget is pinned. `first_call_timeout_s` used to be pinned
+    # to 0.05s as well, on the theory that the generous startup floor would
+    # otherwise mask the per-step timeout -- it does not: `_handshake` sets
+    # `_first_call_done` before `act` is ever called, so `act` already runs on
+    # `timeout_s`. All the pin did was starve the worker's own start-up, which is
+    # fast enough on a laptop and never fast enough on a two-core CI runner: there
+    # the worker died in trusted setup and raised PolicyWorkerError, so the timeout
+    # under test never fired at all.
+    #
+    # Entering the worker outside `pytest.raises` keeps that distinction visible. A
+    # start-up failure is now an error at the `with`, not a caught exception that
+    # could be mistaken for the per-call hang this is about.
+    with PolicyWorker(policy_path, timeout_s=0.05) as policy:
+        with pytest.raises(TimeoutError) as excinfo:
             policy.act({})
     # A per-call hang must be a PolicyTimeoutError so it is ALSO catchable by a
     # migrated grader's `except RuntimeError: return 0.0` (kept 0.0) and the

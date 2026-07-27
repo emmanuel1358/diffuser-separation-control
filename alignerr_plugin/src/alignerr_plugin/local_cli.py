@@ -8,6 +8,7 @@ from rich.console import Console
 
 from alignerr_plugin.exporters.harbor import export_harbor as export_harbor_impl
 from alignerr_plugin.exporters.taiga import export_taiga as export_taiga_impl
+from alignerr_plugin.migrations.mujoco import migrate_legacy_mujoco_task
 from alignerr_plugin.validators.task.creator import TaskCreator
 from alignerr_plugin.validators.task.validator import TaskValidator, reward_hack_lint
 
@@ -152,6 +153,44 @@ def new(
         f"  2. Implement solution/solve.sh (the oracle) and tests/test.sh\n"
         f"  3. Run: [cyan]lbx-rl-template check --problem-dir {problem_dir}[/cyan]"
     )
+
+
+@app.command("migrate-legacy-mujoco")
+def migrate_legacy_mujoco(
+    source: Path = typer.Option(
+        ..., "--source", exists=True, file_okay=False, help="Legacy task directory"
+    ),
+    output_dir: Path | None = typer.Option(
+        None, "--out", "-o", help="New native ISO task directory (must not exist)"
+    ),
+    in_place: bool = typer.Option(
+        False, "--in-place", help="Migrate a native task directly in its current directory"
+    ),
+    domain: str | None = typer.Option(
+        None, "--domain", help="Override the inferred MuJoCo domain taxonomy value"
+    ),
+) -> None:
+    """Convert legacy native/Harbor paths and metadata without hiding scorer debt."""
+    if in_place == (output_dir is not None):
+        console.print("[red]choose exactly one of --out or --in-place[/red]")
+        raise typer.Exit(2)
+    destination = source if in_place else output_dir
+    assert destination is not None
+    result = migrate_legacy_mujoco_task(source, destination, domain=domain)
+    console.print(
+        f"[green]Materialized {result.source_layout} task:[/green] {result.destination}"
+    )
+    for change in result.changes:
+        console.print(f"  [green]\u2713[/green] {change}")
+    if result.blockers:
+        console.print("\n[yellow]Remaining semantic blockers:[/yellow]")
+        for blocker in result.blockers:
+            console.print(f"  - {blocker}")
+        console.print(
+            "\nRun the task-migration agent, regenerate the sealed plan, then run "
+            "`lbx-rl-template validate`."
+        )
+        raise typer.Exit(2)
 
 
 @app.command()

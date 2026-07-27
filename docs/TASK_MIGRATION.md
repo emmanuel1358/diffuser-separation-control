@@ -53,6 +53,44 @@ Do **not** mix paths. A rubric task must not keep a production
 `compute_score()` that bypasses `TASK`. A continuous task must not invent a
 second hand-written PWL curve beside `GeneratedCalibration`.
 
+### Normalize legacy MuJoCo paths and metadata first
+
+MuJoCo tasks from the original pipeline can predate the Taiga resource enum,
+the scoped domain taxonomy, and the root-only scorer layout. Normalize those
+mechanical differences before changing scoring semantics:
+
+```bash
+uv run lbx-rl-template migrate-legacy-mujoco \
+  --source problems/<task_id> --in-place
+```
+
+For a checked-out Harbor export, pass a new native destination with `--out`
+instead. The converter handles both layouts, preserves `/tmp/output` artifacts,
+maps CPU/RAM/GPU requests without under-provisioning, restores canonical
+`data/`, `scorer/data/`, and `environment/` paths, generates missing native
+metadata, rewrites the retired `/mcp_server/.venv` runtime path to
+`/opt/lbx-runtime/.venv`, and removes world traversal from `/mcp_server`.
+
+The command exits `2` when semantic work or proof regeneration remains. In particular, it never
+pretends that an old `compute_score` or `RubricBuilder` is a sealed
+`RubricTask`; complete Path A or Path B-policy and generate the matching plan
+before running ground truth to refresh `.alignerr/build_proof.json` and exporting
+to Taiga.
+
+To audit every MuJoCo task in one or more original repositories:
+
+```bash
+uv run --all-packages python scripts/audit_legacy_mujoco_migration.py \
+  /path/to/original-template /path/to/original-mothership \
+  --report /tmp/mujoco-migration-audit.json
+```
+
+Add `--require-taiga` only after the semantic migration stage. Without it, the
+audit still requires every discovered task to migrate, load natively, and
+round-trip through standalone Harbor; unsealed scorers are reported separately
+as `blocked_by_migration_gates` together with their scorer, plan, or proof
+blockers.
+
 ---
 
 ## Path A — Deterministic rubrics → `RubricTask`

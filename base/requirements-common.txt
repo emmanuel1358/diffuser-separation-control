@@ -26,7 +26,10 @@ pydicom
 pyyaml
 scikit-image
 scikit-learn
-scipy
+# Pinned across every flavor: the tpu base is py312 and the core/gpu bases are
+# py313, so an unpinned scipy resolves to different builds and a task's
+# reference measurement stops matching the lane that grades against it.
+scipy==1.16.3
 seaborn
 SimpleITK
 soundfile

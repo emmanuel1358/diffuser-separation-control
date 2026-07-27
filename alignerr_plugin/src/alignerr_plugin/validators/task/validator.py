@@ -1782,9 +1782,19 @@ class TaskValidator:
                 host_data = (problem_dir / "data").resolve()
                 if host_data.exists():
                     src = src.replace("/data/", str(host_data) + "/")
+                # The script runs as text, so `$0` is "bash" and a solve.sh that
+                # locates its own committed artifacts relative to itself resolves
+                # them against the temp workspace. Hand it the same directory
+                # variables the container exports.
+                probe_env = os.environ.copy()
+                probe_env["LBX_SOLUTION_DIR"] = str((problem_dir / "solution").resolve())
+                probe_env["LBT_OUTPUT_DIR"] = str(workspace)
+                if host_data.exists():
+                    probe_env["LBT_DATA_DIR"] = str(host_data)
                 completed = subprocess.run(
                     ["bash", "-c", src],
                     cwd=workspace,
+                    env=probe_env,
                     capture_output=True,
                     text=True,
                 )

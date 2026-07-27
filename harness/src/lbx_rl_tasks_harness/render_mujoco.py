@@ -40,9 +40,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.model.exists():
         raise FileNotFoundError(f"model not found: {args.model}")
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg is None:
-        raise RuntimeError("ffmpeg is required to render MuJoCo videos")
+    ffmpeg = _resolve_ffmpeg()
 
     hooks = _load_module(args.config) if args.config else None
     policy_path = args.policy or args.controller
@@ -59,7 +57,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     steps_per_frame = max(
-        1, int(round((1.0 / args.fps) / max(model.opt.timestep, 1e-4)))
+        1, round((1.0 / args.fps) / max(model.opt.timestep, 1e-4))
     )
 
     with tempfile.TemporaryDirectory() as td:
@@ -104,6 +102,22 @@ def main(argv: list[str] | None = None) -> int:
             check=True,
         )
     return 0
+
+
+def _resolve_ffmpeg() -> str:
+    """Use the host binary when available, otherwise the bundled binary."""
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg is not None:
+        return system_ffmpeg
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except (ImportError, RuntimeError, OSError) as exc:
+        raise RuntimeError(
+            "ffmpeg is required to render MuJoCo videos; reinstall the harness "
+            "to restore its imageio-ffmpeg dependency"
+        ) from exc
 
 
 def _step(

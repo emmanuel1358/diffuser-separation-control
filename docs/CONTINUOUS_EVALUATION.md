@@ -145,6 +145,29 @@ columns plus every target truth column. It must have more rows than
 5. evaluates quality and family-wide information evidence;
 6. returns a calibrated score and redacted receipt.
 
+#### The challenge selection follows the submitted bytes
+
+Step 2 seeds the row draw from `workspace_artifact_digest(workspace)` — a hash of
+every file the submission committed — so each submission is scored on its own
+`sample_size` rows. That is what stops an agent precomputing answers for a fixed
+subsample, and it has a consequence worth stating plainly:
+
+**Any change to the submitted bytes re-rolls the whole evaluation set, however
+small the change is numerically.** Editing one weight in its last representable
+bit draws a different subsample and moves the score by percent, not by ULPs. The
+score is a step function of the artifact's bytes, not a continuous function of the
+model it encodes.
+
+So a calibration lock's anchors describe exactly one artifact: the committed one it
+was generated from. Rebuilding a byte-different but numerically equivalent copy —
+retraining a model, regenerating weights on another machine — and expecting it to
+land on the anchor is a category error. The framework already forbids this in
+production: `validate_ml_strategy_contract` rejects a strategy whose inference
+entrypoint trains, and calibration runs that entrypoint over the committed weights
+rather than invoking `training_entrypoint`. Verify a retrained model against the
+committed weights numerically; verify the anchors against the committed weights
+themselves.
+
 ### Agent artifact contract
 
 ```python
@@ -420,7 +443,8 @@ Every task family must test through the real grader:
 Run at minimum:
 
 ```bash
-uv run pytest grader/tests harness/tests
+uv sync --all-packages
+uv run --no-sync pytest -ra grader/tests harness/tests
 uv run lbx-rl-template validate --problem-dir problems/<task_id>
 uv run lbx-rl-harness run --runtime ground-truth \
   --problem-dir problems/<task_id>

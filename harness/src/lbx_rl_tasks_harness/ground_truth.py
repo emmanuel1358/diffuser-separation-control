@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -109,7 +110,7 @@ def run_ground_truth_render(
     if problem.source_problem_dir is None:
         raise ValueError("ground-truth rendering requires a source problem directory")
 
-    env = harness_subprocess_env({"LBT_OUTPUT_DIR": str(workspace)})
+    env = _ground_truth_render_env(workspace)
     timeout_sec = problem.metadata.get("agent", {}).get("timeout_sec") or 3600
     proc = subprocess.run(
         ["bash", "-lc", problem.ground_truth.render_command],
@@ -139,6 +140,19 @@ def run_ground_truth_render(
         )
 
     return commit_render_outputs(problem, workspace=workspace, run_dir=run_dir)
+
+
+def _ground_truth_render_env(workspace: Path) -> dict[str, str]:
+    """Select the grading images' software renderer on headless Linux hosts."""
+    env = harness_subprocess_env({"LBT_OUTPUT_DIR": str(workspace)})
+    if (
+        sys.platform.startswith("linux")
+        and not env.get("DISPLAY")
+        and not env.get("WAYLAND_DISPLAY")
+    ):
+        env.setdefault("MUJOCO_GL", "osmesa")
+        env.setdefault("PYOPENGL_PLATFORM", "osmesa")
+    return env
 
 
 def commit_render_outputs(

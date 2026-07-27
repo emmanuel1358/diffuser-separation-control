@@ -53,6 +53,44 @@ Do **not** mix paths. A rubric task must not keep a production
 `compute_score()` that bypasses `TASK`. A continuous task must not invent a
 second hand-written PWL curve beside `GeneratedCalibration`.
 
+### Normalize legacy MuJoCo paths and metadata first
+
+MuJoCo tasks from the original pipeline can predate the Taiga resource enum,
+the scoped domain taxonomy, and the root-only scorer layout. Normalize those
+mechanical differences before changing scoring semantics:
+
+```bash
+uv run lbx-rl-template migrate-legacy-mujoco \
+  --source problems/<task_id> --in-place
+```
+
+For a checked-out Harbor export, pass a new native destination with `--out`
+instead. The converter handles both layouts, preserves `/tmp/output` artifacts,
+maps CPU/RAM/GPU requests without under-provisioning, restores canonical
+`data/`, `scorer/data/`, and `environment/` paths, generates missing native
+metadata, rewrites the retired `/mcp_server/.venv` runtime path to
+`/opt/lbx-runtime/.venv`, and removes world traversal from `/mcp_server`.
+
+The command exits `2` when semantic work or proof regeneration remains. In particular, it never
+pretends that an old `compute_score` or `RubricBuilder` is a sealed
+`RubricTask`; complete Path A or Path B-policy and generate the matching plan
+before running ground truth to refresh `.alignerr/build_proof.json` and exporting
+to Taiga.
+
+To audit every MuJoCo task in one or more original repositories:
+
+```bash
+uv run --all-packages python scripts/audit_legacy_mujoco_migration.py \
+  /path/to/original-template /path/to/original-mothership \
+  --report /tmp/mujoco-migration-audit.json
+```
+
+Add `--require-taiga` only after the semantic migration stage. Without it, the
+audit still requires every discovered task to migrate, load natively, and
+round-trip through standalone Harbor; unsealed scorers are reported separately
+as `blocked_by_migration_gates` together with their scorer, plan, or proof
+blockers.
+
 ---
 
 ## Path A — Deterministic rubrics → `RubricTask`
@@ -176,9 +214,10 @@ only regenerating one JSON file.
   calibration binding and final quality mapping.
 - **Unambiguous metrics:** SRE/F1 (and other registered kernels) are exact,
   versioned, and recorded in the lock.
-- **Reproducible strategies:** trained reference/naive assets bind training
-  inputs/code, configs, seeds, manifests, and artifacts; hand-authored
-  `committed_artifact` strategies bind their source without fake training data.
+- **Reproducible strategies (mandatory):** trained reference/naive assets keep
+  training inputs/code and committed weights; hand-authored policies/static
+  artifacts use `strategy.manifest.json: kind=committed_artifact`. Every solve
+  path is inference-only. Trusted CI never trains.
 - **One-command finalization:** ground truth runs inference, measures metrics,
   generates the lock, verifies 0 / 0.5 / 1 anchors, and updates proof evidence.
 - **Automatic invalidation:** changes to data, models, metrics, rationales,
@@ -228,18 +267,27 @@ V2 locks are not patched in place — regenerate.
 
 1. Replace local metric and curve copies with registered targets +
    `GeneratedCalibration`.
-2. Commit reproducible reference and naive strategies. Use
-   `model.manifest.json` v1 for existing trained models or
-   `strategy.manifest.json` with explicit `trained_model` /
-   `committed_artifact` kind.
-3. Add `TASK` (`ContinuousTask.model()` if possible).
-4. Wire production `compute_score()` to `TASK.grade(...)`.
-5. For non-tabular callbacks, declare ready-to-measure workspaces under
-   `baselines/degenerate/` with `WorkspaceDegenerateProbes`.
-6. If the honest naive ties every effective no-information floor, add a
-   reviewed `naive_at_floor` exception; otherwise retain the strict
-   weak-positive default.
-7. Run local ground truth for feedback; open/update the fork PR so Trusted CI
+2. Commit a strategy contract for `reference_solution/` and `TASK.naive`
+   (usually `baselines/naive/`):
+   - trained strategy: `model.manifest.json` v1 or
+     `strategy.manifest.json: kind=trained_model`, training entrypoint,
+     digest-bound inputs/artifacts, and inference-only `solution.py`;
+   - hand-authored policy/static strategy:
+     `strategy.manifest.json: kind=committed_artifact`, artifact digests, and
+     inference-only `solution.py`.
+3. If the old reference **trained at run time** inside `solution.py` /
+   `solve.sh`, split it: move fitting into `train.py`, commit the resulting
+   weights + refreshed manifest, and leave `solution.py` as load→predict only.
+   A checked-in artifact alone does not satisfy the contract; declare it in its
+   manifest.
+4. Add `TASK` (`ContinuousTask.model()` if possible).
+5. Wire production `compute_score()` to `TASK.grade(...)`.
+6. For non-tabular callbacks, declare ready-to-measure no-information
+   workspaces with `WorkspaceDegenerateProbes`; do not invent CSV probes.
+7. If the honest naive exactly ties the effective no-information floor, add a
+   reviewed `naive_at_floor` exception; otherwise keep the strict weak-positive
+   default.
+8. Run local ground truth for feedback; open/update the fork PR so Trusted CI
    seals production evidence.
 
 #### B2. Calibration lock v2 → v3

@@ -1,14 +1,14 @@
 ---
 name: task-migration
-description: Migrate a legacy ML RL task to the sealed evaluation format and drive it to green validation. Use when a task still ships a hand-rolled compute_score, RubricBuilder/LLMJudge, or a pre-v3 calibration lock, or when Taiga QA findings demand the sealed rubric/continuous stack.
+description: Migrate a legacy ML or MuJoCo RL task to the sealed evaluation format and drive it to green validation. Use when a task still ships old task.toml resources, a hand-rolled compute_score, RubricBuilder/LLMJudge, or a pre-v3 calibration lock, or when Taiga QA findings demand the sealed rubric/continuous stack.
 ---
 
 # Task Migration (sealed evaluation)
 
 Operationalizes `docs/TASK_MIGRATION.md` (bundled alongside as `TASK_MIGRATION.md`).
 Every class, function, and command below is verified against the grader source
-and CLI; do not substitute invented names. Scope: ML tasks — Path A (rubric) and
-Path B (continuous).
+and CLI; do not substitute invented names. Scope: ML and MuJoCo tasks - Path A
+(rubric) and Path B (continuous/policy).
 
 ## When to use
 
@@ -31,6 +31,28 @@ Do **not** mix paths. Decide from config + grader shape:
 
 All APIs import from the single package `grading.evaluation`
 (`grader/src/grading/evaluation/__init__.py`); faults from `grading.faults`.
+
+### Step 0a - normalize a legacy MuJoCo layout first
+
+If a MuJoCo task still uses `environment.cpus` / `memory_mb` / `gpus`, the old
+`difficulty.domain = "robotics"`, retired `[policy]` or `[scorer]` sections, or
+an exported Harbor tree with its scorer under `environment/scorer`, normalize
+the task before rewriting its grader:
+
+```bash
+uv run lbx-rl-template migrate-legacy-mujoco \
+  --source problems/<task_id> --in-place
+```
+
+Exit code `2` is expected while the legacy scorer or fresh build proof remains. The command performs
+only deterministic work: maps resources without under-provisioning, selects a
+MuJoCo taxonomy domain (override with `--domain` when needed), secures
+`/mcp_server`, rewrites `/mcp_server/.venv` to the current
+`/opt/lbx-runtime/.venv`, creates required native paths, and removes retired
+config keys.
+It deliberately reports the missing `RubricTask`/plan as a blocker rather than
+claiming a semantic conversion. Continue with Path A or Path B-policy, generate
+the sealed plan, and run the complete validation/oracle loop below.
 
 ---
 

@@ -43,6 +43,35 @@ from grading.faults import AgentFault
 from grading.helpers import load_submission_or_fault
 from grading.policy_runner import load_submitted_policy
 
+# Thread-parallel inference (the common shape for tree ensembles) sums float
+# contributions in whatever order the threads finish, so a correct predictor can
+# disagree with itself in the last bits. Compare floats within this relative
+# tolerance and everything else exactly, so real nondeterminism still fails.
+REPEAT_CALL_RTOL = 1e-9
+
+
+def _repeats_within_tolerance(first: Any, second: Any) -> bool:
+    import numpy as np
+    from pandas.api.types import is_float_dtype
+
+    if list(first.columns) != list(second.columns) or len(first) != len(second):
+        return False
+    for column in first.columns:
+        left = first[column]
+        right = second[column]
+        if is_float_dtype(left.dtype) and is_float_dtype(right.dtype):
+            if not np.allclose(
+                left.to_numpy(dtype=float),
+                right.to_numpy(dtype=float),
+                rtol=REPEAT_CALL_RTOL,
+                atol=0.0,
+                equal_nan=True,
+            ):
+                return False
+        elif not left.equals(right):
+            return False
+    return True
+
 
 @dataclass(frozen=True)
 class CsvRows:
@@ -625,9 +654,7 @@ class ContinuousTask:
             repeated = _prediction_frame(repeated_raw)
         except Exception as exc:
             raise AgentFault(f"predict() returned an invalid table: {exc}") from exc
-        if list(submission.columns) != list(repeated.columns) or not submission.equals(
-            repeated
-        ):
+        if not _repeats_within_tolerance(submission, repeated):
             raise AgentFault(
                 "predict() is not deterministic for an identical challenge batch"
             )

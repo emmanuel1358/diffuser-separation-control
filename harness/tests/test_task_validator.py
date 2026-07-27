@@ -214,6 +214,35 @@ def test_validator_fails_failing_ml_solution(tmp_path: Path) -> None:
     assert any("ground truth solution exited" in issue for issue in stage.issues)
 
 
+def test_host_oracle_probe_exports_the_container_directory_vars(
+    tmp_path: Path,
+) -> None:
+    """The probe runs solve.sh as text, so `$0` is "bash", not the script.
+
+    A reference that locates its committed artifacts relative to itself then
+    resolves them against the temp workspace and the whole task reads as a
+    broken oracle.
+    """
+    problem_dir = tmp_path / "env-task"
+    _write_problem(problem_dir, task_type="ml")
+    (problem_dir / "data").mkdir(exist_ok=True)
+    (problem_dir / "solution" / "weights.txt").write_text("committed\n")
+    # The idiom every real solve.sh uses: LBX_SOLUTION_DIR or fall back to the
+    # script's own directory.
+    (problem_dir / "solution" / "solve.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'SOLUTION_DIR="${LBX_SOLUTION_DIR:-$(dirname "$0")}"\n'
+        'cat "${SOLUTION_DIR}/weights.txt" > "${LBT_OUTPUT_DIR}/result.txt"\n'
+        'test -d "${LBT_DATA_DIR}"\n'
+    )
+
+    stage, meta = TaskValidator()._compute_score_return(problem_dir)
+
+    assert "reference_solution_exit" not in meta
+    assert not any("ground truth solution exited" in issue for issue in stage.issues)
+
+
 def test_validator_fails_failing_mujoco_solution(tmp_path: Path) -> None:
     problem_dir = tmp_path / "mujoco-task"
     _write_problem(problem_dir, task_type="mujoco")
