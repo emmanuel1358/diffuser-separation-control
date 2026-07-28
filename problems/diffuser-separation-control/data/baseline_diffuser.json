@@ -1,0 +1,6 @@
+{
+  "inlet_height_m": 0.1,
+  "outlet_height_m": 0.2,
+  "baseline_half_angle_deg": 8.0,
+  "baseline_length_ratio": 4.0
+}

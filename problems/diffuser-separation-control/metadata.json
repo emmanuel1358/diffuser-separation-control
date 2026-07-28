@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "openfoam-hydrofoil-flap",
+    "description": "Design a two-dimensional marine hydrofoil aft flap using hidden deterministic CFD scoring."
+  }
+}

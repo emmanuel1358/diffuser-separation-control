@@ -1,0 +1,34 @@
+schema_version = "1.1"
+
+[task]
+name = "diffuser-separation-control"
+description = "Optimize a 2D diffuser geometry to maximize pressure recovery while avoiding flow separation."
+
+[environment]
+required_resources = "8vcpu+64gib"
+storage_mb = 50000
+allow_internet = false
+
+
+[agent]
+timeout_sec = 1800
+
+[verifier]
+timeout_sec = 900
+env = []
+
+[ground_truth]
+score_epsilon = 0.001
+in_container = true
+
+[delivery]
+platform = "prometheus"
+eval = false
+
+[difficulty]
+task_type = "cfd"
+domain = "flow_control"
+reward_type = "multi_deterministic_rubrics"
+
+[[outputs]]
+path = "/tmp/output/diffuser_design.json"
