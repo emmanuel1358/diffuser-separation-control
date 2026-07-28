@@ -1,11 +1,11 @@
 {
   "alignerr_cli_version": "0.1.0",
   "base_image_ref": "lbx-tasks-base:runtime-ml-core-py313-local",
-  "built_at": "2026-07-28T13:30:22.613513+00:00",
-  "duration_seconds": 1.2252678269996977,
+  "built_at": "2026-07-28T15:01:39.252813+00:00",
+  "duration_seconds": 1.5127586359994893,
   "ground_truth_result": {
-    "details_path": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785245417/verifier/reward-details.json",
-    "graded_at": "2026-07-28T13:30:29.650193+00:00",
+    "details_path": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785250893/verifier/reward-details.json",
+    "graded_at": "2026-07-28T15:01:47.016257+00:00",
     "metadata": {
       "headline_score": 1.0,
       "pre_grade_cleanup": {
@@ -46,13 +46,13 @@
         },
         {
           "actual": null,
-          "criterion": "curvature_quality",
-          "criterion_id": "curvature_quality",
-          "description": "curvature_quality",
+          "criterion": "inlet_extension_quality",
+          "criterion_id": "inlet_extension_quality",
+          "description": "inlet_extension_quality",
           "expected": null,
           "grading_type": "unknown",
-          "id": "curvature_quality",
-          "label": "curvature_quality",
+          "id": "inlet_extension_quality",
+          "label": "inlet_extension_quality",
           "passed": true,
           "reasoning": "",
           "score": 1.0,
@@ -61,7 +61,7 @@
       ],
       "rubric_weights": {
         "angle_quality": 0.3333333333333333,
-        "curvature_quality": 0.3333333333333333,
+        "inlet_extension_quality": 0.3333333333333333,
         "length_quality": 0.3333333333333333
       },
       "scoring_mode": "weighted",
@@ -95,13 +95,13 @@
             "weight": 0.3333333333333333
           },
           {
-            "criterion_id": "curvature_quality",
-            "description": "curvature_quality",
-            "grading_criteria": "curvature_quality",
-            "id": "curvature_quality",
-            "label": "curvature_quality",
+            "criterion_id": "inlet_extension_quality",
+            "description": "inlet_extension_quality",
+            "grading_criteria": "inlet_extension_quality",
+            "id": "inlet_extension_quality",
+            "label": "inlet_extension_quality",
             "max_score": 1.0,
-            "name": "curvature_quality",
+            "name": "inlet_extension_quality",
             "reasoning": "",
             "score": 1.0,
             "weight": 0.3333333333333333
@@ -109,20 +109,20 @@
         ],
         "subscores": {
           "angle_quality": 1.0,
-          "curvature_quality": 1.0,
+          "inlet_extension_quality": 1.0,
           "length_quality": 1.0
         },
         "weights": {
           "angle_quality": 0.3333333333333333,
-          "curvature_quality": 0.3333333333333333,
+          "inlet_extension_quality": 0.3333333333333333,
           "length_quality": 0.3333333333333333
         }
       },
       "weighted_subscore_total": 1.0,
       "weighted_total": 1.0
     },
-    "reward_path": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785245417/verifier/reward.json",
-    "run_dir": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785245417",
+    "reward_path": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785250893/verifier/reward.json",
+    "run_dir": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785250893",
     "runtime": "solution",
     "score": 1.0,
     "structured_subscores": [
@@ -151,13 +151,13 @@
         "weight": 0.3333333333333333
       },
       {
-        "criterion_id": "curvature_quality",
-        "description": "curvature_quality",
-        "grading_criteria": "curvature_quality",
-        "id": "curvature_quality",
-        "label": "curvature_quality",
+        "criterion_id": "inlet_extension_quality",
+        "description": "inlet_extension_quality",
+        "grading_criteria": "inlet_extension_quality",
+        "id": "inlet_extension_quality",
+        "label": "inlet_extension_quality",
         "max_score": 1.0,
-        "name": "curvature_quality",
+        "name": "inlet_extension_quality",
         "reasoning": "",
         "score": 1.0,
         "weight": 0.3333333333333333
@@ -165,18 +165,18 @@
     ],
     "subscores": {
       "angle_quality": 1.0,
-      "curvature_quality": 1.0,
+      "inlet_extension_quality": 1.0,
       "length_quality": 1.0
     },
     "trivial_baseline_score": 0.0,
     "weights": {
       "angle_quality": 0.3333333333333333,
-      "curvature_quality": 0.3333333333333333,
+      "inlet_extension_quality": 0.3333333333333333,
       "length_quality": 0.3333333333333333
     }
   },
-  "image_digest": "sha256:c6b424d56e52e865716079c2f6f1f847fbc0aaf89e7be0ec1afa09e75859a608",
+  "image_digest": "sha256:baf8adf7ca2d4331da30c99a2061edade5a3b24d334fb5f8316977e96582faea",
   "platform": "linux/amd64",
   "schema_version": "1.0",
-  "task_dir_sha256": "201c0c2dba03e4f760e979a87af2519b9f13fbf94107b21ed9e2144b57aedbb2"
+  "task_dir_sha256": "48930a3f325f62bfb23efccf865fee4bfdcc3f45d41c2845bb15a9e9128602aa"
 }
