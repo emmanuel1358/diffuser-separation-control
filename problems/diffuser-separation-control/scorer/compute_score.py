@@ -1,23 +1,16 @@
-
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from grading.faults import AgentFault
-from grading.helpers import load_submission_or_fault
+from grading.helpers import load_json
 
 
 def compute_score(workspace: str, trajectory=None, private=None):
-    filename = Path("output") / "diffuser_design.json"
+    submission_path = Path(workspace) / "output" / "diffuser_design.json"
 
-    # Safe submission loader provided by the harness
-    text = load_submission_or_fault(workspace, filename)
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise AgentFault(f"invalid JSON: {e}") from e
+    # load_json returns a dict directly; it also validates the path safely
+    data = load_json(submission_path)
 
     try:
         angle = float(data["half_angle_deg"])
@@ -35,6 +28,7 @@ def compute_score(workspace: str, trajectory=None, private=None):
 
 
 if __name__ == "__main__":
+    import json
     import sys
 
     workspace = sys.argv[1] if len(sys.argv) > 1 else "/tmp"

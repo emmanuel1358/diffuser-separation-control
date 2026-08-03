@@ -24,7 +24,7 @@ Use exactly this schema:
 {
   "half_angle_deg": 6.5,
   "length_ratio": 5.2,
-  "wall_curvature_factor": 0.18
+  "inlet_extension_m": 0.5
 }
 ```
 
@@ -32,7 +32,7 @@ Use exactly this schema:
 
 * `half_angle_deg`: diffuser half-angle in degrees.
 * `length_ratio`: diffuser length divided by inlet height.
-* `wall_curvature_factor`: nondimensional wall-curvature smoothing factor.
+* `inlet_extension_m`: inlet duct extension length in meters.
 
 ### Constraints
 
