@@ -1,11 +1,11 @@
 {
   "alignerr_cli_version": "0.1.0",
   "base_image_ref": "lbx-tasks-base:runtime-ml-core-py313-local",
-  "built_at": "2026-07-28T15:01:39.252813+00:00",
-  "duration_seconds": 1.5127586359994893,
+  "built_at": "2026-08-03T12:38:58.280473+00:00",
+  "duration_seconds": 1.5899662059999855,
   "ground_truth_result": {
-    "details_path": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785250893/verifier/reward-details.json",
-    "graded_at": "2026-07-28T15:01:47.016257+00:00",
+    "details_path": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785760730/verifier/reward-details.json",
+    "graded_at": "2026-08-03T12:39:06.785895+00:00",
     "metadata": {
       "headline_score": 1.0,
       "pre_grade_cleanup": {
@@ -15,168 +15,39 @@
       },
       "reported_final_score": 1.0,
       "return_shape": "rubric_grade",
-      "rubric_breakdown": [
-        {
-          "actual": null,
-          "criterion": "angle_quality",
-          "criterion_id": "angle_quality",
-          "description": "angle_quality",
-          "expected": null,
-          "grading_type": "unknown",
-          "id": "angle_quality",
-          "label": "angle_quality",
-          "passed": true,
-          "reasoning": "",
-          "score": 1.0,
-          "weight": 0.3333333333333333
-        },
-        {
-          "actual": null,
-          "criterion": "length_quality",
-          "criterion_id": "length_quality",
-          "description": "length_quality",
-          "expected": null,
-          "grading_type": "unknown",
-          "id": "length_quality",
-          "label": "length_quality",
-          "passed": true,
-          "reasoning": "",
-          "score": 1.0,
-          "weight": 0.3333333333333333
-        },
-        {
-          "actual": null,
-          "criterion": "inlet_extension_quality",
-          "criterion_id": "inlet_extension_quality",
-          "description": "inlet_extension_quality",
-          "expected": null,
-          "grading_type": "unknown",
-          "id": "inlet_extension_quality",
-          "label": "inlet_extension_quality",
-          "passed": true,
-          "reasoning": "",
-          "score": 1.0,
-          "weight": 0.3333333333333333
-        }
-      ],
-      "rubric_weights": {
-        "angle_quality": 0.3333333333333333,
-        "inlet_extension_quality": 0.3333333333333333,
-        "length_quality": 0.3333333333333333
-      },
+      "rubric_breakdown": [],
+      "rubric_weights": {},
       "scoring_mode": "weighted",
       "serialized_grade": {
         "penalties": null,
         "score": 1.0,
         "scoring_mode": "weighted",
-        "structured_subscores": [
-          {
-            "criterion_id": "angle_quality",
-            "description": "angle_quality",
-            "grading_criteria": "angle_quality",
-            "id": "angle_quality",
-            "label": "angle_quality",
-            "max_score": 1.0,
-            "name": "angle_quality",
-            "reasoning": "",
-            "score": 1.0,
-            "weight": 0.3333333333333333
-          },
-          {
-            "criterion_id": "length_quality",
-            "description": "length_quality",
-            "grading_criteria": "length_quality",
-            "id": "length_quality",
-            "label": "length_quality",
-            "max_score": 1.0,
-            "name": "length_quality",
-            "reasoning": "",
-            "score": 1.0,
-            "weight": 0.3333333333333333
-          },
-          {
-            "criterion_id": "inlet_extension_quality",
-            "description": "inlet_extension_quality",
-            "grading_criteria": "inlet_extension_quality",
-            "id": "inlet_extension_quality",
-            "label": "inlet_extension_quality",
-            "max_score": 1.0,
-            "name": "inlet_extension_quality",
-            "reasoning": "",
-            "score": 1.0,
-            "weight": 0.3333333333333333
-          }
-        ],
+        "structured_subscores": [],
         "subscores": {
-          "angle_quality": 1.0,
-          "inlet_extension_quality": 1.0,
-          "length_quality": 1.0
+          "score": 1.0
         },
         "weights": {
-          "angle_quality": 0.3333333333333333,
-          "inlet_extension_quality": 0.3333333333333333,
-          "length_quality": 0.3333333333333333
+          "score": 1.0
         }
       },
-      "weighted_subscore_total": 1.0,
-      "weighted_total": 1.0
+      "weighted_subscore_total": 0.0,
+      "weighted_total": 0.0
     },
-    "reward_path": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785250893/verifier/reward.json",
-    "run_dir": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785250893",
+    "reward_path": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785760730/verifier/reward.json",
+    "run_dir": "/home/emman/cfd-project/.harness-runs/openfoam-hydrofoil-flap-problem-dir-1785760730",
     "runtime": "solution",
     "score": 1.0,
-    "structured_subscores": [
-      {
-        "criterion_id": "angle_quality",
-        "description": "angle_quality",
-        "grading_criteria": "angle_quality",
-        "id": "angle_quality",
-        "label": "angle_quality",
-        "max_score": 1.0,
-        "name": "angle_quality",
-        "reasoning": "",
-        "score": 1.0,
-        "weight": 0.3333333333333333
-      },
-      {
-        "criterion_id": "length_quality",
-        "description": "length_quality",
-        "grading_criteria": "length_quality",
-        "id": "length_quality",
-        "label": "length_quality",
-        "max_score": 1.0,
-        "name": "length_quality",
-        "reasoning": "",
-        "score": 1.0,
-        "weight": 0.3333333333333333
-      },
-      {
-        "criterion_id": "inlet_extension_quality",
-        "description": "inlet_extension_quality",
-        "grading_criteria": "inlet_extension_quality",
-        "id": "inlet_extension_quality",
-        "label": "inlet_extension_quality",
-        "max_score": 1.0,
-        "name": "inlet_extension_quality",
-        "reasoning": "",
-        "score": 1.0,
-        "weight": 0.3333333333333333
-      }
-    ],
+    "structured_subscores": [],
     "subscores": {
-      "angle_quality": 1.0,
-      "inlet_extension_quality": 1.0,
-      "length_quality": 1.0
+      "score": 1.0
     },
     "trivial_baseline_score": 0.0,
     "weights": {
-      "angle_quality": 0.3333333333333333,
-      "inlet_extension_quality": 0.3333333333333333,
-      "length_quality": 0.3333333333333333
+      "score": 1.0
     }
   },
-  "image_digest": "sha256:baf8adf7ca2d4331da30c99a2061edade5a3b24d334fb5f8316977e96582faea",
+  "image_digest": "sha256:391b472c228841f161dfc6fb5f531301329d647ab663b00285fdc0efc5d9adc3",
   "platform": "linux/amd64",
   "schema_version": "1.0",
-  "task_dir_sha256": "48930a3f325f62bfb23efccf865fee4bfdcc3f45d41c2845bb15a9e9128602aa"
+  "task_dir_sha256": "e2c72ab54c6e4c0c92aab0d3c54f6ba3881c8d029db5df9d871d851814cef91c"
 }
