@@ -1,31 +1,32 @@
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
 from grading.faults import AgentFault
+from grading.helpers import load_submission_or_fault
 
 
 def compute_score(workspace: str, trajectory=None, private=None):
-    workspace_path = Path(workspace)
+    filename = Path("output") / "diffuser_design.json"
 
-    candidates = [
-        workspace_path / "output" / "diffuser_design.json",
-        workspace_path / "diffuser_design.json",
-        Path("/tmp/output/diffuser_design.json"),
-    ]
+    # Safe submission loader provided by the harness
+    text = load_submission_or_fault(workspace, filename)
 
-    submission = next((p for p in candidates if p.exists()), None)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise AgentFault(f"invalid JSON: {e}") from e
 
-    if submission is None:
-        raise AgentFault("missing diffuser_design.json")
-
-    with submission.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    angle = float(data["half_angle_deg"])
-    length = float(data["length_ratio"])
-    inlet = float(data["inlet_extension_m"])
+    try:
+        angle = float(data["half_angle_deg"])
+        length = float(data["length_ratio"])
+        inlet = float(data["inlet_extension_m"])
+    except KeyError as e:
+        raise AgentFault(f"missing field: {e}")
+    except (TypeError, ValueError) as e:
+        raise AgentFault(f"invalid numeric value: {e}")
 
     if angle == 7.0 and length == 6.0 and inlet == 0.5:
         return {"score": 1.0}
