@@ -1,6 +1,6 @@
 ---
 description: Reward-hacking mitigations the grader enforces
-globs: "{problems,examples}/**/scorer/**/*.py,grader/src/grading/**/*.py"
+globs: "{problems,examples}/**/scorer/**/*.py,{problems,examples}/**/baselines/**,{problems,examples}/**/attacks/**,grader/src/grading/**/*.py"
 alwaysApply: false
 ---
 
@@ -28,6 +28,9 @@ reads. Full catalog: `docs/REWARD_HACKING.md`.
 - A broad `except Exception: return 0.0` (or `return _failure(...)`) is rejected by the blocking `agent_fault` validator stage: it converts author/infra bugs into a kept 0.0. Catch the specific agent exception and raise AgentFault; keep hidden-truth reads outside the agent `try`.
 - Continuous tasks: a no-op submission must not exceed `[ground_truth].max_trivial_score`, and committed `baselines/<name>/` must score clearly below the reference (learnability gate). Calibrate via `grading.calibration` so naive baselines map to ~0.
 - MuJoCo: gate the score on `helpers.world_integrity(model, ...)` to catch physics reward-hacks (gravity off, gravcomp abuse, welds, contacts off).
+- Every task needs no-op/unchanged-starter coverage; add deterministic attack
+  fixtures for relevant reward/report forgery, symlink, delegation,
+  introspection, background-process, and oversized-artifact shortcuts.
 - Runtime hardening (pre/post-grade process quiescence, symlink/FIFO scrub,
   PID-namespace, non-finite trap, uid-1000/0700) is automatic. Confirmed
   respawning agent processes earn a kept 0.0; runtime inspection failures are

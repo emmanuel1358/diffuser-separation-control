@@ -1,0 +1,37 @@
+---
+description: Redirect shared-tooling edits from mothership to iso-template
+alwaysApply: true
+---
+
+# Template-owned shared code
+
+`lbx-rl-tasks-iso-template` is the source of truth for shared tooling. The mothership
+repo (`lbx-rl-tasks-iso-mothership`) receives those paths via
+`sync-shared-from-template.yml` and overwrites local edits on every sync.
+
+## When you are editing mothership
+
+Do **not** modify template-owned paths in mothership. Make the change in
+`lbx-rl-tasks-iso-template` instead, merge it, then run or wait for the mothership
+workflow **Sync shared code from template**.
+
+Wholesale (always template-owned):
+
+- `.claude/skills`, `.cursor/rules`, `.cursor/skills`
+- `.env.example`, `AGENTS.md`, `README.md`
+- `alignerr_plugin/pyproject.toml`, `alignerr_plugin/src`
+- `base`, `grader`, `harness`, `project_guidelines`
+- `taiga_runtime/rubric/pyproject.toml`, `taiga_runtime/rubric/src`
+
+Overlay (blocked in mothership only when the same relative path exists in the template):
+
+- `docs/` (e.g. `docs/AUTHORING.md` → template; `docs/INFRA.md` → mothership-only OK)
+- `scripts/` (e.g. `scripts/sync_mount.sh` → template; `scripts/poll_taiga_runs.py` → mothership-only OK)
+
+Canonical list: mothership `configs/template-shared-sync.yaml`. CI check name:
+`template-owned-paths`.
+
+## When you are editing the template
+
+Shared-tooling changes belong here. After merge, mothership picks them up through
+the sync workflow (schedule / `template_shared_sync` / manual dispatch).

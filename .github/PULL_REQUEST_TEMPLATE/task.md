@@ -56,11 +56,10 @@ executed through the approved sandbox helpers.
 - [ ] I set `[difficulty].task_type` to the correct supported task type.
 - [ ] Reviewer artifacts are committed, if applicable.
 - [ ] No local secrets, provider keys, `.env.local`, `.harness-runs/`, or generated credentials are committed.
-- [ ] I understand trusted CI runs in ISO mothership, but posts
-      `trusted-ci/grade` and QA comments back on this template PR.
-- [ ] For MuJoCo tasks, I know `run_qa`, `run_adversarial`, or
-      `run_mujoco_adversarial` triggers the non-blocking adversarial review
-      comment on this PR.
+- [ ] I understand trusted CI is dispatched by ISO mothership, while
+      `trusted-ci/grade` and QA comments are posted back on this PR.
+- [ ] I did not add workflow credentials or cross-repository dispatch to this
+      template or task fork.
 
 ## Reviewer Notes
 

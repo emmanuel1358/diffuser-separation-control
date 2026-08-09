@@ -1,0 +1,211 @@
+schema_version = "1.2"
+
+[task]
+name = "labelbox/frontier-mcp-workspace"
+description = "Synthetic conformance task for a shared workspace and task-local SSE MCP service."
+authors = [{ name = "Labelbox", email = "research@labelbox.com" }]
+keywords = ["services", "mcp", "sse", "workspace", "browser", "conformance"]
+
+[environment]
+required_resources = "4vcpu+16gib"
+storage_mb = 8192
+allow_internet = false
+
+[agent]
+timeout_sec = 1800
+user = "agent"
+
+[agent.resources]
+cpus = 3
+memory_mb = 2048
+storage_mb = 4096
+gpus = 0
+platform = "linux/amd64"
+build_timeout_sec = 600
+runtime_timeout_sec = 1800
+network = "isolated"
+
+[verifier]
+timeout_sec = 120
+user = "root"
+
+[verifier.resources]
+cpus = 1
+memory_mb = 1024
+storage_mb = 1024
+gpus = 0
+platform = "linux/amd64"
+build_timeout_sec = 300
+runtime_timeout_sec = 120
+network = "none"
+
+[workspace]
+seed = "starter"
+root = "/workspace"
+agent_cwd = "/workspace/repo"
+init_policy = "copy"
+git_baseline = true
+clean_paths = ["repo/__pycache__", "repo/.pytest_cache"]
+checkpoint_restore = true
+
+[[volumes]]
+name = "workspace-shared"
+
+[[services]]
+name = "workspace"
+role = "sidecar"
+build = { context = "environment/workspace", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "/opt/workspace/server.py"]
+user = "service"
+env = { WORKSPACE_PORT = "18073", SHARED_PATH = "/shared/workspace.json" }
+ports = [{ container_port = 18073, name = "workspace-http" }]
+healthcheck = { command = ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18073/health', timeout=2).read()"], interval_sec = 1, timeout_sec = 2, retries = 30 }
+volumes = [{ volume = "workspace-shared", target = "/shared", mode = "rw" }]
+resources = { cpus = 0.5, memory_mb = 256, storage_mb = 128, gpus = 0, platform = "linux/amd64", network = "isolated" }
+
+[[services]]
+name = "browser-mcp"
+role = "sidecar"
+build = { context = "environment/mcp", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "/opt/mcp/server.py"]
+user = "service"
+env = { MCP_PORT = "3080", SHARED_PATH = "/shared/workspace.json" }
+ports = [{ container_port = 3080, name = "mcp-sse" }]
+depends_on = [{ service = "workspace", condition = "healthy" }]
+healthcheck = { command = ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3080/health', timeout=2).read()"], interval_sec = 1, timeout_sec = 2, retries = 30 }
+volumes = [{ volume = "workspace-shared", target = "/shared", mode = "ro" }]
+resources = { cpus = 0.5, memory_mb = 256, storage_mb = 128, gpus = 0, platform = "linux/amd64", network = "isolated" }
+
+[[services]]
+name = "main"
+role = "main"
+build = { context = "environment/main", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "-m", "http.server", "8080", "--directory", "/workspace/repo"]
+user = "agent"
+ports = [{ container_port = 8080, name = "agent-http" }]
+depends_on = [
+    { service = "workspace", condition = "healthy" },
+    { service = "browser-mcp", condition = "healthy" },
+]
+healthcheck = { command = ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=2).read()"], interval_sec = 1, timeout_sec = 2, retries = 30 }
+volumes = [{ volume = "workspace-shared", target = "/shared", mode = "ro" }]
+resources = { cpus = 1, memory_mb = 512, storage_mb = 512, gpus = 0, platform = "linux/amd64", network = "isolated" }
+
+[[services]]
+name = "verifier"
+role = "verifier"
+build = { context = "environment/verifier", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "/opt/verifier/verify.py"]
+user = "root"
+resources = { cpus = 1, memory_mb = 512, storage_mb = 256, gpus = 0, platform = "linux/amd64", network = "none" }
+
+[[mcp_servers]]
+name = "playwright"
+transport = "sse"
+url = "http://browser-mcp:3080/sse"
+service = "browser-mcp"
+depends_on = ["workspace", "browser-mcp"]
+access = "agent"
+
+[mcp_servers.readiness]
+kind = "http"
+url = "http://browser-mcp:3080/health"
+accepted_statuses = [200]
+timeout_sec = 30
+interval_sec = 1
+
+[[captures]]
+name = "workspace-snapshot"
+service = "workspace"
+command = "python3 /opt/workspace/server.py --capture /tmp/workspace.json.tmp && mv /tmp/workspace.json.tmp /tmp/workspace.json"
+timeout_sec = 20
+atomic_destination = "/tmp/workspace.json"
+failure_policy = "infrastructure"
+
+[[artifacts]]
+name = "agent-repo"
+kind = "tree"
+source = "/workspace/repo"
+destination = "repo"
+service = "main"
+exclude = ["__pycache__", ".pytest_cache", "*.pyc"]
+max_bytes = 2097152
+max_files = 64
+max_depth = 8
+
+[[artifacts]]
+name = "workspace-snapshot"
+kind = "service"
+source = "/tmp/workspace.json"
+destination = "evidence/workspace.json"
+service = "workspace"
+max_bytes = 65536
+
+[evaluation]
+engine = "rubric_task"
+entrypoint = "scorer/compute_score.py"
+hidden_fixtures = ["scorer/data/claim_cases.json"]
+repetitions = 2
+
+[[gates]]
+name = "hidden-behavior"
+kind = "behavioral"
+required = true
+weight = 0.9
+timeout_sec = 30
+repetitions = 2
+
+[[gates]]
+name = "repeatability"
+kind = "determinism"
+required = true
+weight = 0.1
+timeout_sec = 30
+repetitions = 2
+
+[result]
+output_root = "/tmp/output"
+reward_file = "grade.json"
+reward_key = "score"
+subscores_key = "subscores"
+agent_fault_reward = 0.0
+infrastructure_fault = "discard"
+
+[[outputs]]
+path = "/tmp/output/grade.json"
+required = true
+description = "Independent verifier result for the sealed workspace snapshot"
+
+[[outputs]]
+path = "/tmp/output/repo"
+required = true
+description = "Captured final agent repository mapped from the main service artifact"
+
+[ground_truth]
+score_epsilon = 0.000001
+max_trivial_score = 0.0
+
+[reference]
+execution = "container"
+
+[runner]
+attempts = 1
+turn_limit = 300
+max_ctx = 200000
+context_mode = "autocompact"
+api_model_name = "claude-fable-5"
+required_tools = ["bash", "str_replace_editor", "tmux"]
+container_runtime = "firecracker"
+
+[runner.timeouts]
+setup_sec = 600
+grading_sec = 300
+tool_sec = 300
+max_episode_sec = 1800
+
+[difficulty]
+task_type = "software_engineering"
+domain = "repo_debugging"
+reward_type = "multi_deterministic_rubrics"
+license = "self_generated"
+license_source = "All claim records, expected outputs, services, MCP responses, and fixtures are synthetic and authored for this conformance example."

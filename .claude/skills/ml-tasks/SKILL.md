@@ -1,6 +1,6 @@
 ---
 name: ml-tasks
-description: Author ml tasks (continuous-scored machine learning) in this template. Use when creating or migrating a continuous-scored ML task with held-out truth — the compute_score() grader, the submission loaders, FLOOR/REF/PERFECT + PiecewiseLinearCurve calibration, dataset licensing, hidden envs and policy evaluation, the dependency channels, or the flagship base flavors.
+description: Authors continuous-scored ml tasks with held-out truth, sanctioned submission loaders, generated calibration, dataset licensing, hidden environments, dependency channels, and accelerator base flavors. Use for task_type ml.
 ---
 
 # ML Tasks
@@ -10,7 +10,7 @@ native contract as every other task type, plus the committed-strategy
 calibration contract. Full guide: `docs/ML_TASKS.md`.
 Canonical examples: `examples/mle-tabular-classification/` (static data),
 `examples/hidden-env-bandit/` (hidden env). Scaffold with
-`lbx-rl-template new <name> --template ml`.
+`uv run lbx-rl-template create --name labelbox/<task_id> --template ml --out problems`.
 
 ## Layout
 

@@ -1,0 +1,53 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/software-engineering-replace-me"
+description = "Repair a seeded source repository against deterministic public and hidden behavioral checks."
+
+[environment]
+required_resources = "4vcpu+16gib"
+storage_mb = 10000
+allow_internet = false
+
+[agent]
+timeout_sec = 7200
+user = "agent"
+
+[verifier]
+timeout_sec = 7200
+user = "root"
+env = []
+
+[ground_truth]
+in_container = true
+score_epsilon = 0.000001
+max_trivial_score = 0.0
+
+[reference]
+execution = "container"
+
+[runner]
+attempts = 1
+turn_limit = 1500
+max_ctx = 1000000
+context_mode = "autocompact"
+api_model_name = "claude-fable-5"
+required_tools = ["bash", "str_replace_editor", "tmux"]
+container_runtime = "firecracker"
+
+[runner.timeouts]
+setup_sec = 1800
+grading_sec = 7200
+tool_sec = 1800
+max_episode_sec = 7200
+
+[difficulty]
+level = "hard"
+task_type = "software_engineering"
+domain = "repo_debugging"
+reward_type = "multi_deterministic_rubrics"
+
+[[outputs]]
+path = "/tmp/output/repo"
+required = true
+description = "Final directly edited source repository."

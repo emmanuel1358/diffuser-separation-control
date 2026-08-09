@@ -146,7 +146,7 @@ run under the unprivileged `agent` account. Malformed input raises
 | CSV / dataframe | `helpers.load_submission_or_fault` | leaf/parent symlink swaps, FIFO, oversize, schema |
 | NumPy `.npz` / `.npy` | `helpers.load_submission_npz_or_fault` | leaf/parent symlink swaps, FIFO-hang, compressed/logical-size caps, mandatory `allow_pickle=False` |
 | Python policy / model module | `helpers.run_policy` / `helpers.run_model_module` | RCE-as-root (sandboxed subprocess; score from return value, never stdout) |
-| Executable | `helpers.run_submitted_executable` | uid-drop + caps stdout (kills the child past the cap) + discards stderr (memory) + AgentFault on timeout/over-cap; `streaming=True` also strips `RUBRIC_SCORE=` lines (capture mode returns raw stdout for you to parse — never relay it to the score parser) |
+| Executable | `helpers.run_submitted_executable` | fresh best-effort IPC namespace + uid-drop + caps stdout (kills the child past the cap) + discards stderr (memory) + AgentFault on timeout/over-cap; `streaming=True` also strips `RUBRIC_SCORE=` lines (capture mode returns raw stdout for you to parse — never relay it to the score parser) |
 | HDF5 | `helpers.load_submission_h5_or_fault` | immutable input snapshot plus dropped parser; links/virtual datasets and dataset-count/per-dataset/aggregate logical-size caps. Whole-object H5AD root handoff is disabled. |
 | K-fold CV of a model module | `score_kfold_cv` | cross-fold label leakage via memory (fresh worker), IPC (`CLONE_NEWIPC`), and disk (per-fold pristine-snapshot rebuild) |
 | Custom file-like parser | `helpers.open_submission_file_or_fault(path)` | bounded immutable `BytesIO`; rejects symlinks in every path component |
@@ -511,7 +511,19 @@ What DOES come from `task.toml`:
 - `[runner]` block → job-level fields (`api_model_name`,
   `n_attempts_per_problem`, `max_ctx`, `turn_limit`, `priority`,
   `iteration_order`, `serialize_restore_test_interval`,
-  `checkpoint_ttl`).
+  `checkpoint_ttl`, plus `enable_autocompact` / `enable_memory` from
+  `context_mode`).
+
+`context_mode` values:
+
+| Mode | API flags | Guidance |
+| --- | --- | --- |
+| `none` | neither | Stop when context fills. |
+| `memory` | `enable_memory=true` | Memory tool + context resets (~500k total across resets). **Do not enable without consulting Labelbox first.** |
+| `autocompact` (default) | `enable_autocompact=true` | Silent summarize/compress near the limit. |
+
+When `[runner]` omits `max_ctx` / `turn_limit`, trusted CI submit uses
+`max_ctx=1_000_000` and `turn_limit=1430`.
 - `[runner.timeouts]` → `setup_timeout_seconds`, `grading_timeout_seconds`,
   `tool_timeout_seconds`, `max_timeout_seconds` (see the timeout mapping below).
 - `[runner.required_tools]` → `required_tools` (default
@@ -656,9 +668,9 @@ description = "Final answer file the agent writes."
 
 [runner]
 attempts = 3                  # n_attempts_per_problem
-turn_limit = 1000             # null/0 = unlimited
+turn_limit = 1430             # null/0 = unlimited; default matches Taiga scaled cap
 max_ctx = 1_000_000
-context_mode = "none"         # none / autocompact / memory
+context_mode = "autocompact"  # none / autocompact / memory
 api_model_name = "claude-fable-5"
 priority = "high"
 iteration_order = "problems_first"
@@ -674,7 +686,7 @@ tool_sec = 120
 max_episode_sec = 3600
 
 [difficulty]
-task_type = "ml"              # ml | mujoco | cfd | structures
+task_type = "ml"              # ml | mujoco | cfd | structures | software_engineering
 domain = "scientific_discovery_computational_science"
 reward_type = "continuous_scoring_function"
 

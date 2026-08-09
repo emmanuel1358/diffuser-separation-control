@@ -3,10 +3,11 @@
 ## Setup
 
 ```bash
-git clone https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-template.git
-cd lbx-rl-tasks-template
+git clone https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-template.git
+cd lbx-rl-tasks-iso-template
 uv sync                # grading library + harness + local helpers (one shot)
 uv run lbx-rl-harness --help # confirm the local harness is installed
+uv run lbx-rl-template --help
 ```
 
 The `uv sync` installs:
@@ -42,10 +43,22 @@ example while switching between worktrees at different `base/` revisions.
 
 ## Scaffold a task
 
-There is one starter per supported `task_type` (`ml`, `mujoco`, `cfd`,
-`structures`). Copy the one that matches your task. Use the `prometheus-*`
-starters when a `cfd` or `structures` task should keep the same local/CI checks
-and submit to Prometheus while also running an independent Taiga mirror.
+Starters ship for `ml`, `mujoco`, `cfd`, `structures`, and
+`software_engineering`. Prefer the creator command so task identity placeholders
+and the generated rubric plan are refreshed automatically:
+
+```bash
+uv run lbx-rl-template create \
+  --name labelbox/my-repo-debugging-task \
+  --template software-engineering \
+  --out problems
+```
+
+For repository work, follow
+[`SOFTWARE_TRANSFORMATION_TASKS.md`](SOFTWARE_TRANSFORMATION_TASKS.md). Use the
+`prometheus-*` starters when a `cfd` or `structures` task should keep the same
+local/CI checks and submit to Prometheus while also running an independent Taiga
+mirror.
 Prometheus has two
 starter families per domain: non-eval starters set `[delivery].eval = false`,
 and eval starters set `[delivery].eval = true`. Both families follow the same
@@ -57,6 +70,7 @@ cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/ml problems/my-task
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/mujoco problems/reacher-control
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/cfd problems/my-cfd-case
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/structures problems/my-frame
+cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/software-engineering problems/my-repo-task
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-cfd problems/my-prometheus-cfd-case
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-structures problems/my-prometheus-frame
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-eval-cfd problems/my-prometheus-eval-cfd-case
@@ -65,15 +79,23 @@ cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-eval-stru
 
 Use the matching project guide:
 
+- Long-horizon software engineering and Frontier-style service tasks:
+  `project_guidelines/software_engineering/frontier_style_software_engineering_tasks.md`
+- New software task design and delivery:
+  `project_guidelines/software_engineering/new_task_design_workflow.md`
 - Non-eval CFD: `project_guidelines/cfd/prometheus_cfd_environments.md`
 - Eval CFD: `project_guidelines/cfd/prometheus_eval_cfd_environments.md`
 - Non-eval structures: `project_guidelines/strctural_engineering/PROMETHEUS_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`
 - Eval structures: `project_guidelines/strctural_engineering/PROMETHEUS_EVAL_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`
 
-After copying a starter, update `metadata.json` and `task.toml` so
+After copying a starter manually, update `metadata.json` and `task.toml` so
 `problem_data.instance_id` and `[task].name` match your directory. Copy
 task-specific patterns from the matching `examples/` reference (not the example
 directory itself).
+
+New software-engineering problems are accepted only after every required
+trusted CI check is green and the final problem-level Boreal aggregate score is
+`<= 0.4`. A green local run or oracle score alone is not completion.
 
 Before opening or updating a PR, run:
 
@@ -90,23 +112,22 @@ The ground-truth runtime checks the reference solution without calling an LLM.
 It creates or overwrites local generated evidence and, for rendered tasks,
 `.alignerr/ground_truth/` reviewer artifacts. Commit task source, reproducible
 reference/baseline assets, and reviewed render artifacts—not generated
-calibration locks or proofs. When the fork PR opens or updates, the template
-repo dispatches trusted CI in
-`lbx-rl-tasks-iso-mothership`, but the template PR stays the author-facing
-surface. The template workflow posts a handoff comment, and mothership posts the
-`trusted-ci/grade` check, dashboard link, diagnostics, and later Taiga/Boreal
-feedback comments back on the same fork PR. Authors and labelers do not need to
-open mothership to see pipeline status. See
+calibration locks or proofs. When the fork PR opens or updates, the trusted
+mothership control plane dispatches CI in `lbx-rl-tasks-iso-mothership`; no
+credentialed dispatch workflow runs in the template or task fork. The template
+PR remains the author-facing surface: mothership posts the `trusted-ci/grade`
+check, dashboard link, diagnostics, and later Taiga/Boreal feedback comments
+back on that PR. Authors and labelers do not need to open mothership to see
+pipeline status. See
 [`GROUND_TRUTH.md`](GROUND_TRUTH.md) for the oracle and reviewer video contract.
 
 Migrating an older task onto sealed continuous calibration, declarative
 `RubricTask`, or sealed `evaluation.plan.json`? Start with
 [`TASK_MIGRATION.md`](TASK_MIGRATION.md).
 
-For MuJoCo tasks, add the `run_qa`, `run_adversarial`, or
-`run_mujoco_adversarial` label when you want the non-blocking adversarial
-score-shaping review. That review also runs in mothership and posts its
-`MuJoCo Adversarial AutoQA (shadow)` comment back on the template PR.
+MuJoCo adversarial review and explicit Taiga deployment are also initiated by
+trusted mothership automation. They must not be dispatched by a workflow in the
+template or task fork. Their results are posted back to the template PR.
 
 There are no task categories. Add the files your task needs; the validator
 runs checks based on what is present.
@@ -128,10 +149,10 @@ problems/<task_id>/
 │   ├── env-requirements.txt # optional: hidden-env-only pip deps (root-only)
 │   └── data/             # private hidden test set
 ├── data/                 # public data the agent sees at /data/
-├── solution/solve.sh     # required reference/oracle solution
-├── solution/render.sh    # required reviewer video generation for mujoco tasks
-├── baselines/naive.sh    # optional weak baseline
-└── README.md
+├── solution/solve.sh     # required reference/oracle solution (layout varies for ML)
+├── solution/render.sh    # reviewer video when MuJoCo or render_outputs declared
+├── baselines/            # optional weak baseline (layout varies by starter)
+└── README.md             # optional
 ```
 
 ### Runtime Prompt Guidance
@@ -262,7 +283,7 @@ Every task must declare three enum-backed metadata fields in `[difficulty]`:
 
 ```toml
 [difficulty]
-task_type = "ml"                         # ml | mujoco | cfd | structures
+task_type = "ml"                         # ml | mujoco | cfd | structures | software_engineering
 domain = "scientific_discovery_computational_science" # enum scoped by task_type
 reward_type = "continuous_scoring_function" # or multi_deterministic_rubrics
 license = "MIT"                           # required for ml tasks; permissive SPDX id
@@ -278,8 +299,9 @@ identifier from `task_metadata.LICENSES` (`MIT`, `Apache-2.0`, `BSD-2-Clause`,
 carry incorrect license claims. Copyleft, share-alike, non-commercial, and
 research-only data is rejected outright because it cannot ship in a commercial
 delivery. (`not_applicable` is still accepted as a back-compat alias for
-`self_generated`.) `mujoco`/`cfd`/`structures` tasks use solver-generated or
-self-authored data and may omit the field.
+`self_generated`.) `mujoco`/`cfd`/`structures`/`software_engineering` tasks may
+omit the dataset-license field. Software tasks must still document upstream
+source licensing in their task README.
 
 `ml` tasks must also set `[difficulty].license_source` -- the provenance pointer
 a licensing code-owner verifies by hand. For a real license it must be the
@@ -306,16 +328,29 @@ Prometheus starter. Trusted CI still runs the same CFD/structures checks before
 delivery: solver-agnostic prompt checks, grader QA, solver-backed oracle
 validation, local agent score gates, Auto QA, and build-proof validation. Only
 the final delivery job changes from Taiga submission to the Prometheus Agent
-Service runner. For Prometheus CFD/structures, `trusted-ci/grade` waits on Submit Prometheus and
-fails when the Prometheus target average is missing or above `0.5`. Standard
-deviation and the trainability audit are diagnostic context, not approval gates.
+Service runner.
+
+For **non-eval** Prometheus CFD/structures, submit for review when **either**
+score lane clears (easing — two independent ways to clear the difficulty bar).
+Full rules and the required PR comment template:
+[`CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](CFD_STRUCTURES_DUAL_LANE_REVIEW.md).
+
+- **Prometheus lane:** CI green, Prometheus mean `<= 0.6`, stddev `>= 0.08`.
+- **Achilles lane:** CI green, Boreal mean `<= 0.4` — **independent of
+  Prometheus**.
+- **Both lanes also require Boreal QA:** wait for Boreal QA to complete on the
+  current head with no undocumented criticals. A passing Prometheus score gate
+  is not permission to submit.
+- Document Boreal critical false positives on the PR (common case: Data Quality
+  treating a required output filename as a missing input).
+
 Eval rows are accepted once trusted CI is green; Boreal QA is non-blocking for
-eval. Non-eval rows also need Boreal required QA complete with no unresolved
-critical findings before review (warnings/info are fine; Boreal average is not
-a blocker). Self-iterate on clear criticals for non-eval; submit for coaching
-when stuck, or for acceptance when gates pass, and name which Boreal surface is
-latest. Submitting a non-passing non-eval row for review violates fair practices
+eval. Submitting a non-eval row that clears neither lane violates fair practices
 and may remove the tasker from the project.
+
+That Prometheus CFD/structures policy does not apply to newly authored
+`software_engineering` problems. Software problems require all trusted CI checks
+green **and** a Boreal aggregate score `<= 0.4`.
 
 Prometheus Harbor exports require agent/verifier user separation in
 ``task.toml``: ``[agent].user = "agent"`` (non-root uid 1000) and
@@ -410,7 +445,10 @@ example, ML includes the production taxonomy (`physical_sciences`,
 expansion areas (`world_models`, `active_perception`, `long_horizon_planning`).
 MuJoCo includes `policy_training_improvement` and `manipulation`, CFD includes
 `aerodynamics` and `vortex_suppression`, and structures includes
-`seismic_retrofit` and `topology_optimization`.
+`seismic_retrofit` and `topology_optimization`. Software engineering includes
+repository debugging, feature implementation, migrations, compatibility,
+performance, frontend, data systems, and security hardening; see
+[`SOFTWARE_TRANSFORMATION_TASKS.md`](SOFTWARE_TRANSFORMATION_TASKS.md).
 
 `task_type` is the broad domain family. `domain` is the finer diversity label
 used by the dashboard/Supabase index. `reward_type` controls the ground-truth
@@ -459,11 +497,20 @@ required = true
 description = "Final MJCF model the agent writes."
 ```
 
-This contract is task-type agnostic: `ml`, `mujoco`, `cfd`, `structures`, and any
-hidden-env variant all use the same `[[outputs]]` shape. The Taiga exporter
+This contract is task-type agnostic: `ml`, `mujoco`, `cfd`, `structures`,
+`software_engineering`, and any hidden-env variant all use the same `[[outputs]]`
+shape. The Taiga exporter
 copies these declarations into the problem payload as `outputs` and mirrors them
 under `extra_fields.task_metadata.outputs` so Taiga QA, local Taiga-format runs,
 and reviewers see the same required artifact list as the authoring validator.
+
+Software tasks may use either the simple single-image contract or a declared
+service/capsule graph. Simple tasks publish their repository under
+`/tmp/output/repo`; service tasks collect the repository from the agent service,
+publish the canonical verifier result under `/tmp/output`, and package
+per-service images into a trusted outer capsule. Declared SSE MCP endpoints are
+supported on Taiga only through that capsule's audited service-DNS proxy;
+arbitrary unbundled SSE export remains fail-closed.
 
 Do not use `/workspace` in task prompts or `task.toml` output paths.
 
@@ -648,9 +695,9 @@ env = []
 ```toml
 [runner]
 attempts = 3                    # n_attempts_per_problem
-turn_limit = 1500               # null = unlimited
-max_ctx = 1_000_000
-context_mode = "none"           # none / autocompact / memory
+turn_limit = 1430               # null = unlimited; unset default matches Taiga cap
+max_ctx = 1_000_000             # Taiga maximum
+context_mode = "autocompact"    # none / autocompact / memory
 api_model_name = "claude-fable-5"
 required_tools = ["bash", "str_replace_editor", "tmux"]
 
@@ -663,6 +710,16 @@ max_episode_sec = 3600
 
 These become per-problem and job-level fields in the Boreal submission.
 Defaults are sensible — leave the section out and the exporter uses them.
+
+### Context mode
+
+| Mode | API flags | Guidance |
+| --- | --- | --- |
+| Default (`none`) | neither | Stop when context fills. |
+| Memory | `enable_memory=true` | `memory` tool + context resets; wiki says up to ~500k total tokens across resets. **Do not enable without consulting Labelbox first.** |
+| Autocompact (default) | `enable_autocompact=true` | Silent summarize/compress near the limit; less control than Memory. Prefer this for long-horizon ISO tasks. |
+
+Trusted CI submit also uses these maxima when `[runner]` omits `max_ctx` / `turn_limit`.
 
 ## Holistic grading guide
 

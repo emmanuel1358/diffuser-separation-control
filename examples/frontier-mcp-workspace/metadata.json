@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "description": "Synthetic shared-workspace and SSE MCP conformance task.",
+    "instance_id": "frontier-mcp-workspace"
+  }
+}

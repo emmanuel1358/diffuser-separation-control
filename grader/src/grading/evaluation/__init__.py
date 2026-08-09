@@ -5,8 +5,10 @@ from grading.evaluation.artifacts import (
     NumericField,
     RegularFileArtifact,
     SubmittedFile,
+    SubmittedWorkspace,
     TextArtifact,
     TrustedJson,
+    WorkspaceArtifact,
 )
 from grading.evaluation.author import (
     CALIBRATION_SEED_ENV,
@@ -21,6 +23,15 @@ from grading.evaluation.author import (
     load_task_module,
     load_task_registration,
     measure_task_module,
+)
+from grading.evaluation.candidate_suite import (
+    CandidateAttempt,
+    CandidateCommandSpec,
+    CandidateSuiteMetadata,
+    CandidateSuiteResult,
+    parse_candidate_json,
+    parse_candidate_jsonl,
+    run_candidate_suite,
 )
 from grading.evaluation.context import EvaluationContext
 from grading.evaluation.decision import IIDPermutationEvidence
@@ -65,6 +76,10 @@ __all__ = [
     "BinaryF1Target",
     "CalibrationLock",
     "CalibrationMeasureContext",
+    "CandidateAttempt",
+    "CandidateCommandSpec",
+    "CandidateSuiteMetadata",
+    "CandidateSuiteResult",
     "ContinuousTask",
     "CsvRows",
     "EvaluationContext",
@@ -88,8 +103,10 @@ __all__ = [
     "RubricTask",
     "SRETarget",
     "SubmittedFile",
+    "SubmittedWorkspace",
     "TextArtifact",
     "TrustedJson",
+    "WorkspaceArtifact",
     "WorkspaceDegenerateProbes",
     "WorkspaceProbe",
     "build_calibration_lock",
@@ -101,7 +118,10 @@ __all__ = [
     "load_task_module",
     "load_task_registration",
     "measure_task_module",
+    "parse_candidate_json",
+    "parse_candidate_jsonl",
     "refresh_evaluation_plan",
+    "run_candidate_suite",
     "write_calibration_lock_atomic",
     "write_evaluation_plan_atomic",
 ]

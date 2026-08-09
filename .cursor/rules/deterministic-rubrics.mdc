@@ -23,4 +23,6 @@ alwaysApply: false
 - For subjective requirements, replace the wording with code-checkable properties: file parses, numeric tolerance, fixed rollout result, hidden fixture match, or structural model inspection.
 - Keep `[verifier].env` free of model-provider keys. Local harness keys belong in `.env.local`, not task verifier config.
 - For MuJoCo tasks, pin timestep, integrator, initial `qpos` / `qvel`, controls, perturbations, and RNG seeds before scoring.
-- Before opening or updating a PR, run `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` and commit the generated `problems/<task_id>/.alignerr/build_proof.json` plus any refreshed `scorer/evaluation.plan.json`. While iterating, use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>`.
+- Before a PR, run local ground-truth preflight and commit refreshed
+  `scorer/evaluation.plan.json`; trusted CI owns authoritative proof/lock
+  evidence. While iterating, use `lbx-rl-harness reference`.

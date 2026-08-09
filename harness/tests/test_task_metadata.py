@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import pytest
-
 from alignerr_plugin.task_metadata import (
     DOMAINS_BY_TASK_TYPE,
     REWARD_TYPES,
@@ -26,7 +25,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_master_metadata_enums() -> None:
-    assert TASK_TYPES == ("ml", "mujoco", "cfd", "structures")
+    assert TASK_TYPES == (
+        "ml",
+        "mujoco",
+        "cfd",
+        "structures",
+        "software_engineering",
+    )
     assert REWARD_TYPES == (
         "continuous_scoring_function",
         "multi_deterministic_rubrics",
@@ -45,6 +50,33 @@ def test_master_metadata_enums() -> None:
     assert "rans_simulation" in DOMAINS_BY_TASK_TYPE["cfd"]
     assert "seismic_retrofit" in DOMAINS_BY_TASK_TYPE["structures"]
     assert "topology_optimization" in DOMAINS_BY_TASK_TYPE["structures"]
+    assert DOMAINS_BY_TASK_TYPE["software_engineering"] == (
+        "legacy_modernization",
+        "behavioral_compatibility",
+        "runtime_migration",
+        "schema_evolution",
+        "build_system_migration",
+        "framework_migration",
+        "compiler_toolchain_migration",
+        "concurrency_reliability",
+        "distributed_protocol_evolution",
+        "repo_debugging",
+        "feature_implementation",
+        "performance_optimization",
+        "frontend_ui",
+        "data_database_systems",
+        "security_hardening",
+    )
+
+
+def test_software_engineering_metadata_is_valid_without_dataset_license() -> None:
+    issues = metadata_validation_issues(
+        task_type="software_engineering",
+        domain="repo_debugging",
+        reward_type="multi_deterministic_rubrics",
+    )
+
+    assert issues == []
 
 
 def test_metadata_validation_rejects_cross_type_domain() -> None:

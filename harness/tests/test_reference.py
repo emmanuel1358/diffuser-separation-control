@@ -507,7 +507,12 @@ def test_container_grade_command_runs_root_with_host_scorer_mount(tmp_path) -> N
     scorer_dir = tmp_path / "scorer"
     scorer_dir.mkdir()
     cmd = _docker_grade_command(
-        "img:tag", Path("/cache"), scorer_dir, Path("/out"), "echo grade"
+        "img:tag",
+        Path("/cache"),
+        scorer_dir,
+        Path("/out"),
+        "echo grade",
+        verifier_capabilities=("SYS_PTRACE",),
     )
     # Grade runs as root (no --user drop) so it can read the root-only truth...
     assert "--user" not in cmd
@@ -516,6 +521,7 @@ def test_container_grade_command_runs_root_with_host_scorer_mount(tmp_path) -> N
     # which would make the reference calibration unrealistic.
     assert "--network" in cmd
     assert cmd[cmd.index("--network") + 1] == "none"
+    assert cmd[cmd.index("--cap-add") + 1] == "SYS_PTRACE"
     # A native task ships a host scorer/; mount it read-only so editing
     # compute_score.py changes the next score with no image rebuild.
     assert any(part == f"{scorer_dir}:/mcp_server/grader:ro" for part in cmd)

@@ -6,6 +6,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from alignerr_plugin.capsule import export_task_capsule
 from alignerr_plugin.exporters.harbor import export_harbor as export_harbor_impl
 from alignerr_plugin.exporters.taiga import export_taiga as export_taiga_impl
 from alignerr_plugin.migrations.mujoco import migrate_legacy_mujoco_task
@@ -23,6 +24,7 @@ STARTER_TEMPLATES = (
     "mujoco",
     "cfd",
     "structures",
+    "software-engineering",
     "prometheus",
     "prometheus-cfd",
     "prometheus-structures",
@@ -110,7 +112,8 @@ def validate(
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command("create")
+@app.command("new")
 def new(
     name: str = typer.Option(
         None, "--name", help="Task name, e.g. labelbox/my-task (prompted if omitted)"
@@ -120,9 +123,9 @@ def new(
         "--template",
         "-t",
         help=(
-            "Starter: ml | mujoco | cfd | structures | prometheus | "
-            "prometheus-cfd | prometheus-structures | prometheus-eval-cfd | "
-            "prometheus-eval-structures"
+            "Starter: ml | mujoco | cfd | structures | software-engineering | "
+            "prometheus | prometheus-cfd | prometheus-structures | "
+            "prometheus-eval-cfd | prometheus-eval-structures"
         ),
     ),
     output_dir: Path = typer.Option(
@@ -164,7 +167,9 @@ def migrate_legacy_mujoco(
         None, "--out", "-o", help="New native ISO task directory (must not exist)"
     ),
     in_place: bool = typer.Option(
-        False, "--in-place", help="Migrate a native task directly in its current directory"
+        False,
+        "--in-place",
+        help="Migrate a native task directly in its current directory",
     ),
     domain: str | None = typer.Option(
         None, "--domain", help="Override the inferred MuJoCo domain taxonomy value"
@@ -281,9 +286,23 @@ def export_taiga(
     ),
     output: Path = typer.Option(Path("problems-metadata.json"), "--out", "-o"),
     image: str = typer.Option("PLACEHOLDER", "--image"),
+    outer_capsule: bool = typer.Option(
+        False,
+        "--outer-capsule",
+        help=(
+            "Trusted assertion that --image is the built outer capsule. Required "
+            "for capability tasks; production images must be digest-pinned "
+            "(LOCAL_IMAGE is allowed for local validation)."
+        ),
+    ),
 ) -> None:
     """Export Boreal/Taiga metadata without the external Alignerr CLI."""
-    sidecar = export_taiga_impl(problem_dir, output, image_ref=image)
+    sidecar = export_taiga_impl(
+        problem_dir,
+        output,
+        image_ref=image,
+        image_is_outer_capsule=outer_capsule,
+    )
     console.print(f"[green]Wrote Boreal metadata:[/green] {output}")
     console.print(sidecar)
 
@@ -295,12 +314,22 @@ def export_harbor(
     ),
     output_dir: Path = typer.Option(Path("harbor-export"), "--out", "-o"),
     image: str | None = typer.Option(
-        None, "--image", help="Digest-pinned Docker image to write into task.toml"
+        None,
+        "--image",
+        help=(
+            "Digest-pinned image to stamp for capability/separate-service tasks; "
+            "ignored for legacy self-contained exports."
+        ),
     ),
     runtime_notices: bool = typer.Option(
         True,
         "--runtime-notices/--no-runtime-notices",
         help="Include generated non-prompt runtime notices such as GPU/TPU availability.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Atomically replace an existing export directory.",
     ),
 ) -> None:
     """Export Harbor task format without the external Alignerr CLI."""
@@ -309,8 +338,44 @@ def export_harbor(
         output_dir,
         image_ref=image,
         include_runtime_notices=runtime_notices,
+        force=force,
     )
     console.print(f"[green]Wrote Harbor export:[/green] {path}")
+
+
+@app.command("export-capsule")
+def export_capsule(
+    problem_dir: Path = typer.Option(
+        ..., "--problem-dir", "-d", exists=True, file_okay=False
+    ),
+    output_dir: Path = typer.Option(Path("taiga-capsule"), "--out", "-o"),
+    trusted_build: bool = typer.Option(
+        False,
+        "--trusted-build",
+        help=(
+            "Allow child image builds/pulls. Use only in trusted CI; packaging "
+            "fails closed without this flag."
+        ),
+    ),
+    docker_command: str = typer.Option("docker", "--docker-command"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Atomically replace an existing capsule context.",
+    ),
+) -> None:
+    """Bundle capability services into an outer Taiga capsule build context."""
+    result = export_task_capsule(
+        problem_dir,
+        output_dir,
+        trusted_build=trusted_build,
+        docker_command=docker_command,
+        force=force,
+    )
+    console.print(f"[green]Wrote Taiga capsule context:[/green] {result.context_dir}")
+    console.print(
+        f"[green]Child image manifest:[/green] {result.image_bundle.manifest_path}"
+    )
 
 
 if __name__ == "__main__":

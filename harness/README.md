@@ -6,6 +6,10 @@ is meant to answer: "Does the oracle proof pass?" and, for optional agent runs,
 "Would this task actually work in a Boreal-like agent run, and what did the agent
 do turn by turn?"
 
+Reference tasks under `examples/` ship in this template repo (and author forks).
+The mothership checkout does not include `examples/`; sync copies this harness
+package for maintainers, but day-to-day example runs belong in the template.
+
 ## What It Runs
 
 The harness accepts all three task shapes used by this repo:

@@ -1,0 +1,24 @@
+---
+description: Required trusted CI and difficulty gates before task acceptance
+alwaysApply: true
+---
+
+# Task Delivery Gates
+
+- Local success is not acceptance. Every applicable mothership trusted CI check
+  must be green; a skipped, bypassed, indefinitely pending, or missing required
+  check is not green.
+- Trusted CI is authoritative for image builds, seals/proofs, grader QA,
+  ground-truth, security, exports, and capsule attestation.
+- The oracle target remains `1.0` for deterministic rubrics and `0.5 ± 0.05`
+  for continuous scoring. Agent difficulty must never lower the oracle target.
+- Newly authored `software_engineering` problems require Boreal aggregate
+  `<= 0.4` over valid configured attempts after trusted CI is green.
+- Prometheus CFD/structures use their documented target-average and eval/non-eval
+  policy; do not apply the software threshold to those rows.
+- Do not satisfy a score gate with hidden requirements, flaky tests, unfair
+  timeouts, packaging friction, or infrastructure failures.
+- Material changes to prompt, environment, grader, fixtures, oracle, baselines,
+  or weights require a fresh trusted CI and evaluation cycle.
+
+See `docs/AUTHORING.md`, `docs/GROUND_TRUTH.md`, and the matching project guide.

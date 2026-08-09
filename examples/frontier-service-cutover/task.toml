@@ -1,0 +1,261 @@
+schema_version = "1.2"
+
+[task]
+name = "labelbox/frontier-service-cutover"
+description = "Synthetic conformance task for a live service cutover with ordered capture and isolated verification."
+authors = [{ name = "Labelbox", email = "research@labelbox.com" }]
+keywords = ["services", "database", "cutover", "capture", "conformance"]
+
+[environment]
+required_resources = "6vcpu+32gib"
+storage_mb = 8192
+allow_internet = false
+
+[agent]
+timeout_sec = 1800
+user = "agent"
+
+[agent.resources]
+cpus = 3
+memory_mb = 2048
+storage_mb = 4096
+gpus = 0
+platform = "linux/amd64"
+build_timeout_sec = 600
+runtime_timeout_sec = 1800
+network = "isolated"
+
+[verifier]
+timeout_sec = 120
+user = "root"
+
+[verifier.resources]
+cpus = 1
+memory_mb = 1024
+storage_mb = 1024
+gpus = 0
+platform = "linux/amd64"
+build_timeout_sec = 300
+runtime_timeout_sec = 120
+network = "none"
+
+[workspace]
+seed = "starter"
+root = "/workspace"
+agent_cwd = "/workspace/repo"
+init_policy = "copy"
+git_baseline = true
+clean_paths = ["repo/__pycache__", "repo/.pytest_cache"]
+checkpoint_restore = true
+
+[[volumes]]
+name = "state-data"
+
+[[volumes]]
+name = "cutover-shared"
+
+[[services]]
+name = "state"
+role = "sidecar"
+build = { context = "environment/state", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "/opt/state/server.py"]
+user = "service"
+env = { STATE_PATH = "/data/state.json", STATE_PORT = "7000" }
+ports = [{ container_port = 7000, name = "state-http" }]
+healthcheck = { command = ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7000/health', timeout=2).read()"], interval_sec = 1, timeout_sec = 2, retries = 30 }
+volumes = [{ volume = "state-data", target = "/data", mode = "rw" }]
+resources = { cpus = 0.5, memory_mb = 256, storage_mb = 256, gpus = 0, platform = "linux/amd64", network = "isolated" }
+
+[[services]]
+name = "initialize"
+role = "init"
+build = { context = "environment/init", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "/opt/init/initialize.py"]
+user = "service"
+env = { STATE_URL = "http://state:7000" }
+depends_on = [{ service = "state", condition = "healthy" }]
+resources = { cpus = 0.25, memory_mb = 128, storage_mb = 128, gpus = 0, platform = "linux/amd64", network = "isolated" }
+
+[[services]]
+name = "customer"
+role = "sidecar"
+build = { context = "environment/customer", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "/opt/customer/server.py"]
+user = "service"
+env = { STATE_URL = "http://state:7000", API_BASE = "http://main:8080", CUSTOMER_PORT = "9000", SHARED_RESULT = "/shared/customer-results.json" }
+ports = [{ container_port = 9000, name = "customer-http" }]
+depends_on = [
+    { service = "state", condition = "healthy" },
+    { service = "initialize", condition = "completed" },
+]
+healthcheck = { command = ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=2).read()"], interval_sec = 1, timeout_sec = 2, retries = 30 }
+volumes = [{ volume = "cutover-shared", target = "/shared", mode = "rw" }]
+resources = { cpus = 0.5, memory_mb = 256, storage_mb = 128, gpus = 0, platform = "linux/amd64", network = "isolated" }
+
+[[services]]
+name = "main"
+role = "main"
+build = { context = "environment/main", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "/workspace/repo/app.py", "--serve"]
+user = "agent"
+env = { STATE_URL = "http://state:7000", APP_PORT = "8080" }
+ports = [{ container_port = 8080, name = "app-http" }]
+depends_on = [
+    { service = "state", condition = "healthy" },
+    { service = "initialize", condition = "completed" },
+    { service = "customer", condition = "healthy" },
+]
+healthcheck = { command = ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).read()"], interval_sec = 1, timeout_sec = 2, retries = 30 }
+volumes = [{ volume = "cutover-shared", target = "/shared", mode = "ro" }]
+resources = { cpus = 1, memory_mb = 512, storage_mb = 512, gpus = 0, platform = "linux/amd64", network = "isolated" }
+
+[[services]]
+name = "verifier"
+role = "verifier"
+build = { context = "environment/verifier", dockerfile = "Dockerfile", platform = "linux/amd64" }
+command = ["python3", "/opt/verifier/verify.py"]
+user = "root"
+resources = { cpus = 1, memory_mb = 512, storage_mb = 256, gpus = 0, platform = "linux/amd64", network = "none" }
+
+[[captures]]
+name = "finalize-load"
+service = "main"
+command = "python3 -c \"import urllib.request; request = urllib.request.Request('http://customer:9000/finalize', data=b'', method='POST'); urllib.request.urlopen(request, timeout=10).read()\""
+timeout_sec = 20
+failure_policy = "infrastructure"
+
+[[captures]]
+name = "customer-results"
+service = "customer"
+command = "python3 /opt/customer/server.py --capture /tmp/customer-results.json.tmp && mv /tmp/customer-results.json.tmp /tmp/customer-results.json"
+timeout_sec = 20
+atomic_destination = "/tmp/customer-results.json"
+failure_policy = "infrastructure"
+
+[[captures]]
+name = "state-dump"
+service = "state"
+command = "python3 /opt/state/server.py --capture /tmp/state.json.tmp && mv /tmp/state.json.tmp /tmp/state.json"
+timeout_sec = 20
+atomic_destination = "/tmp/state.json"
+failure_policy = "infrastructure"
+
+[[captures]]
+name = "workspace-git-diff"
+service = "main"
+command = "cd /workspace/repo && base=$(git rev-list --max-parents=0 HEAD | tail -n 1) && test -n \"$base\" && git diff --binary --no-color \"$base\" -- . > /tmp/workspace.patch.tmp && mv /tmp/workspace.patch.tmp /tmp/workspace.patch"
+timeout_sec = 20
+atomic_destination = "/tmp/workspace.patch"
+failure_policy = "infrastructure"
+
+[[artifacts]]
+name = "agent-repo"
+kind = "tree"
+source = "/workspace/repo"
+destination = "repo"
+service = "main"
+exclude = ["__pycache__", ".pytest_cache", "*.pyc"]
+max_bytes = 2097152
+max_files = 64
+max_depth = 8
+
+[[artifacts]]
+name = "workspace-patch"
+kind = "file"
+source = "/tmp/workspace.patch"
+destination = "evidence/workspace.patch"
+service = "main"
+max_bytes = 1048576
+
+[[artifacts]]
+name = "customer-results"
+kind = "service"
+source = "/tmp/customer-results.json"
+destination = "evidence/customer-results.json"
+service = "customer"
+max_bytes = 65536
+
+[[artifacts]]
+name = "state-dump"
+kind = "service"
+source = "/tmp/state.json"
+destination = "evidence/state.json"
+service = "state"
+max_bytes = 65536
+
+[[artifacts]]
+name = "init-marker"
+kind = "service"
+source = "/tmp/init.json"
+destination = "evidence/init.json"
+service = "initialize"
+max_bytes = 4096
+
+[evaluation]
+engine = "rubric_task"
+entrypoint = "scorer/compute_score.py"
+hidden_fixtures = ["scorer/data/cutover_cases.json"]
+repetitions = 2
+
+[[gates]]
+name = "hidden-behavior"
+kind = "behavioral"
+required = true
+weight = 0.9
+timeout_sec = 30
+repetitions = 2
+
+[[gates]]
+name = "repeatability"
+kind = "determinism"
+required = true
+weight = 0.1
+timeout_sec = 30
+repetitions = 2
+
+[result]
+output_root = "/tmp/output"
+reward_file = "grade.json"
+reward_key = "score"
+subscores_key = "subscores"
+agent_fault_reward = 0.0
+infrastructure_fault = "discard"
+
+[[outputs]]
+path = "/tmp/output/grade.json"
+required = true
+description = "Independent verifier result for the sealed service snapshot"
+
+[[outputs]]
+path = "/tmp/output/repo"
+required = true
+description = "Captured final agent repository mapped from the main service artifact"
+
+[ground_truth]
+score_epsilon = 0.000001
+max_trivial_score = 0.0
+
+[reference]
+execution = "container"
+
+[runner]
+attempts = 1
+turn_limit = 300
+max_ctx = 200000
+context_mode = "autocompact"
+api_model_name = "claude-fable-5"
+required_tools = ["bash", "str_replace_editor", "tmux"]
+container_runtime = "firecracker"
+
+[runner.timeouts]
+setup_sec = 600
+grading_sec = 300
+tool_sec = 300
+max_episode_sec = 1800
+
+[difficulty]
+task_type = "software_engineering"
+domain = "data_database_systems"
+reward_type = "multi_deterministic_rubrics"
+license = "self_generated"
+license_source = "All records, expected outputs, services, and fixtures are synthetic and authored for this conformance example."

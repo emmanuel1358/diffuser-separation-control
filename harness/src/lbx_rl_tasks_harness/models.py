@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -65,7 +66,7 @@ class HarnessProblem:
     ground_truth: GroundTruthSpec = field(default_factory=GroundTruthSpec)
     reference: ReferenceSpec = field(default_factory=ReferenceSpec)
     metadata: dict[str, Any] = field(default_factory=dict)
-    taiga_problem: dict[str, Any] | None = None
+    taiga_problem: Mapping[str, Any] | None = None
 
     def require_grader(self) -> tuple[Path, Path]:
         if self.grader_dir is None:

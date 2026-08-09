@@ -1,0 +1,82 @@
+{
+  "decision_ids": [
+    "geometry",
+    "inviscid",
+    "viscous",
+    "polar_state"
+  ],
+  "evidence": {
+    "aggregation": "weighted",
+    "artifact": {
+      "allow_extra_workspace_entries": false,
+      "clean_paths": [
+        ".git",
+        "target"
+      ],
+      "forbidden_names": [
+        "build.rs"
+      ],
+      "forbidden_suffixes": [
+        ".f",
+        ".f77",
+        ".f90",
+        ".for",
+        ".o",
+        ".a",
+        ".so",
+        ".dylib",
+        ".dll",
+        ".exe",
+        ".class",
+        ".jar",
+        ".wasm",
+        ".pyc"
+      ],
+      "forbidden_text_patterns": [
+        "Command::new",
+        "std::process::Command",
+        "process::Command",
+        "extern \"C\"",
+        "libloading",
+        "dlopen"
+      ],
+      "max_file_bytes": 16777216,
+      "max_files": 5000,
+      "max_total_bytes": 268435456,
+      "path": "repo",
+      "reject_native_payloads": true,
+      "text_suffixes": [
+        ".rs",
+        ".rsi",
+        ".inc",
+        ".toml",
+        ".lock",
+        ".py",
+        ".sh",
+        ".c",
+        ".h",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".hpp",
+        ".go",
+        ".java",
+        ".js",
+        ".ts",
+        ".cs",
+        ".swift",
+        ".kt",
+        ".kts",
+        ".rb"
+      ],
+      "type": "workspace-artifact.v1"
+    },
+    "type": "declarative-rubric.v1"
+  },
+  "metric_ids": [],
+  "plan_sha256": "9ff47c5ce97507098ed4a8f38434ffe361e4c5b341dac88f90515d68a22bead2",
+  "protocol": "declarative-rubric.v1",
+  "schema_version": "evaluation-plan.v2",
+  "security_tier": "sealed_rescore",
+  "task_spec_sha256": "37e99a1d07e7dc1780dbd4b45c29c7c5f1a30d1d5784d3a08fe086587c9cf571"
+}

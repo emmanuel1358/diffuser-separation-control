@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -666,6 +667,7 @@ def _docker_grade_command(
     script: str,
     *,
     calibration_lock: Path | None = None,
+    verifier_capabilities: Sequence[str] = (),
 ) -> list[str]:
     """GRADE phase: run as root (so the grader can read the root-only held-out
     truth) and bind-mount the HOST ``scorer/`` over ``/mcp_server/grader`` so an
@@ -686,6 +688,8 @@ def _docker_grade_command(
     on the network-isolated Taiga sandbox, giving an unrealistic reference
     calibration; isolating the grade keeps local scores representative.
     """
+    from lbx_rl_tasks_harness.docker import docker_capability_args
+
     cmd = [
         "docker",
         "run",
@@ -694,6 +698,7 @@ def _docker_grade_command(
         TAIGA_PLATFORM,
         "--network",
         "none",
+        *docker_capability_args(verifier_capabilities),
         "-v",
         f"{cache_dir}:/tmp/output",
     ]
@@ -726,7 +731,10 @@ def _run_container_reference(
     options: ReferenceRunOptions,
     cache_dir: Path,
 ) -> ReferenceRunResult:
-    from lbx_rl_tasks_harness.docker import build_task_image
+    from lbx_rl_tasks_harness.docker import (
+        build_task_image,
+        verifier_container_capabilities,
+    )
 
     if problem.source_problem_dir is None:
         raise ValueError("reference run requires a source problem directory")
@@ -785,6 +793,7 @@ def _run_container_reference(
             container_out,
             _container_grade_script(),
             calibration_lock=src / "calibration.lock.json",
+            verifier_capabilities=verifier_container_capabilities(problem),
         )
         grade_timeout = _verifier_timeout(problem) + 300
         grader_rc, grade_out = _run_streaming(

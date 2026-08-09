@@ -35,6 +35,9 @@ examples/opensees-base-isolation/.alignerr/*
 !examples/opensees-base-isolation/.alignerr/build_proof.json
 !examples/opensees-base-isolation/.alignerr/ground_truth/
 !examples/opensees-base-isolation/.alignerr/ground_truth/**
+!examples/xfoil-rust-port/.alignerr/
+examples/xfoil-rust-port/.alignerr/*
+!examples/xfoil-rust-port/.alignerr/build_proof.json
 /.alignerr/
 .env.local
 .taiga_submit.json

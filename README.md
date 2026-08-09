@@ -1,210 +1,50 @@
 # LBX RL Tasks Template
 
-This repository is the starting point for authoring Alignerr RL tasks.
-It includes the shared grading package, local authoring utilities, starter
-templates, the local Boreal-like harness, and complete example tasks you can
-copy from while building your own task under `problems/`.
+Author workspace for Alignerr RL tasks. Clone this repo (or your assigned
+fork), scaffold under `problems/`, validate locally, and open a fork PR.
+Trusted CI and post-merge integration live in
+[`lbx-rl-tasks-iso-mothership`](https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-mothership);
+you do not need mothership access to author tasks.
 
-You do not need mothership repo access to use this repo. The normal workflow is:
-
-1. Install the local workspace with `uv sync`.
-2. Read the examples in `examples/` (MuJoCo, tabular ML, CFD/OpenFOAM, and
-   structural/OpenSees).
-3. Set `domain` in `.labelbox/problem.json` — Labelbox reads this when your PR
-   opens and shows it in the Tasks table. (Path + field are a contract with
-   Labelbox; leave the file in place.)
-4. Create your own task in `problems/<task_id>/`.
-5. Implement the task grader in `scorer/compute_score.py`.
-6. For continuous ML, commit reproducible reference/naive strategies and compose
-   hand-authored evaluation logic with `grading.evaluation.ContinuousTask`.
-7. Optionally run the ground-truth verifier for local feedback.
-8. Commit reproducible task/model source and reviewed
-   `.alignerr/ground_truth/` artifacts. Generated lock/proof files remain local;
-   trusted CI regenerates or restores the authoritative production evidence.
-9. Open a GitHub PR in **your assigned fork** (not this template repo).
-   Labelbox relays the PR to trusted-side CI, which runs the agent harness,
-   rubric QA, and Auto QA and posts a `trusted-ci/grade` check back on your PR.
-10. Read feedback on your PR, fix the same task, and push updates. Your reviewer
-   merges the PR once the check passes; submission happens after acceptance.
-
-## What This Repo Contains
-
-```text
-lbx-rl-tasks-template/
-├── pyproject.toml
-├── grader/
-│   ├── src/grading/           # Grade, RubricTask, helpers, fault types
-│   ├── src/grader_runner/     # run-grader console script
-│   └── tests/                 # shared grader tests
-├── alignerr_plugin/
-│   └── src/alignerr_plugin/
-│       ├── commands.py        # internal authoring/export helpers
-│       ├── validators/        # task validation helpers used by CI
-│       └── starter_templates/ # ml, mujoco, cfd, structures, Prometheus scaffolds
-├── harness/                   # local Boreal-like agent runner and docs
-├── examples/
-│   ├── mle-tabular-classification/      # continuous ML scoring example
-│   ├── mujoco-pendulum/                 # MuJoCo robotics reference task
-│   ├── openfoam-hydrofoil-flap/          # CFD/OpenFOAM numerical-solver example
-│   └── opensees-base-isolation/          # structural/OpenSees numerical-solver example
-├── problems/                  # put your authored tasks here
-├── docs/
-│   ├── AUTHORING.md           # task creation walkthrough
-│   ├── GRADING.md             # compute_score and grader package guide
-│   ├── TASK_MIGRATION.md      # migrate older tasks to sealed evaluation stack
-│   ├── GROUND_TRUTH.md        # oracle solution and reviewer video requirements
-│   ├── HIDDEN_ENV.md          # simulation/interaction tasks via the hidden-env RPC server
-│   ├── ML_TASKS.md            # continuous ML authoring/calibration
-│   ├── REWARD_HACKING.md      # reward-hacking mitigations every scorer must respect
-│   ├── NUMERICAL_SOLVERS.md   # installed solver inventory + invocation guide
-│   ├── RUBRIC_EVALUATION.md   # mandatory declarative RubricTask protocol
-│   └── RUBRIC_GUIDANCE.md     # rubric design principles and examples
-└── project_guidelines/
-    ├── cfd/cfd_environments.md
-    ├── mujoco_environments.md
-    └── strctural_engineering/STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md
-```
-
-The `grader/` package is installed into task Docker images so a task-local
-`scorer/compute_score.py` can import `grading`. The `harness/`
-package lets you run a local Boreal-like LLM attempt before opening a PR.
-Template PR validation only requires the deterministic ground-truth proof in
-`problems/<task_id>/.alignerr/build_proof.json` plus any renderer artifacts
-under `.alignerr/ground_truth/`. The expensive agent harness, rubric QA, and Auto QA
-run in trusted-side CI on your fork PR and post a `trusted-ci/grade` check.
-
-## First-Time Setup
-
-Install `uv` if you do not already have it, then install the workspace:
+## Quick start
 
 ```bash
 git clone https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-template.git
 cd lbx-rl-tasks-iso-template
 uv sync
 uv run lbx-rl-harness --help
+uv run lbx-rl-template --help
 ```
 
-`uv sync` installs:
+`uv sync` installs the shared `grading` package, Harbor `run-grader`, local
+harness, validators/exporters, and the `lbx-rl-template` CLI. Prefer
+`uv run ...` from the repo root.
 
-- `lbx-rl-tasks-grading`, the shared `grading` package from `grader/`.
-- `run-grader`, the Harbor-compatible grader runner.
-- `lbx-rl-tasks-harness`, the local Boreal-like runner.
-- `lbx-rl-tasks-alignerr-plugin`, internal task validation/export helpers used by CI.
-- `lbx-rl-template`, a self-contained CLI for template validation/export helpers.
+Set `domain` in `.labelbox/problem.json` before you open a PR (Labelbox contract;
+leave the file in place).
 
-You should normally run commands through `uv run ...` from the repo root.
-
-For optional local pre-submission feedback, run the deterministic ground-truth
-verifier:
+Scaffold a task (preferred):
 
 ```bash
-uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
+uv run lbx-rl-template create \
+  --name labelbox/my-task \
+  --template ml \
+  --out problems
 ```
 
-While developing the reference solution (especially ML training), use the
-lighter reference loop:
+Starters: `ml`, `mujoco`, `cfd`, `structures`, `software-engineering`,
+`prometheus-cfd`, `prometheus-structures`, `prometheus-eval-cfd`,
+`prometheus-eval-structures`. Manual `cp -R` from
+`alignerr_plugin/.../starter_templates/` still works; see
+[`docs/AUTHORING.md`](docs/AUTHORING.md).
 
-```bash
-uv run lbx-rl-harness reference --problem-dir problems/<task_id>
-uv run lbx-rl-harness reference --problem-dir problems/<task_id> --skip-solve
-```
-
-Generated locks/proofs under `problems/**` are ignored development state.
-Trusted CI checks out the immutable PR revision, generates or restores the
-authoritative evidence, and passes it to the Taiga submission job. MuJoCo
-reviewer render artifacts under `.alignerr/ground_truth/` remain reviewable
-source artifacts.
-
-Optional local modes are available when you want earlier feedback before
-spending CI/model budget:
-
-```bash
-uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime ground-truth
-uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime rubric-quality
-uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime claude-code
-uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime deepagents
-uv run lbx-rl-harness run --problem-dir problems/<task_id>
-```
-
-Local agent runs default to `claude-code`. Use this path if you have Claude Code
-available through your subscription: install the `claude` CLI, run
-`claude /login`, and the harness will use that local OAuth session without
-needing provider API keys. If you do not have a Claude Code subscription/login,
-use `--runtime deepagents` instead and configure provider keys in `.env.local`
-as shown in `.env.example`.
-
-Local agent harness runs are self-contained. On first use, the harness builds
-the required repo-local base image from this repo's `base/`, `taiga_runtime/`,
-and `grader/` directories, then builds your task image from that local base.
-CPU tasks use `lbx-tasks-base:runtime-ml-core-py313-local`; GPU tasks use
-`lbx-tasks-base-gpu:runtime-ml-core-py313-local`. This first Docker build can
-take a while because it downloads Python and ML dependencies, but it does not
-require Google Artifact Registry credentials.
-
-## The Beginner Workflow
-
-Start by reading the reference tasks. Each demonstrates a different domain and
-scoring shape:
-
-- [`examples/mujoco-pendulum/`](examples/mujoco-pendulum/) — MuJoCo robotics,
-  `task_type = "mujoco"`, `domain = "model_environment_construction"`,
-  `reward_type = "multi_deterministic_rubrics"`, required rollout video.
-- [`examples/mle-tabular-classification/`](examples/mle-tabular-classification/) —
-  tabular ML, `task_type = "ml"`,
-  `domain = "scientific_discovery_computational_science"`,
-  `reward_type = "continuous_scoring_function"`.
-- [`examples/openfoam-hydrofoil-flap/`](examples/openfoam-hydrofoil-flap/) —
-  CFD/OpenFOAM, `task_type = "cfd"`, `domain = "aerodynamics"`,
-  deterministic engineering rubric with solver-agnostic instructions and
-  solver-backed oracle/scorer code.
-- [`examples/opensees-base-isolation/`](examples/opensees-base-isolation/) —
-  structural/OpenSeesPy, `task_type = "structures"`,
-  `domain = "structural_mechanics"`, deterministic engineering score with
-  solver-backed oracle/grader scoring.
-
-These tasks show the expected files, Dockerfile copy paths, `task.toml` shape,
-`/tmp/output` convention, oracle scripts, and grader patterns.
-
-Create a new task under `problems/` by copying the starter that matches your
-`task_type` (`ml`, `mujoco`, `cfd`, or `structures`). Use the `prometheus-*`
-starters when the task should keep its task type and trusted-CI gates but route
-passing delivery to Prometheus and an independent Taiga mirror. Prometheus
-supports both non-eval and eval submissions for CFD and structures. They use
-the same CI and dual-delivery route; the only starter-level difference is
-`[delivery].eval = false`
-for non-eval starters and `[delivery].eval = true` for eval starters.
-
-```bash
-mkdir -p problems
-# ml (continuous scoring); also: mujoco | cfd | structures
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/ml problems/my-task
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/mujoco problems/reacher-control
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/cfd problems/my-cfd-case
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/structures problems/my-frame
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-cfd problems/my-prometheus-cfd-case
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-structures problems/my-prometheus-frame
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-eval-cfd problems/my-prometheus-eval-cfd-case
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-eval-structures problems/my-prometheus-eval-frame
-```
-
-Use the matching project guide:
-
-- Non-eval CFD: [`project_guidelines/cfd/prometheus_cfd_environments.md`](project_guidelines/cfd/prometheus_cfd_environments.md)
-- Eval CFD: [`project_guidelines/cfd/prometheus_eval_cfd_environments.md`](project_guidelines/cfd/prometheus_eval_cfd_environments.md)
-- Non-eval structures: [`project_guidelines/strctural_engineering/PROMETHEUS_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`](project_guidelines/strctural_engineering/PROMETHEUS_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md)
-- Eval structures: [`project_guidelines/strctural_engineering/PROMETHEUS_EVAL_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`](project_guidelines/strctural_engineering/PROMETHEUS_EVAL_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md)
-
-Each starter is intentionally minimal; copy task-specific patterns from the
-matching `examples/` reference (not the example directory itself).
-
-Then update `metadata.json` and `task.toml` so the task id and name match the
-directory:
+Update `metadata.json` and `task.toml` so ids match the directory:
 
 ```json
 {
   "benchmark": "taiga_task",
   "problem_data": {
-    "instance_id": "reacher-control",
+    "instance_id": "my-task",
     "description": "Your concise task description"
   }
 }
@@ -212,514 +52,265 @@ directory:
 
 ```toml
 [task]
-name = "labelbox/reacher-control"
+name = "labelbox/my-task"
 description = "Your concise task description"
-```
 
-Then edit the generated files, especially:
-
-- `instruction.md`: the prompt the agent sees.
-- `task.toml`: resources, outputs, timeouts, and metadata.
-- `environment/Dockerfile`: how the task image copies public data,
-  private scorer data, and the grader into the container.
-- `scorer/compute_score.py`: the Python grader.
-- `data/`: public files available to the agent at `/data/`.
-- `scorer/data/`: private files available only to the grader.
-- `solution/solve.sh`: required ground-truth solution used by validation.
-- `solution/render.sh`: required reviewer video generation for `mujoco` ground-truth solutions.
-- `baselines/naive.sh`: optional weak baseline.
-
-### Task metadata
-
-Every task must declare enum-backed `[difficulty]` metadata. The master enum
-values live in `alignerr_plugin.task_metadata`.
-
-```toml
 [difficulty]
-task_type = "mujoco" # ml | mujoco | cfd | structures
-domain = "model_environment_construction"  # enum scoped by task_type
-reward_type = "multi_deterministic_rubrics" # or continuous_scoring_function
+task_type = "ml"  # ml | mujoco | cfd | structures | software_engineering
+domain = "scientific_discovery_computational_science"
+reward_type = "continuous_scoring_function"  # or multi_deterministic_rubrics
 ```
 
-`task_type` is the broad category. `domain` is the finer diversity label used by
-the dashboard/Supabase index. `reward_type` controls the ground-truth score
-target: continuous scoring-function references should score `0.5 ± 0.05`, while
-deterministic rubric oracles should score `1.0`.
+## Required vs conditional files
 
-### Delivery platform
+**Always required** (validator schema stage):
 
-Omit `[delivery]` for the default Taiga path. Set it only when the task should
-use a non-default post-CI route:
+| File | Notes |
+| --- | --- |
+| `metadata.json` | Required. `benchmark` must be `"taiga_task"`; `problem_data.instance_id` must match the task id. |
+| `task.toml` | Config, resources, `[difficulty]`, and at least one `[[outputs]]`. |
+| `instruction.md` | Agent-facing prompt. |
+| `scorer/compute_score.py` | Grader entrypoint (`compute_score` and/or `TASK = RubricTask(...)`). |
 
-```toml
-[delivery]
-platform = "prometheus"
-```
+**Effectively required for submitted tasks:**
 
-For `cfd` and `structures`, Prometheus delivery does not change the task type or
-the numerical-solver quality gates. Trusted CI still runs the normal CFD or
-structures validation, grader QA, oracle validation, local agent score gates,
-and Auto QA; only the final delivery job changes from Taiga submission to the
-Prometheus Agent Service runner. For Prometheus CFD/structures, `trusted-ci/grade` waits on Submit Prometheus.
-The only score gate is the Prometheus target average `<= 0.5`. Standard
-deviation and the trainability audit are diagnostic context, not approval
-gates. Eval rows are accepted once trusted CI is green; Boreal QA is
-non-blocking coaching context for eval. Non-eval rows also need Boreal
-required QA complete with no unresolved critical findings before Labelbox
-review (warnings/info are fine; Boreal average is not a blocker). Self-iterate
-on clear criticals for non-eval; submit for coaching when stuck, or for
-acceptance when gates pass, and name which Boreal surface is latest.
-Submitting a non-passing non-eval row for review violates fair practices and
-may remove the tasker from the project.
+| File / artifact | When |
+| --- | --- |
+| `environment/Dockerfile` | Local/CI image build and build-proof stages. |
+| Oracle under `solution/` | Ground-truth proof (`solve.sh`, or ML committed-strategy layout). |
 
-## Requesting GPUs
+**Conditional:**
 
-**Prefer GPU.** We want GPU-accelerated tasks: `ml` tasks default to GPU (the
-`ml` starter ships `required_resources = "12vcpu+100gib+h100/2"`), and any task
-that can use acceleration should request an H100 resource enum. Pick a CPU enum
-only when a task genuinely cannot use acceleration.
+| File / artifact | When |
+| --- | --- |
+| `solution/render.sh` + `[ground_truth].render_*` | MuJoCo, or any task that declares `render_outputs`. |
+| `scorer/evaluation.plan.json` | Rubric / `RubricTask` tasks (sealed; do not hand-edit). |
+| ML manifests / committed artifacts | Continuous `ml` tasks — see [`docs/ML_TASKS.md`](docs/ML_TASKS.md). |
+| `scorer/data/env.py` + `data/env_client.py` | `[environment].hidden_env` tasks. |
+| `baselines/`, `data/`, task `README.md` | Recommended; not schema-required. Layout varies by starter. |
+| `.alignerr/build_proof.json` | Local feedback only under `problems/` (gitignored). Trusted CI regenerates the authoritative proof. |
+| `.alignerr/ground_truth/` | Commit reviewer media when render is expected. |
 
-Pick one Taiga-supported resource enum in `task.toml` under `[environment]`:
-
-```toml
-[environment]
-required_resources = "12vcpu+100gib+h100/2"
-storage_mb = 50000
-allow_internet = true
-```
-
-Available resource enums:
-
-```text
-CPU: 2vcpu+6gib, 4vcpu+16gib, 6vcpu+32gib, 8vcpu+64gib, 16vcpu+64gib, 16vcpu+128gib
-CPU perf: 2vcpu+6gib+perf, 4vcpu+16gib+perf, 6vcpu+32gib+perf, 8vcpu+64gib+perf, 16vcpu+64gib+perf, 16vcpu+128gib+perf
-TPU: 13vcpu+32gib+tpuv5e1x1, 16vcpu+64gib+tpuv5e2x2, 50vcpu+128gib+tpuv5e2x2
-H100: 3vcpu+25gib+h100/8, 6vcpu+50gib+h100/4, 12vcpu+100gib+h100/2, 24vcpu+200gib+h100/1
-H100 graphics: 3vcpu+25gib+h100/8+graphics, 6vcpu+50gib+h100/4+graphics, 12vcpu+100gib+h100/2+graphics, 24vcpu+200gib+h100/1+graphics
-```
-
-The default GPU tier is `12vcpu+100gib+h100/2` (2x H100), shipped by the `ml`
-starter. When `required_resources` is an H100 tier, the local harness
-automatically builds and uses the repo-local clean ML GPU base image,
-`lbx-tasks-base-gpu:runtime-ml-core-py313-local`. Graphics H100 tiers ending in
-`+graphics` select `cuda-graphics`; TPU tiers select the TPU base. Use
-`base_flavor = "gpu-openroad"` only for OpenROAD/EDA tasks with a non-graphics
-H100 enum.
-
-Keep `environment/Dockerfile` generic so the harness and mothership can inject
-the correct CPU or GPU base image:
-
-```dockerfile
-ARG BASE_IMAGE=lbx-tasks-base
-ARG BASE_TAG=runtime-ml-core-py313-local
-ARG PROBLEM_DIR=problems/<task_id>
-FROM ${BASE_IMAGE}:${BASE_TAG}
-```
-
-Local GPU image builds do not require Artifact Registry access, but running a
-GPU-dependent task locally requires a Docker host with NVIDIA GPU support. The
-local harness adds a runtime note for GPU/TPU tasks: the agent should make one
-quick accelerator availability probe, then fall back to CPU-compatible work
-instead of spending time debugging CUDA/TPU drivers. It must still write every
-required artifact under `/tmp/output`.
-
-Trusted CI routes GPU-configured tasks to the org `gpu` runner. TPU-configured
-tasks stay on the default CPU runner, so they should also have a quick CPU
-fallback path for the local/GitHub harness. Taiga submission remains accelerator
-backed: exported jobs keep the structured GPU/TPU runtime notice and request the
-configured accelerator resources.
-
-## Required Task Layout
-
-Each authored task should live in one directory:
+Typical layout (not every path is always present):
 
 ```text
 problems/<task_id>/
-├── task.toml
-├── metadata.json
-├── instruction.md
-├── environment/
-│   └── Dockerfile
-├── scorer/
-│   ├── compute_score.py
-│   └── data/
-├── data/
-├── solution/
-│   └── solve.sh
-├── baselines/
-│   └── naive.sh
-└── README.md
+├── metadata.json          # required
+├── task.toml              # required
+├── instruction.md         # required
+├── environment/Dockerfile # required for submit
+├── scorer/compute_score.py
+├── data/                  # optional public inputs
+├── solution/              # oracle / render scripts as needed
+├── baselines/             # optional
+└── README.md              # optional
 ```
 
-The validator requires `metadata.json`, `task.toml`, `instruction.md`,
-and `scorer/compute_score.py`. It also expects `task.toml` to declare at
-least one `[[outputs]]` entry and a `[ground_truth]` render command/video.
+## Author loop
 
-## Output Directory
+1. Edit the task under `problems/<task_id>/`.
+2. Iterate on the oracle: `uv run lbx-rl-harness reference --problem-dir problems/<task_id>`.
+3. Optional preflight: `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>`.
+4. Pre-submit check: `uv run lbx-rl-template check --problem-dir problems/<task_id>` (or `validate` for full JSON).
+5. Optional local agent / Auto QA (see below).
+6. Commit task source and, when applicable, `.alignerr/ground_truth/` media. **Do not** commit `build_proof.json` or generated calibration locks under `problems/`.
+7. Open a PR in **your assigned fork** (not this template repo). Keep one task per PR.
 
-Always ask the agent to write final artifacts under `/tmp/output`.
+## Artifacts policy
 
-Good output paths:
+Local `--runtime ground-truth` writes development evidence under
+`problems/<task_id>/.alignerr/`. That path is gitignored except
+`.alignerr/ground_truth/` reviewer media.
 
-```text
-/tmp/output/model.xml
-/tmp/output/policy.py
-/tmp/output/submission.csv
-/tmp/output/answer.md
-```
-
-Avoid `/workspace` for final answers, submissions, policies, MJCF files,
-or other graded artifacts. The grader receives `/tmp/output` as its
-`workspace` argument.
-
-## Writing `compute_score.py`
-
-Every task has exactly one grader entrypoint:
-
-```python
-from pathlib import Path
-
-def compute_score(workspace: Path, trajectory, private: Path):
-    ...
-```
-
-The arguments are:
-
-- `workspace`: the agent output directory, usually `/tmp/output`.
-- `trajectory`: reserved for future trajectory data; it is usually `None`
-  today.
-- `private`: the hidden grader data directory, copied from `scorer/data/`.
-
-Continuous/legacy `compute_score()` may return one of three deterministic shapes:
-
-- A `float` in `[0, 1]` for a single continuous score.
-- A `dict` with at least `score`, plus optional `subscores`, `weights`,
-  and `metadata`.
-- A canonical `Grade`.
-
-For continuous reward functions, follow
-[`docs/CONTINUOUS_EVALUATION.md`](docs/CONTINUOUS_EVALUATION.md). New tasks use
-queryable post-commit challenges; `ContinuousTask` owns registered metrics,
-reviewed floors, information certificates, generated calibration, and the PWL
-quality mapping.
-
-Every `multi_deterministic_rubrics` task must declare `TASK = RubricTask(...)`.
-The shared runner invokes it directly; rubric authors do not define
-`compute_score()` or hand-write artifact/error/aggregation plumbing:
-
-```python
-from grading.evaluation import JsonArtifact, RubricCriterion, RubricTask
-
-def evaluate(context):
-    return {"answer_present": bool(context.candidate)}
-
-TASK = RubricTask(
-    artifact=JsonArtifact("answer.json"),
-    criteria=(RubricCriterion("answer_present", required=True),),
-    evaluate=evaluate,
-)
-```
-
-Read [`docs/GRADING.md`](docs/GRADING.md) for the full grading contract,
-helper API, return shapes, Harbor outputs, and common patterns. Read
-[`docs/RUBRIC_EVALUATION.md`](docs/RUBRIC_EVALUATION.md) for artifact schemas,
-numeric/solver APIs, fault attribution, plans, and migration. Read
-[`docs/RUBRIC_GUIDANCE.md`](docs/RUBRIC_GUIDANCE.md) before writing
-criteria so the rubric stays task-specific, measurable, and
-not overly prescriptive.
-
-Important: rubric criteria must be deterministic Python checks. Do not use
-LLMs as judges in rubric evaluation; model calls make rewards non-reproducible
-and are not allowed for submitted task rubrics.
-
-## Using The Example Tasks
-
-`examples/mujoco-pendulum/` is the canonical rubric-style reference. It
-demonstrates:
-
-- A complete `task.toml` with `/tmp/output/model.xml` as the required
-  output.
-- A Dockerfile that installs the shared `grader/` package and copies the
-  task scorer into `/mcp_server/grader/`.
-- Public `data/` versus private `scorer/data/`.
-- A deterministic `RubricTask` registration with ten criteria and no
-  author-owned score/error plumbing.
-- Optional solution and baseline scripts.
-
-`examples/mle-tabular-classification/` is the canonical continuous-scored ml
-reference. It demonstrates:
-
-- A synthetic tabular train/test task.
-- Public parquet files in `data/` and hidden ground truth in
-  `scorer/data/`.
-- A queryable `predictor.py`, private challenge bank, `ContinuousTask.model()`,
-  and framework-generated `calibration.lock.json`.
-- No rubrics / no `RubricTask`; the score is a continuous function
-  of certified hidden-challenge quality.
-
-Use examples as patterns, but create your actual work under `problems/`,
-not under `examples/`.
-
-## Optional Local Validation
-
-Run the ground-truth verifier when you want pre-PR feedback:
+- **Do not commit** `build_proof.json` or generated calibration lock/evidence for
+  authored tasks under `problems/`.
+- **Do commit** reviewed media under `.alignerr/ground_truth/` when render is
+  expected (typically MuJoCo).
+- Trusted CI checks out the immutable PR revision, runs ground-truth, then
+  verifies the CI-generated proof before grading and Taiga submission.
 
 ```bash
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
+git add problems/<task_id>
+# If render artifacts exist:
+git add problems/<task_id>/.alignerr/ground_truth/
 ```
 
-For v3 continuous ML, it validates reference/naive strategies, measures raw
-metrics, generates and replays the PWL calibration, and atomically updates
-ignored development state:
+Details: [`docs/GROUND_TRUTH.md`](docs/GROUND_TRUTH.md).
+
+## What CI runs where
+
+| Surface | What runs |
+| --- | --- |
+| This template repo | Shared package tests (`python-ci.yml`) and example contract checks. No full task grade. |
+| Your fork PR | Labelbox relays to mothership trusted CI (`trusted-ci/grade`): ground-truth, proof verify, validate, harness/rubric QA, Auto QA, advisory Taiga. |
+
+Gate map for maintainers:
+[mothership `docs/QA_PIPELINE.md`](https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-mothership/blob/main/docs/QA_PIPELINE.md).
+
+## Repo layout
 
 ```text
-problems/<task_id>/calibration.lock.json
-problems/<task_id>/.alignerr/calibration.evidence.json
+lbx-rl-tasks-iso-template/
+├── grader/                 # shared grading package + Harbor runner
+├── alignerr_plugin/        # validators, exporters, starter_templates/
+├── harness/                # local Boreal-like agent runner
+├── examples/               # reference tasks (patterns only)
+├── problems/               # put authored tasks here
+├── docs/                   # authoring / grading / domain guides
+├── project_guidelines/     # long-form domain handbooks
+├── base/                   # local base-image build context
+└── taiga_runtime/          # rubric runtime used by local images
 ```
 
-Commit strategy manifests/artifacts, task source, explicit non-tabular
-no-information workspaces, and required reviewer artifacts;
-do not commit generated calibration files. Trusted CI computes a semantic cache
-key, restores or regenerates the authoritative bundle from the immutable PR
-revision, and promotes that exact lock to Taiga as a read-only mount.
+On first local run the harness builds a repo-local base from `base/`,
+`taiga_runtime/`, and `grader/` (no Artifact Registry needed). CPU:
+`lbx-tasks-base:runtime-ml-core-py313-local`. GPU:
+`lbx-tasks-base-gpu:runtime-ml-core-py313-local`.
 
-Optional local modes are available while iterating:
+## Examples
 
-```bash
-uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime ground-truth
-uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime rubric-quality
-uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime claude-code
-```
+Use `examples/` as patterns; submit new work under `problems/`.
 
-The same commands work for checked-in examples by replacing `problems/<task_id>`
-with `examples/<example_id>`. For example, to verify the MuJoCo pendulum example
-end to end, including the required reviewer video render:
+| Example | `task_type` | `reward_type` |
+| --- | --- | --- |
+| [`mujoco-pendulum`](examples/mujoco-pendulum/) | `mujoco` | `multi_deterministic_rubrics` |
+| [`mle-tabular-classification`](examples/mle-tabular-classification/) | `ml` | `continuous_scoring_function` |
+| [`hidden-env-bandit`](examples/hidden-env-bandit/) | `ml` | `continuous_scoring_function` |
+| [`openfoam-hydrofoil-flap`](examples/openfoam-hydrofoil-flap/) | `cfd` | `multi_deterministic_rubrics` |
+| [`opensees-base-isolation`](examples/opensees-base-isolation/) | `structures` | `multi_deterministic_rubrics` |
+| [`wal-recovery-ordering`](examples/wal-recovery-ordering/) | `software_engineering` | `multi_deterministic_rubrics` |
+| [`xfoil-rust-port`](examples/xfoil-rust-port/) | `software_engineering` | `multi_deterministic_rubrics` |
+| [`frontier-service-cutover`](examples/frontier-service-cutover/) | `software_engineering` | `multi_deterministic_rubrics` |
+| [`frontier-mcp-workspace`](examples/frontier-mcp-workspace/) | `software_engineering` | `multi_deterministic_rubrics` |
 
-```bash
-uv run lbx-rl-harness run --problem-dir examples/mujoco-pendulum --runtime ground-truth
-uv run lbx-rl-harness run --problem-dir examples/mujoco-pendulum --runtime rubric-quality
-uv run lbx-rl-harness run --problem-dir examples/mujoco-pendulum --runtime claude-code
-```
+See [`examples/README.md`](examples/README.md) for expected scores and how to run them.
 
-For MuJoCo tasks, `--runtime ground-truth` runs `solution/solve.sh`, grades the
-oracle output, and runs the configured ground-truth render command. A passing
-run prints `review_artifact: .alignerr/ground_truth/...` for each generated
-review artifact.
+## Task metadata and delivery
 
-## Trusted CI On Your Fork PR
+Every task declares enum-backed `[difficulty]` metadata (`task_type`, `domain`,
+`reward_type`). Master enums live in `alignerr_plugin.task_metadata`.
 
-When you open or update a PR in your assigned fork, Labelbox relays it to
-trusted-side CI in `lbx-rl-tasks-iso-mothership`. That workflow:
+- Continuous references should score about `0.5 ± 0.05`.
+- Deterministic rubric oracles should score `1.0`.
 
-- reruns proof checks, ground-truth checks, static task validation, and Boreal
-  metadata export;
-- runs the DeepAgents AI harness using org-level secrets;
-- runs rubric QA and Auto QA from the CI-generated proof;
-- posts a `trusted-ci/grade` check and summary comment on your fork PR;
-- submits a fire-and-forget Taiga eval job for advisory downstream feedback.
+Omit `[delivery]` for default Taiga. Set `platform = "prometheus"` only for
+Prometheus CFD/structures routes (non-eval vs eval starters differ by
+`[delivery].eval`). Software-engineering acceptance still requires trusted CI
+green and Boreal aggregate `<= 0.4`. Non-eval CFD/structures may submit for
+review through **either** score lane — Prometheus (CI + mean `<= 0.6` + stddev
+`>= 0.08`) or Achilles (CI + Boreal mean `<= 0.4`). Both lanes additionally
+require completed Boreal QA with no undocumented criticals; see
+[`docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md)
+and [`docs/AUTHORING.md`](docs/AUTHORING.md).
 
-You do not need mothership access. Push fixes to the same fork PR; trusted CI
-reruns automatically on each sync.
+**Prefer GPU.** `ml` defaults to H100 (`12vcpu+100gib+h100/2`). Use a CPU enum
+only when acceleration is impossible. Keep Dockerfiles generic
+(`ARG BASE_IMAGE` / `ARG BASE_TAG`) so harness/CI can inject the correct base.
+Resource enums and base flavors: [`docs/AUTHORING.md`](docs/AUTHORING.md).
 
-## Optional Local Agent And Auto QA Runs
+ML tasks must keep `allow_internet = false` and declare
+`[difficulty].license` (prefer `self_generated` for synthetic data, or a
+permissive SPDX id with `license_source`). `not_applicable` remains a
+back-compat alias for `self_generated`.
 
-You can still run the full agent harness locally if you want earlier feedback:
+## Output directory and grading
+
+Ask the agent to write final artifacts under `/tmp/output`. The grader receives
+that path as `workspace`.
+
+- Continuous / legacy: implement `compute_score(workspace, trajectory, private)`.
+- Rubric tasks: declare `TASK = RubricTask(...)` (no author-owned score plumbing);
+  commit sealed `scorer/evaluation.plan.json`.
+
+Details: [`docs/GRADING.md`](docs/GRADING.md),
+[`docs/RUBRIC_EVALUATION.md`](docs/RUBRIC_EVALUATION.md),
+[`docs/RUBRIC_GUIDANCE.md`](docs/RUBRIC_GUIDANCE.md). Criteria must be
+deterministic Python — no LLM judges.
+
+## Local agent and Auto QA (optional)
+
+Local agent runs default to `claude-code` (Claude CLI + `claude /login`). Without
+that subscription, use `--runtime deepagents` and `.env.local` from
+`.env.example`.
 
 ```bash
 uv run lbx-rl-harness run --problem-dir problems/<task_id>
-```
-
-For the default `claude-code` runtime, use your Claude Code subscription: install
-the `claude` CLI and run `claude /login` first. If you do not have Claude Code
-subscription access, run the provider-key path instead:
-
-```bash
 uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime deepagents
-```
-
-Configure `.env.local` from `.env.example` for `--runtime deepagents`; CI uses
-org secrets.
-
-Auto QA can also be run locally after a local agent proof exists:
-
-```bash
+uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime rubric-quality
 uv run lbx-rl-harness autoqa --problem-dir problems/<task_id>
 ```
 
-To keep the submitted proof untouched and write local artifacts under
-`.harness-runs/`, use:
-
-```bash
-uv run lbx-rl-harness autoqa \
-  --problem-dir problems/<task_id> \
-  --output-proof-path .harness-runs/autoqa/<task_id>/build_proof.json \
-  --output-json .harness-runs/autoqa/<task_id>/auto_qa.json
-```
-
-## Open A Pull Request
-
-When your task is ready, open a GitHub PR in **your assigned fork** (not this
-template repo). Keep each task PR focused on exactly one task directory under
-`problems/<task_id>/`.
-
-Before opening the PR:
+## Open a fork PR
 
 ```bash
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
-git status --short
-git add problems/<task_id> problems/<task_id>/.alignerr/build_proof.json problems/<task_id>/.alignerr/ground_truth/
-```
-
-Do not open the PR until `build_proof.json` is present in `git status` and
-included in your commit. If you edit task files after generating the proof,
-rerun the ground-truth verifier so the proof hash matches the final task
-contents.
-Do not commit `.env.local`, `.harness-runs/`, provider keys, or other secrets.
-
-Trusted CI runs automatically when your fork PR opens or updates.
-
-## Feedback On Your PR
-
-Alignerrs do not need mothership access. All feedback appears on the fork PR
-you opened.
-
-Feedback can come from:
-
-- the `trusted-ci/grade` check and its summary comment,
-- CI agent harness trajectory and score summaries,
-- rubric QA and Auto QA summaries,
-- Taiga/Boreal polling comments (advisory),
-- reviewer comments before merge.
-
-The intended feedback loop is:
-
-1. Open or update your fork PR with a fresh ground-truth proof.
-2. Trusted CI runs the full QA stack and posts `trusted-ci/grade`.
-3. Taiga results arrive later as advisory comments on the same fork PR.
-4. Your reviewer merges the fork PR once the check passes.
-5. After merge, accepted task content integrates into the solution repo.
-
-If feedback requests changes, do this:
-
-```bash
-# Edit files under problems/<task_id>/
-uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
-git status --short
-git add problems/<task_id> problems/<task_id>/.alignerr/build_proof.json problems/<task_id>/.alignerr/ground_truth/
-git commit -m "Address review feedback"
+uv run lbx-rl-template check --problem-dir problems/<task_id>
+git add problems/<task_id>
+git add problems/<task_id>/.alignerr/ground_truth/   # only if render media exists
+git status --short   # confirm no build_proof.json / secrets
+git commit -m "Add problems/<task_id>"
 git push
 ```
 
-Each push to your fork PR reruns trusted CI automatically.
+Do not commit `.env.local`, `.harness-runs/`, provider keys, or credentials.
+Push fixes to the same fork PR; trusted CI reruns on each sync. Feedback appears
+on the fork PR (`trusted-ci/grade`, harness/rubric/Auto QA, advisory Taiga).
 
-## Command Reference
+## Command reference
 
-Common local commands:
+### `lbx-rl-harness`
 
-- `lbx-rl-harness run --problem-dir problems/<task_id>`:
-  optional local Claude Code agent harness and rubric quality review.
-- `lbx-rl-harness run --problem-dir problems/<task_id> --runtime ground-truth`:
-  required pre-PR check. Runs only the checked-in solution/reference path. For
-  `mujoco` tasks this records `ground_truth_result` and rendering artifacts.
-- `lbx-rl-harness run --problem-dir problems/<task_id> --runtime claude-code`:
-  run the AI agent harness through the local Claude Code CLI/OAuth path.
-- `lbx-rl-harness run --problem-dir problems/<task_id> --runtime deepagents`:
-  run the AI agent harness through DeepAgents and provider API keys.
-- `lbx-rl-harness run --problem-dir problems/<task_id> --runtime rubric-quality`:
-  run the no-agent grading/rubric-quality path. Alias: `--runtime noop`.
-- `lbx-rl-harness autoqa --problem-dir problems/<task_id>`:
-  optional local Auto QA review using an existing local agent proof.
-- `lbx-rl-template validate --problem-dir problems/<task_id>`:
-  internal static template validation used by CI; authors normally rely on PR
-  validation rather than running this directly.
-- `lbx-rl-template export-taiga --problem-dir problems/<task_id> --out problems-metadata.json --image PLACEHOLDER`:
-  internal Boreal/Taiga metadata export used by template and mothership CI.
-- `lbx-rl-harness run-taiga --metadata problems-metadata.json --source-problem-dir problems/<task_id>`:
-  run a local Boreal payload while using the source task scorer for grading.
-- `lbx-rl-harness run-harbor --task-dir harbor-export --source-problem-dir problems/<task_id>`:
-  run a local Harbor export and write Harbor-style verifier logs.
+| Command | Purpose |
+| --- | --- |
+| `reference` | Day-to-day solve/grade loop for the oracle. |
+| `run` | Full local run; use `--runtime ground-truth`, `rubric-quality`, `claude-code`, or `deepagents`. |
+| `verify-ground-truth` | Convenience wrapper for the ground-truth runtime. |
+| `autoqa` | Local Auto QA from an existing proof. |
+| `run-taiga` | Local Boreal metadata / job payload. |
+| `run-harbor` | Local Harbor export directory. |
+| `calibration-key` | Print continuous-ML calibration cache key. |
 
-## Testing Shared Package Changes
+### `lbx-rl-template`
 
-If you change `grader/`, `harness/`, or task helper packages, run the Python tests:
+| Command | Purpose |
+| --- | --- |
+| `create` / `new` | Scaffold from a starter template. |
+| `check` | Human-friendly pre-submit preflight. |
+| `validate` | Full validator JSON (CI-shaped). |
+| `export-taiga` | Boreal/Taiga metadata export. |
+| `export-harbor` | Harbor directory export. |
+| `export-capsule` | Outer Taiga capsule bundle for multi-service tasks. |
+| `lint-reward-hacks` | Advisory reward-hacking lint. |
+| `migrate-legacy-mujoco` | Legacy MuJoCo path migration. |
+
+Also: `run-grader` (Harbor in-container grader) after `uv sync`.
+
+## Testing shared package changes
 
 ```bash
 uv sync --all-packages
 uv run --no-sync pytest -ra grader/tests harness/tests
 ```
 
-Both suites are named explicitly and the sync uses `--all-packages` so this
-runs the same way here and in the consumer repos that
-`sync-shared-from-template.yml` copies this README into. In this repo a bare
-`uv run pytest` happens to be equivalent, but downstream it is not: `pytest`
-with no arguments picks up that repo's own `testpaths` instead, and a plain
-`uv sync` installs neither `grader/` nor `harness/` — they are workspace
-members the root project there does not depend on — so both suites stop at
-collection with `ModuleNotFoundError` rather than running. `-ra` prints the
-reason for every skip, which downstream is how you tell a missing fixture apart
-from lost coverage.
+Root discovery excludes `problems/` and `examples/`. Task validation is via
+harness + `lbx-rl-template` + trusted CI.
 
-The root test configuration intentionally excludes `problems/` and
-`examples/` from pytest discovery and Ruff linting. Task-specific validation
-happens through the local harness and PR validation.
+## Docs index
 
-## Pull Request Expectations
+| Audience | Start here |
+| --- | --- |
+| First task | [`docs/AUTHORING.md`](docs/AUTHORING.md), [`problems/README.md`](problems/README.md) |
+| Grading / rubrics | [`docs/GRADING.md`](docs/GRADING.md), [`docs/RUBRIC_EVALUATION.md`](docs/RUBRIC_EVALUATION.md), [`docs/RUBRIC_GUIDANCE.md`](docs/RUBRIC_GUIDANCE.md) |
+| Ground truth / proof | [`docs/GROUND_TRUTH.md`](docs/GROUND_TRUTH.md) |
+| Continuous ML | [`docs/ML_TASKS.md`](docs/ML_TASKS.md), [`docs/CONTINUOUS_EVALUATION.md`](docs/CONTINUOUS_EVALUATION.md) |
+| Hidden env | [`docs/HIDDEN_ENV.md`](docs/HIDDEN_ENV.md) |
+| Software engineering | [`docs/SOFTWARE_ENGINEERING_FRAMEWORK.md`](docs/SOFTWARE_ENGINEERING_FRAMEWORK.md), [`project_guidelines/software_engineering/`](project_guidelines/software_engineering/) |
+| CFD / structures | [`docs/NUMERICAL_SOLVERS.md`](docs/NUMERICAL_SOLVERS.md), [`project_guidelines/cfd/`](project_guidelines/cfd/), [`project_guidelines/strctural_engineering/`](project_guidelines/strctural_engineering/) |
+| CFD / structures submit lanes | [`docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md) |
+| Migration | [`docs/TASK_MIGRATION.md`](docs/TASK_MIGRATION.md) |
+| Reward hacking | [`docs/REWARD_HACKING.md`](docs/REWARD_HACKING.md), [`docs/POLICY_ISOLATION.md`](docs/POLICY_ISOLATION.md) |
+| Agent rules | [`AGENTS.md`](AGENTS.md) |
 
-For task work, keep each PR focused on exactly one task directory under
-`problems/<task_id>/`. Shared changes to docs, `grader/`, `harness/`, or
-task helper packages may be included when they are required for that task.
-You may also open focused PRs to improve any part of this codebase, including
-shared grading utilities, harness behavior, validators, examples, starter
-templates, documentation, or CI workflows.
-
-Opening a PR in your assigned fork that changes a task under `problems/<task_id>/`
-runs trusted CI automatically. This template repo
-should not contain checked-in Boreal, GCP, Artifact Registry, Harbor, or provider
-API secrets.
-
-## More Reading
-
-- [`docs/TASK_MIGRATION.md`](docs/TASK_MIGRATION.md): authoritative guide for
-  migrating older tasks onto sealed continuous calibration, `RubricTask`, and
-  sealed `evaluation.plan.json`.
-- [`docs/AUTHORING.md`](docs/AUTHORING.md): task creation walkthrough.
-- [`docs/GRADING.md`](docs/GRADING.md): detailed grader package guide.
-- [`docs/RUBRIC_EVALUATION.md`](docs/RUBRIC_EVALUATION.md): mandatory
-  declarative rubric API, hardening, plans, fault semantics, and migration.
-- [`docs/ML_TASKS.md`](docs/ML_TASKS.md): authoring continuous-scored `ml` tasks
-  (dataset/CSV, model module, executable, HDF5, k-fold) -- submission loaders,
-  calibration, licensing, mounts, and base flavors.
-- [`docs/HIDDEN_ENV.md`](docs/HIDDEN_ENV.md): simulation / interaction tasks where
-  the agent probes a black-box environment over an RPC socket
-  (`[environment].hidden_env`, the env server, `load_submitted_policy`).
-- [`docs/REWARD_HACKING.md`](docs/REWARD_HACKING.md): the reward-hacking
-  mitigations the grader enforces and what every scorer must do to stay inside
-  them.
-- [`docs/NUMERICAL_SOLVERS.md`](docs/NUMERICAL_SOLVERS.md): installed
-  numerical-solver stack and invocation patterns.
-- [`docs/POLICY_ISOLATION.md`](docs/POLICY_ISOLATION.md): safe out-of-process
-  execution for submitted `policy.py` / `controller.py` code.
-- [`docs/RUBRIC_GUIDANCE.md`](docs/RUBRIC_GUIDANCE.md): rubric design
-  principles, examples, and common pitfalls.
-- [`examples/mle-tabular-classification/`](examples/mle-tabular-classification/):
-  continuous ML scoring reference task.
-- [`examples/mujoco-pendulum/`](examples/mujoco-pendulum/): complete
-  MuJoCo robotics reference task.
-- [`examples/openfoam-hydrofoil-flap/`](examples/openfoam-hydrofoil-flap/):
-  CFD/OpenFOAM numerical-solver reference task.
-- [`examples/opensees-base-isolation/`](examples/opensees-base-isolation/):
-  structural/OpenSeesPy numerical-solver reference task.
-- [`project_guidelines/mujoco_environments.md`](project_guidelines/mujoco_environments.md):
-  MuJoCo task design guidance.
-- [`project_guidelines/cfd/cfd_environments.md`](project_guidelines/cfd/cfd_environments.md):
-  CFD task design guidance for AVL and OpenFOAM.
-- [`project_guidelines/cfd/prometheus_cfd_environments.md`](project_guidelines/cfd/prometheus_cfd_environments.md):
-  non-eval Prometheus CFD task guidance.
-- [`project_guidelines/cfd/prometheus_eval_cfd_environments.md`](project_guidelines/cfd/prometheus_eval_cfd_environments.md):
-  eval Prometheus CFD task guidance.
-- [`project_guidelines/strctural_engineering/STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`](project_guidelines/strctural_engineering/STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md):
-  structural engineering task guidance for OpenSeesPy.
-- [`project_guidelines/strctural_engineering/PROMETHEUS_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`](project_guidelines/strctural_engineering/PROMETHEUS_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md):
-  non-eval Prometheus structures task guidance.
-- [`project_guidelines/strctural_engineering/PROMETHEUS_EVAL_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`](project_guidelines/strctural_engineering/PROMETHEUS_EVAL_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md):
-  eval Prometheus structures task guidance.
+Historical snapshot (not current policy):
+[`docs/QA_TRIAGE_2026-07-24.md`](docs/QA_TRIAGE_2026-07-24.md).

@@ -101,6 +101,8 @@ Rubric task code may:
 - call `context.trusted_operation(...)` for trusted model/configuration work;
 - call `context.policy(...)` for agent Python;
 - call `context.run_solver(...)` for bounded trusted executables;
+- call `context.run_candidate(...)` for uid-dropped workspace builds and
+  executables;
 - return a criterion mapping or `RubricEvaluation`.
 
 Rubric task code must not:
@@ -181,6 +183,31 @@ privilege-dropped worker executes that immutable source. Parent-directory and
 leaf symlink swaps are rejected. `context.candidate.path` is the immutable
 grader-owned copy; `context.policy()` preserves the submitted module's original
 `__file__` and sibling-import directory while executing those captured bytes.
+
+### `WorkspaceArtifact`
+
+Use for repository-level software transformation, build, or debugging tasks:
+
+```python
+WorkspaceArtifact(
+    "repo",
+    clean_paths=("target",),
+    forbidden_suffixes=(".o", ".so", ".exe"),
+    forbidden_text_patterns=("std::process::Command", 'extern "C"'),
+    text_suffixes=(".rs", ".toml"),
+)
+```
+
+The framework removes declared top-level caches before committing the replay
+digest, rejects undeclared sibling outputs, and traverses every directory and
+file through pinned no-follow descriptors. Validated bytes are copied into an
+immutable grader-owned master, and that stable copy—not the live agent path—is
+committed. Symlinks, special files, oversized trees/files, bundled native
+payload magic, and task-declared source patterns are rejected before a typed
+`SubmittedWorkspace` reaches evaluator code.
+
+See [`SOFTWARE_TRANSFORMATION_TASKS.md`](SOFTWARE_TRANSFORMATION_TASKS.md) for
+the complete repository-task contract.
 
 ### `TrustedJson`
 
@@ -272,6 +299,79 @@ The shared runner:
 - raises `GraderFault` for launch/environment failures.
 
 No `TimeoutExpired` escapes into the grader process.
+
+## Bounded candidate build and execution
+
+`WorkspaceArtifact` evaluators run agent-controlled build tools and executables
+through the shared candidate boundary:
+
+```python
+build = context.run_candidate(
+    ["cargo", "build", "--release", "--offline"],
+    env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"},
+    timeout_s=1200,
+)
+if build.returncode:
+    context.reject_candidate("candidate build failed")
+```
+
+The process runs as the non-root identity selected by `RUBRIC_AGENT_USER` or
+the paired `RUBRIC_AGENT_UID`/`RUBRIC_AGENT_GID` settings. The boundary fails
+closed if the verifier cannot establish that identity. Each call copies the
+immutable committed master into a disposable bounded worktree, chowns only
+that clone, enters it through a pinned no-follow cwd descriptor, and securely
+removes it after execution. The runner uses a sanitized or explicitly supplied
+environment, bounded stdout, and optional trusted stdin. Timeouts and output
+floods kill and reap the full process group and become `AgentFault` zeros
+rather than free-veto infrastructure failures.
+
+For repeated deterministic checks, declare an immutable candidate suite:
+
+```python
+from grading.evaluation import CandidateCommandSpec
+
+SUITE = CandidateCommandSpec(
+    argv=("cargo", "run", "--release", "--offline", "--", "--jsonl"),
+    cwd=".",
+    stdin_bytes=b'{"case":1}\n{"case":2}\n',
+    timeout_s=30,
+    max_output_bytes=1024 * 1024,
+    repeats=3,
+    allowed_return_codes=(0,),
+    deterministic_stdout=True,
+    max_attempt_elapsed_s=2.0,
+    max_total_elapsed_s=6.0,
+)
+
+
+def evaluate(context):
+    result = context.run_candidate_suite(SUITE)
+    rows = result.attempts[0].parse_jsonl(
+        context,
+        expected_lines=2,
+        reject_duplicate_lines=True,
+    )
+    return {"quality": check_rows(rows)}
+```
+
+Every attempt starts from a new clone of the same committed
+`WorkspaceArtifact` master and uses the secure `run_candidate` boundary.
+Filesystem mutations are discarded between calls, so commands must emit
+needed evidence through captured stdout (or another explicitly managed output
+channel) rather than relying on a later attempt to see build artifacts. A
+non-empty `env` is the explicit child environment apart from framework-owned
+identity variables; an empty `env` uses the shared sanitized default. Invalid
+return codes, nondeterministic stdout, performance-budget overruns, timeouts,
+and output floods are `AgentFault`. The typed result reports process metadata
+and raw stdout only—it never interprets candidate text as a score.
+
+`CandidateCommandSpec.spec_dict()` is a stable JSON-serializable plan fragment
+(stdin is represented by size and SHA-256). Authors may include that fragment
+in a sealed plan they define; existing `RubricTask` plans are unchanged merely
+by importing or running this API. `parse_candidate_json()` and
+`parse_candidate_jsonl()` provide strict UTF-8, duplicate-key, shape, byte, and
+line bounds under `candidate_operation`; JSONL can additionally enforce exact
+line counts and reject duplicate documents.
 
 ## Fault and episode semantics
 
@@ -383,3 +483,10 @@ Canonical migrations are under:
 - `examples/mujoco-pendulum/`
 - `examples/opensees-base-isolation/`
 - `examples/openfoam-hydrofoil-flap/`
+- [`wal-recovery-ordering`](https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-template/tree/main/examples/wal-recovery-ordering)
+- [`xfoil-rust-port`](https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-template/tree/main/examples/xfoil-rust-port)
+- [`frontier-service-cutover`](https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-template/tree/main/examples/frontier-service-cutover)
+- [`frontier-mcp-workspace`](https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-template/tree/main/examples/frontier-mcp-workspace)
+
+For the complete software task framework, see
+[`SOFTWARE_ENGINEERING_FRAMEWORK.md`](SOFTWARE_ENGINEERING_FRAMEWORK.md).

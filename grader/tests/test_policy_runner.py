@@ -549,7 +549,6 @@ def _run_preexec_capturing_status(
     r, w = os.pipe()
     try:
         policy_runner._agent_preexec(1234, 1235, ipc_status_fd=w)()
-        os.close(w)
         w = -1
         data = os.read(r, 1)
     finally:

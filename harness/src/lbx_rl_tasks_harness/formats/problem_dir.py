@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
+from typing import Any
 
+from alignerr_plugin.capabilities import is_capability_task
 from alignerr_plugin.exporters.taiga import build_job_payload
 from alignerr_plugin.schemas import TaskToml
 from alignerr_plugin.utils import load_metadata, load_task_toml, read_prompt, task_id
@@ -12,6 +15,48 @@ from lbx_rl_tasks_harness.models import (
     OutputSpec,
     ReferenceSpec,
 )
+
+
+class LazyTaigaProblem(Mapping[str, Any]):
+    """Build optional Taiga metadata only when a Taiga consumer requests it."""
+
+    def __init__(
+        self, problem_dir: Path, factory: Callable[[], dict[str, Any]]
+    ) -> None:
+        self._problem_dir = problem_dir
+        self._factory = factory
+        self._value: dict[str, Any] | None = None
+        self._error: ValueError | None = None
+
+    def _load(self) -> dict[str, Any]:
+        if self._value is not None:
+            return self._value
+        if self._error is not None:
+            raise self._error
+        try:
+            self._value = self._factory()
+        except (OSError, TypeError, ValueError) as exc:
+            self._error = ValueError(
+                "Taiga metadata projection is unavailable for "
+                f"{self._problem_dir}: {exc}"
+            )
+            raise self._error from exc
+        return self._value
+
+    def __getitem__(self, key: str) -> Any:
+        return self._load()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._load())
+
+    def __len__(self) -> int:
+        return len(self._load())
+
+    def __repr__(self) -> str:
+        state = "loaded" if self._value is not None else "pending"
+        if self._error is not None:
+            state = "unavailable"
+        return f"LazyTaigaProblem({self._problem_dir!s}, {state})"
 
 
 def task_toml_metadata(task_toml: TaskToml) -> dict:
@@ -35,10 +80,15 @@ def load_problem_dir(problem_dir: Path) -> HarnessProblem:
     scorer_dir = problem_dir / "scorer"
     grader_dir = scorer_dir
     private_dir = scorer_dir / "data"
-    taiga_problem = build_job_payload(problem_dir, image_ref="LOCAL_IMAGE")[
-        "problems_metadata"
-    ]["problem_set"]["problems"][0]
-    _apply_prompt_to_taiga_problem(taiga_problem, prompt)
+
+    def build_taiga_problem() -> dict[str, Any]:
+        taiga_problem = build_job_payload(
+            problem_dir,
+            image_ref="LOCAL_IMAGE",
+            image_is_outer_capsule=is_capability_task(task_toml),
+        )["problems_metadata"]["problem_set"]["problems"][0]
+        _apply_prompt_to_taiga_problem(taiga_problem, prompt)
+        return taiga_problem
 
     return HarnessProblem(
         id=task_id(problem_dir),
@@ -78,7 +128,7 @@ def load_problem_dir(problem_dir: Path) -> HarnessProblem:
         required_resources=task_toml.environment.required_resources,
         required_tools=list(task_toml.runner.required_tools),
         metadata={"benchmark": metadata.benchmark, **task_toml_metadata(task_toml)},
-        taiga_problem=taiga_problem,
+        taiga_problem=LazyTaigaProblem(problem_dir, build_taiga_problem),
     )
 
 

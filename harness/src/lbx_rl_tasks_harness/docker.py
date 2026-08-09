@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from alignerr_plugin.proof import write_build_proof
 from lbx_rl_tasks_harness.models import HarnessProblem
 
 TAIGA_PLATFORM = "linux/amd64"
+_ALLOWED_VERIFIER_CAPABILITIES = frozenset({"SYS_PTRACE"})
 
 
 @dataclass(frozen=True)
@@ -61,9 +63,7 @@ def resolve_task_build(problem_dir: Path, repo_root: Path) -> tuple[Path, list[s
     return problem_dir / "environment" / "Dockerfile", []
 
 
-def build_task_image(
-    problem: HarnessProblem, *, write_proof: bool = True
-) -> TaskBuild:
+def build_task_image(problem: HarnessProblem, *, write_proof: bool = True) -> TaskBuild:
     if problem.source_problem_dir is None:
         raise RuntimeError(
             "agent harness runtimes require --source-problem-dir for exported formats"
@@ -116,7 +116,37 @@ def build_task_image(
     return TaskBuild(image_tag=image_tag)
 
 
-def start_task_container(image_tag: str) -> StartedContainer:
+def verifier_container_capabilities(problem: HarnessProblem) -> tuple[str, ...]:
+    verifier = problem.metadata.get("verifier")
+    raw = verifier.get("capabilities", []) if isinstance(verifier, dict) else []
+    if not isinstance(raw, list):
+        raise ValueError("verifier capabilities must be a list")
+    capabilities = tuple(str(item).strip().upper() for item in raw)
+    unsupported = sorted(set(capabilities) - _ALLOWED_VERIFIER_CAPABILITIES)
+    if any(not item for item in capabilities) or unsupported:
+        raise ValueError(
+            "unsupported verifier container capabilities; only SYS_PTRACE is allowed"
+        )
+    return capabilities
+
+
+def docker_capability_args(capabilities: Sequence[str]) -> list[str]:
+    args: list[str] = []
+    for capability in capabilities:
+        normalized = str(capability).strip().upper()
+        if normalized not in _ALLOWED_VERIFIER_CAPABILITIES:
+            raise ValueError(
+                f"unsupported verifier container capability {capability!r}"
+            )
+        args.extend(["--cap-add", normalized])
+    return args
+
+
+def start_task_container(
+    image_tag: str,
+    *,
+    verifier_capabilities: Sequence[str] = (),
+) -> StartedContainer:
     # ``--network none`` isolates the agent's code execution from the internet,
     # mirroring the Taiga sandbox. The model itself runs on the HOST (the
     # claude-code / deepagents loop drives the container over ``docker exec`` via
@@ -136,6 +166,7 @@ def start_task_container(image_tag: str) -> StartedContainer:
         "ANTHROPIC_API_KEY",
         "-e",
         "IS_SANDBOX=yes",
+        *docker_capability_args(verifier_capabilities),
         image_tag,
         "sleep",
         "infinity",

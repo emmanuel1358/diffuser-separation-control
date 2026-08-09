@@ -1,0 +1,45 @@
+{
+  "decision_ids": [
+    "hidden_behavior",
+    "repeatability"
+  ],
+  "evidence": {
+    "aggregation": "weighted",
+    "artifact": {
+      "allow_extra_workspace_entries": true,
+      "clean_paths": [
+        ".git",
+        ".pytest_cache",
+        "__pycache__"
+      ],
+      "forbidden_names": [],
+      "forbidden_suffixes": [
+        ".pyc",
+        ".pyo",
+        ".so",
+        ".dylib",
+        ".dll",
+        ".exe"
+      ],
+      "forbidden_text_patterns": [],
+      "max_file_bytes": 262144,
+      "max_files": 64,
+      "max_total_bytes": 2097152,
+      "path": "repo",
+      "reject_native_payloads": true,
+      "text_suffixes": [
+        ".py",
+        ".md",
+        ".txt"
+      ],
+      "type": "workspace-artifact.v1"
+    },
+    "type": "declarative-rubric.v1"
+  },
+  "metric_ids": [],
+  "plan_sha256": "ed524b3badfe5a2a9142c025f0958d3c55c8683b2c9f7b73ee38fac1d35314f2",
+  "protocol": "declarative-rubric.v1",
+  "schema_version": "evaluation-plan.v2",
+  "security_tier": "sealed_rescore",
+  "task_spec_sha256": "d338add6ab8d9f984a8947e492bfaf3e1bda109dc82633684a7b197f4ffbf6ba"
+}

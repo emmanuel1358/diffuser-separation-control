@@ -39,8 +39,9 @@ At a high level, the workflow is:
    let harness reference/ground-truth refresh sealed `scorer/evaluation.plan.json` from `TASK` (commit it; never hand-edit).
 5. Write an oracle solution in `solution/solve.sh`.
 6. Run the local harness to prove the oracle scores `1.0`.
-7. Run a model attempt, then use the PR Prometheus report to confirm
-   the task is challenging enough and has usable rollout evidence.
+7. Run a model attempt, then use the PR Prometheus and/or Boreal reports to
+   confirm the task clears at least one submit-for-review lane (see
+   [`docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](../../docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md)).
 
 The model sees the prompt and public files. The grader sees the model's output
 and private scorer data. This separation is important: it lets you use hidden
@@ -52,50 +53,57 @@ reference anchors without leaking the answer to the model.
 After you finish authoring, the Labelbox review path is:
 
 1. Open a PR in your fork (one task per PR).
-2. Wait for `trusted-ci/grade` to pass. For Prometheus CFD/structures, that
-   check waits on Submit Prometheus, so a green check already means Prometheus
-   completed and the mean-reward gate passed. Auto QA is advisory only.
+2. Wait for `trusted-ci/grade` to pass. Auto QA is advisory only.
 3. Prometheus and Taiga run independently in parallel after sandbox validation.
    Taiga uses the dedicated Prometheus numerical-solvers environment and sends
    OpenFOAM availability as a native hint rather than changing your
    instruction.
-4. The only **score** gate is the Prometheus target average `<= 0.500`.
-   Standard deviation and the trainability audit are diagnostic context, not
-   approval gates. The **Boreal average score is not a blocker**.
-5. Boreal QA **is** required before Labelbox review / Done. Check **both**
-   surfaces and use whichever has the latest findings:
+4. You may submit for review when **either** acceptance lane clears (this is an
+   easing — two independent ways to clear the difficulty bar):
+   - **Prometheus lane:** CI pass, Prometheus mean `<= 0.6`, Prometheus
+     stddev `>= 0.08`.
+   - **Achilles lane:** CI pass, Boreal mean `<= 0.4`. **Independent of
+     Prometheus.**
+   - **Both:** submit as both when both lanes pass on the same head.
+5. **Boreal QA is required on both lanes.** Wait for Boreal QA to run on your
+   current head and clear its critical findings (or document false positives)
+   before submitting. A passing Prometheus score gate is **not** permission to
+   submit.
+6. Check **both** Boreal surfaces and use whichever has the latest findings:
    - the **LBx Validation / Boreal** PR comment, and
    - the **results dashboard**.
-   Required QAs must be complete on at least one current surface:
-   `transcript_health`, `data_quality`, `env_linter`, `reward_hacking`.
-   Only **critical** findings block Done. Warning and info findings are fine.
-6. Submit the production row for Labelbox review only when the gates
-   above pass and no unresolved critical Boreal findings remain.
-   Do not submit after Trusted CI or Auto QA alone.
-   Missing rollout or score-gate sections mean pending, not clean.
+   Warning and info findings are fine. Only **critical** findings block unless
+   you document why they are false positives.
+7. Do not submit after Trusted CI or Auto QA alone if neither lane is met, or if
+   Boreal QA has not posted results yet. Missing Prometheus rollout sections
+   mean pending for the Prometheus lane, not a failed Achilles lane.
+
+Full lane rules, the common Data Quality false positive, and the required PR
+comment template:
+[`docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](../../docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md).
 
 ### When to submit for review (and when not to)
 
 | Situation | What to do |
 | --- | --- |
 | `trusted-ci/grade` still running or red | Wait. Do not submit. |
-| Prometheus average missing or `> 0.5` | Rework / re-trigger. Do not submit. |
-| Boreal QA incomplete on **both** surfaces | Wait. Do not submit. |
+| Neither lane met (Prometheus mean/stddev off **and** Boreal mean `> 0.4`) | Rework / re-trigger. Do not submit. |
+| Prometheus lane met; Achilles not | Submit on **Prometheus** lane with the comment template. |
+| Achilles lane met; Prometheus not | Submit on **Achilles** lane with the comment template. |
+| Both lanes met | Submit as **both**. |
+| Boreal QA has not posted results for this head | Wait. Do not submit, even with a passing Prometheus score gate. |
 | Latest Boreal **critical** findings are clear and fixable | Self-iterate: fix, push, wait for refreshed QA. Do **not** submit yet. |
-| Suspected false positive, or unclear how to proceed | Submit for **coaching** review. Name which Boreal surface is latest and what is unclear. |
-| Gates pass; zero criticals; warnings/info may remain | Submit for **acceptance** review. Name which Boreal surface is latest. |
-| Warning or info findings only | Allowed to submit for acceptance if other gates pass. Do not burn cycles clearing them. |
+| Suspected Boreal critical false positive | Submit with `REVIEW_LANE` set and explain the FP in the template (e.g. Data Quality treating an output filename as a missing input). |
+| Warning or info findings only | Allowed if a lane otherwise passes. Do not burn cycles clearing them. |
 
-**Eligible for review** means: `trusted-ci/grade` green (Prometheus average
-included) **and** latest Boreal QA complete on either surface.
+**Eligible for review** means: CI green, at least one score lane above is met,
+**and** Boreal QA has completed with criticals clear or FP-documented.
 
-**Ready to accept / Done** means: those gates pass, zero unresolved critical
-Boreal findings (warnings/info may remain), and a reviewer confirms factual
-accuracy — not only green automated checks.
+**Ready to accept / Done** still requires a reviewer factual-accuracy check —
+green gates alone are not Done.
 
-When you submit, leave a PR comment that names **which surface has the latest
-Boreal QA** (LBx Validation comment and/or dashboard URL) and whether you want
-coaching or acceptance.
+When you submit, leave the dual-lane PR comment template so the reviewer knows
+which criteria apply.
 
 ## 2. RL in Plain English
 
@@ -609,7 +617,7 @@ Look for three things:
 2. Did the grader run cleanly and return a meaningful score?
 3. Did the model avoid a perfect `1.0` score?
 
-### PR Prometheus Score and Diversity Target
+### PR score targets and submit-for-review lanes
 
 After you open the task PR, trusted CI runs the normal numerical-solver gates for
 CFD: solver-agnostic instruction checks, deterministic grader QA, ground-truth
@@ -618,8 +626,9 @@ score-bounds gating. If those pass, the task is exported to Harbor and submitted
 to Prometheus instead of the default delivery path.
 
 The Prometheus comment reports aggregate target-model rewards across the
-required production attempts. Treat this as the authoritative difficulty signal,
-not the local single-agent run.
+required production attempts. Treat this as the authoritative difficulty signal
+for the **Prometheus lane**, not the local single-agent run. Boreal mean is the
+authoritative signal for the independent **Achilles lane**.
 
 **Timing:** the first `trusted-ci/grade` result usually appears after the local
 mothership gates finish, roughly 10-15 minutes for typical solver tasks. The
@@ -630,23 +639,30 @@ must finish the agent episode and hidden verifier runs.
 The targets are:
 
 ```text
-Blocking score gate:
-Average Prometheus target score <= 0.500
+Required on BOTH lanes:
+  CI green
+  Boreal QA completed on the current head
+  No unresolved Boreal criticals (or FP documented on the PR)
 
-Also required before review / Done:
-Boreal required QA complete on comment or dashboard
-No unresolved critical Boreal findings
+Two independent score lanes (clear either one):
 
-Reported for context (not gates):
-Prometheus target score standard deviation
+Prometheus lane:
+  Average Prometheus target score <= 0.6
+  Prometheus reward stddev >= 0.08
+
+Achilles lane (independent of Prometheus):
+  Boreal average score <= 0.4
+
+Reported for coaching / Done context (not labeler submit gates):
 Trainability-audit feedback
-Boreal average score
-Below 40 trainability: failures often not model-controllable; weak RL candidate
 ```
 
-If the average score is above `0.500`, the task is too easy for the target run
-even if local validation passed. Use the per-attempt scores, standard deviation,
-and per-criterion breakdown as context to see what the target run is solving,
+If the Prometheus average is above `0.6` (or stddev is below `0.08`), the
+Prometheus lane is not clear — you can still submit on the Achilles lane when
+Boreal mean is `<= 0.4`. If Boreal mean is above `0.4`, the Achilles lane is
+not clear — you can still submit on the Prometheus lane when mean/stddev pass.
+Use the per-attempt scores, standard deviation, and per-criterion breakdown as
+context to see what the target run is solving,
 then tighten or rebalance the engineering challenge fairly.
 
 If the model scores `1.0`, the task may be too easy, too constrained to one
@@ -758,20 +774,21 @@ uv run lbx-rl-harness run \
 ```
 
 - Wait for a green `trusted-ci/grade` before treating the task as review-ready.
-  For Prometheus CFD/structures that check already includes Submit Prometheus
-  and the only score gate: average target score `<= 0.500`. Standard deviation
-  and trainability-audit feedback are context, not approval gates. Absence of
-  the rollout or score-gate section means pending, not clean.
-- Confirm Boreal QA on the LBx Validation comment and/or dashboard: required
-  QAs complete (`transcript_health`, `data_quality`, `env_linter`,
-  `reward_hacking`) and no unresolved critical findings before submitting for
-  Labelbox review. Warning/info findings are fine. The Boreal average score is
-  not a blocker. Do not submit a failed or pending production row for review.
-  Submitting failed or pending rows violates fair practices and may remove the
-  tasker from the project.
-- Self-iterate on clear critical findings; submit for coaching only when stuck
-  or for acceptance when gates pass. When submitting, leave a PR comment naming
-  which Boreal surface is latest.
+  Submit for review when **either** score lane clears (see
+  [`docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](../../docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md)):
+  Prometheus (mean `<= 0.6`, stddev `>= 0.08`) **or** Achilles (Boreal mean
+  `<= 0.4`). Absence of the Prometheus rollout section means the Prometheus
+  lane is pending, not that Achilles failed.
+- **Boreal QA gates both lanes.** Wait for Boreal QA results on the LBx
+  Validation comment and/or dashboard before submitting, on either lane.
+  Warning/info findings are fine. Self-iterate on clear criticals; if a
+  critical is a false positive (including Data Quality treating an output
+  filename as a missing input), document it in the submit comment template.
+  Do not submit when neither lane is met, or while Boreal QA is still pending.
+  Submitting failed or pending rows that clear neither lane violates fair
+  practices and may remove the tasker from the project.
+- When submitting, leave the dual-lane PR comment template so the reviewer
+  knows which criteria apply.
 
 - Diversity and originality are required. Problems submitted to the original CFD
   or structures projects, or previously submitted to Boreal, must not be
@@ -781,8 +798,8 @@ uv run lbx-rl-harness run \
 - `.alignerr/ground_truth/` artifacts are committed when the task declares them.
 - `.env.local`, `.harness-runs/`, API keys, and other secrets are not committed.
 
-If those checks pass, `trusted-ci/grade` is green, Boreal required QA is
-complete, and criticals are clear, the task is in good shape for review.
+If CI is green, at least one score lane is met, and Boreal QA has completed with
+criticals clear or FP-documented, the task is in good shape for review.
 
 ## Env Pre-flight QA (Blocking in CI)
 

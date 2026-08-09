@@ -27,8 +27,16 @@ Do NOT use it for:
 - Tasks where the "environment" is just a public helper the agent may read --
   put it in `data/` and skip the server.
 
-`hidden_env` is **orthogonal to `task_type`**: an `ml`, `mujoco`, `cfd`, or
-`structures` task can each opt in. It is a runtime capability, not a domain.
+`hidden_env` is **orthogonal to `task_type`**: an `ml`, `mujoco`, `cfd`,
+`structures`, or `software_engineering` task can opt in. It is a runtime
+capability, not a domain.
+
+For `software_engineering`, do not use `hidden_env` as a substitute for a
+declared service graph. Simple tasks use the single-image repository contract;
+multi-service tasks declare service-owned artifacts, per-service Dockerfiles,
+and an isolated verifier, then trusted tooling packages them as an outer
+capsule. Task-local SSE MCP is available on Taiga only through that capsule's
+audited service-DNS proxy; unbundled SSE remains unsupported.
 
 ## How it works
 

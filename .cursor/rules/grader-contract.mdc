@@ -44,4 +44,6 @@ alwaysApply: false
 - Never `import` / `exec_module` / `exec` / `pickle.load` / `joblib.load` / `torch.load` an agent artifact in the grader (root) process. The `grader_sandbox` and `agent_fault` validator stages hard-fail this.
 - Apply the AgentFault keep-vs-discard discipline: `raise grading.faults.AgentFault(...)` for agent-controlled failures (kept 0.0); let author/infra failures (missing truth, broken import, simulator crash) propagate (discarded). A broad `except Exception: return 0.0` is rejected by the `agent_fault` stage. Keep author/infra reads (hidden truth) outside the agent `try`.
 - Run `lbx-rl-template validate --problem-dir problems/<task_id>`; the blocking `agent_fault` stage flags over-keep (broad except returning a score), RCE (pickle on an agent artifact), and over-discard (unguarded agent-path read). See `docs/REWARD_HACKING.md`.
-- After changing scorer behavior, run `uv run lbx-rl-harness run --problem-dir problems/<task_id>` before PR and commit the generated `problems/<task_id>/.alignerr/build_proof.json`.
+- After changing scorer behavior, run local reference/ground-truth preflight and
+  commit the generated evaluation plan. Trusted CI generates authoritative
+  build proof/lock evidence from the immutable PR.

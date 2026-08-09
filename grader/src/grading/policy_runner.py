@@ -65,9 +65,9 @@ class PolicyTimeoutError(PolicyWorkerError, TimeoutError):
     """
 
 
-# CLONE_NEWIPC: a private SysV-IPC/POSIX-message namespace. Used by the k-fold
-# loader so a submitted model cannot stash cross-fold state (e.g. the held-out
-# labels it just saw) in a shared-memory segment that survives a fresh worker.
+# CLONE_NEWIPC: a private SysV-IPC/POSIX-message namespace. Used by every
+# submitted policy or executable worker so rollout state cannot survive in a
+# shared-memory segment, semaphore set, or message queue visible to a later run.
 _CLONE_NEWIPC = 0x08000000
 try:
     _LIBC: ctypes.CDLL | None = ctypes.CDLL(None, use_errno=True)
@@ -188,13 +188,19 @@ def _agent_identity() -> tuple[int, int, str, str]:
 
 
 def _agent_preexec(
-    uid: int, gid: int, ipc_status_fd: int | None = None
+    uid: int,
+    gid: int,
+    ipc_status_fd: int | None = None,
+    *,
+    cwd_fd: int | None = None,
 ) -> Callable[[], None]:
-    """``preexec_fn`` that unshares the IPC namespace WHILE STILL ROOT, then
-    drops to the agent account. ``unshare(CLONE_NEWIPC)`` needs CAP_SYS_ADMIN so
-    it must run before ``setuid``; the unshare is best-effort -- a runtime
-    without CAP_SYS_ADMIN must still grade honest policies, so a failure is
-    never raised.
+    """``preexec_fn`` that isolates IPC, enters a pinned cwd, and drops uid.
+
+    ``unshare(CLONE_NEWIPC)`` needs CAP_SYS_ADMIN so it must run before
+    ``setuid``. The unshare is best-effort -- a runtime without CAP_SYS_ADMIN
+    must still grade honest submissions, so a failure is reported but never
+    raised. ``cwd_fd`` lets all submitted-process boundaries reuse this ordering
+    without resolving an agent-controlled pathname after ``fork``.
 
     The unshare result is surfaced (not silently dropped): when
     ``ipc_status_fd`` is given, a single status byte is written to it -- ``0``
@@ -207,9 +213,10 @@ def _agent_preexec(
 
     def _preexec() -> None:
         status = 0
-        if _LIBC is not None and _CLONE_NEWIPC_ARG is not None:
+        unshare = getattr(_LIBC, "unshare", None)
+        if unshare is not None and _CLONE_NEWIPC_ARG is not None:
             ctypes.set_errno(0)
-            if _LIBC.unshare(_CLONE_NEWIPC_ARG) != 0:  # best-effort; never raise
+            if unshare(_CLONE_NEWIPC_ARG) != 0:  # best-effort; never raise
                 status = ctypes.get_errno() or errno.EPERM
         else:
             status = errno.ENOSYS
@@ -218,11 +225,57 @@ def _agent_preexec(
                 os.write(ipc_status_fd, bytes([min(status, 255)]))
             except OSError:
                 pass
+            finally:
+                try:
+                    os.close(ipc_status_fd)
+                except OSError:
+                    pass
+        if cwd_fd is not None:
+            os.fchdir(cwd_fd)
+            os.close(cwd_fd)
         os.setgroups([])
         os.setgid(gid)
         os.setuid(uid)
 
     return _preexec
+
+
+def _warn_if_ipc_unisolated(
+    status_fd: int,
+    *,
+    boundary: str = "policy worker",
+) -> None:
+    """Report a failed best-effort IPC boundary without changing the grade."""
+    data = b""
+    try:
+        # The byte is written before exec, hence before Popen returned; a short
+        # select guards against a hang if the child died before writing it.
+        if select.select([status_fd], [], [], 5.0)[0]:
+            data = os.read(status_fd, 1)
+    except OSError:
+        data = b""
+    finally:
+        try:
+            os.close(status_fd)
+        except OSError:
+            pass
+    if not data:
+        logger.warning(
+            "[GRADING] could not determine %s IPC isolation status; "
+            "proceeding without verifying CLONE_NEWIPC",
+            boundary,
+        )
+        return
+    status = data[0]
+    if status != 0:
+        logger.warning(
+            "[GRADING] %s IPC namespace NOT isolated: "
+            "unshare(CLONE_NEWIPC) failed (errno=%d %s); proceeding without "
+            "per-process IPC isolation",
+            boundary,
+            status,
+            os.strerror(status),
+        )
 
 
 def _agent_drop_kwargs(
@@ -832,34 +885,7 @@ class PolicyWorker:
         """Read the preexec IPC-unshare status byte and warn if isolation did
         not take. Best-effort: never raises, so an un-isolated runtime still
         grades honest policies (it just logs that the defense is off)."""
-        data = b""
-        try:
-            # The byte is written before exec, hence before Popen returned; a
-            # short select guards against a hang if the child died pre-write.
-            if select.select([status_fd], [], [], 5.0)[0]:
-                data = os.read(status_fd, 1)
-        except OSError:
-            data = b""
-        finally:
-            try:
-                os.close(status_fd)
-            except OSError:
-                pass
-        if not data:
-            logger.warning(
-                "[GRADING] could not determine policy worker IPC isolation "
-                "status; proceeding without verifying CLONE_NEWIPC"
-            )
-            return
-        status = data[0]
-        if status != 0:
-            logger.warning(
-                "[GRADING] policy worker IPC namespace NOT isolated: "
-                "unshare(CLONE_NEWIPC) failed (errno=%d %s); proceeding without "
-                "per-worker IPC isolation",
-                status,
-                os.strerror(status),
-            )
+        _warn_if_ipc_unisolated(status_fd)
 
     def start(self) -> None:
         if self._proc is not None:

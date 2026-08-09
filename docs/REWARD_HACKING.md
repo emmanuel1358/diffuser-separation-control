@@ -75,7 +75,7 @@ bytes from the same opened file. Executable/model parsers run as the unprivilege
 | Custom file-like parser | `helpers.open_submission_file_or_fault(path)` | immutable bounded `BytesIO` captured through a component-safe descriptor walk |
 | Legacy pathname-only parser | `helpers.require_regular_file(path)` | framework compatibility only; task scorers remain validator-blocked and must add a shared format loader instead |
 | Python policy / model module | `helpers.run_policy` / `helpers.run_model_module` | RCE-as-root: runs in a non-root subprocess; **score comes from the return value, never stdout** |
-| Executable | `helpers.run_submitted_executable` | uid-drop + caps stdout and discards stderr so it cannot exhaust grader memory + converts an agent timeout / stdout-flood into an `AgentFault` (kept 0.0, not a discarded rollout). In `streaming=True` it also strips any `RUBRIC_SCORE=` line so the binary cannot forge a score on stdout; **capture mode returns raw stdout for you to parse — never relay it to the score parser** |
+| Executable | `helpers.run_submitted_executable` | fresh best-effort IPC namespace + uid-drop + caps stdout and discards stderr so it cannot exhaust grader memory + converts an agent timeout / stdout-flood into an `AgentFault` (kept 0.0, not a discarded rollout). In `streaming=True` it also strips any `RUBRIC_SCORE=` line so the binary cannot forge a score on stdout; **capture mode returns raw stdout for you to parse — never relay it to the score parser** |
 | HDF5 | `helpers.load_submission_h5_or_fault` | immutable input snapshot plus dropped parser; rejects links/virtual datasets and caps dataset count, per-dataset bytes, and aggregate logical bytes. Whole-object H5AD handoff back to the root grader is disabled. |
 | K-fold CV of a model module | `score_kfold_cv` | cross-fold label leakage via memory (fresh worker per fold), IPC (`CLONE_NEWIPC`), and disk (per-fold pristine-snapshot rebuild) |
 | Submitted policy (hidden-env tasks) | `grading.load_submitted_policy` | uid-drop sandbox; result over a dedicated pipe (never stdout); `AgentFault` on missing / non-regular / oversized / load-crash |
@@ -118,6 +118,9 @@ every grade) closes the classic exploits with no author action:
   inability to inspect or terminate processes aborts as infrastructure failure;
 - repeats quiescence after grading before publishing traces/results, so
   descendants spawned by submitted code cannot race post-grade root I/O;
+- gives every submitted policy or executable worker a fresh best-effort IPC
+  namespace, preventing persistent SysV shared memory, semaphore, and message
+  queue state from relaying rollout data into grading or between candidate runs;
 - scrubs escaping symlinks and non-regular files (FIFOs/sockets/devices) under
   the output dir (symlink-to-truth and FIFO-hang-to-discard defenses);
 - traps non-finite scores (`NaN`/`inf` cannot clamp up to `1.0`);

@@ -45,11 +45,20 @@ import math
 import os
 import re
 import time
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from alignerr_plugin.base_image import resolve_base_flavor_for_resource
+from alignerr_plugin.capabilities import (
+    CapabilityConfig,
+    ServiceSpec,
+    implicit_agent_service,
+    is_capability_task,
+    model_dump,
+    resolve_capabilities,
+)
 from alignerr_plugin.ground_truth import expected_ground_truth_score, sha256_file
 from alignerr_plugin.runtime_notices import GPU_NOTICE, TPU_NOTICE
 from alignerr_plugin.schemas import (
@@ -62,6 +71,8 @@ from alignerr_plugin.schemas import (
 )
 from alignerr_plugin.solver_hints import task_type_solver_hint
 from alignerr_plugin.taiga_resources import (
+    CPU_PERF_RESOURCE_OPTIONS,
+    CPU_RESOURCE_OPTIONS,
     RESOURCE_RANK,
     is_accelerator_resource,
     is_cpu_resource,
@@ -143,6 +154,17 @@ TPU_BASE_IMAGE = "us-east1-docker.pkg.dev/gcp-taiga/labelbox/lbx-tasks-base-tpu"
 # describe the machine the job will actually land on. Unset everywhere else, which
 # leaves the declared tier untouched.
 QA_CPU_RESOURCE_ENV = "LBX_TAIGA_QA_CPU_RESOURCE"
+
+_CAPABILITY_SUMMARY_SCHEMA = "alignerr.taiga.capability-summary.v1"
+_OUTER_CAPSULE_IMAGE_RE = re.compile(
+    r"^[^\s@]+@sha256:[0-9a-f]{64}\Z",
+    re.IGNORECASE,
+)
+_RESOURCE_DIMENSIONS = ("cpus", "memory_mb", "storage_mb", "gpus")
+_CPU_MEMORY_DIMENSIONS = ("cpus", "memory_mb")
+_CPU_RESOURCE_RE = re.compile(
+    r"^(?P<cpus>\d+)vcpu\+(?P<memory_gib>\d+)gib(?:\+perf)?\Z"
+)
 
 
 def _tpu_base_image_tag() -> str:
@@ -343,6 +365,614 @@ def _taiga_outputs(task_toml: TaskToml) -> list[dict[str, Any]]:
         }
         for output in task_toml.outputs
     ]
+
+
+def _require_outer_capsule_image(
+    *,
+    image_ref: str,
+    image_is_outer_capsule: bool,
+) -> str:
+    """Validate and return the assertion source for a capsule image reference."""
+    if not image_is_outer_capsule:
+        raise ValueError(
+            "capability-aware Taiga export requires the supplied image_ref to be "
+            "the built outer capsule; trusted export code must pass "
+            "image_is_outer_capsule=True"
+        )
+
+    if image_ref != "LOCAL_IMAGE" and not _OUTER_CAPSULE_IMAGE_RE.fullmatch(image_ref):
+        raise ValueError(
+            "capability-aware Taiga export requires a digest-pinned outer capsule "
+            "image_ref (<repository>@sha256:<64 hex>), or LOCAL_IMAGE for an "
+            f"explicit local capsule; got {image_ref!r}"
+        )
+    return "exporter_flag"
+
+
+def _resolve_capabilities_for_problem(
+    problem_dir: Path,
+    task_toml: TaskToml,
+) -> CapabilityConfig:
+    """Apply the same implicit main-service convention as capsule packaging."""
+    capabilities = resolve_capabilities(task_toml)
+    if capabilities.agent_service is not None:
+        return capabilities
+    default_context = next(
+        (
+            context
+            for context in ("environment", "environment/main")
+            if (problem_dir / context / "Dockerfile").is_file()
+        ),
+        None,
+    )
+    if default_context is None:
+        raise ValueError(
+            "capability task has no agent service and neither "
+            "environment/Dockerfile nor environment/main/Dockerfile is available"
+        )
+    platform = (
+        task_toml.agent.resources.platform
+        if task_toml.agent.resources is not None
+        else None
+    )
+    default_agent = implicit_agent_service(
+        context=default_context,
+        resources=capabilities.agent_resources,
+        network=(
+            task_toml.agent.resources.network
+            if task_toml.agent.resources is not None
+            else None
+        ),
+        platform=platform,
+    )
+    return CapabilityConfig(
+        services=(default_agent, *capabilities.services),
+        artifacts=capabilities.artifacts,
+        captures=capabilities.captures,
+        mcp_servers=capabilities.mcp_servers,
+        verifier_mcp_servers=capabilities.verifier_mcp_servers,
+        volumes=capabilities.volumes,
+        agent_resources=capabilities.agent_resources,
+        verifier_resources=capabilities.verifier_resources,
+    )
+
+
+def _validate_capability_mcp(task_toml: TaskToml) -> None:
+    """Allow only the audited SSE proxy implemented by the capsule runtime."""
+    unsupported = sorted(
+        f"{server.name}:{server.transport}"
+        for server in task_toml.mcp_servers
+        if server.transport != "sse"
+    )
+    if unsupported:
+        raise ValueError(
+            "Taiga task capsules support only declared SSE MCP endpoints through "
+            "the audited service-DNS proxy; unsupported task-local MCP transports: "
+            + ", ".join(unsupported)
+        )
+
+
+def _canonical_number(value: float) -> int | float:
+    return int(value) if value.is_integer() else value
+
+
+def _resource_vector(value: Any, *, label: str) -> dict[str, Any]:
+    """Project a resource declaration to non-secret numeric capacity fields."""
+    raw = dict(value) if isinstance(value, Mapping) else model_dump(value)
+    vector: dict[str, Any] = {}
+    for field in _RESOURCE_DIMENSIONS:
+        raw_value = raw.get(field)
+        if raw_value is None:
+            continue
+        if isinstance(raw_value, bool):
+            raise TypeError(f"{label} {field} must be numeric, not boolean")
+        try:
+            number = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} {field} must be numeric") from exc
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"{label} {field} must be finite and non-negative")
+        if field != "cpus" and not number.is_integer():
+            raise ValueError(f"{label} {field} must be an integer")
+        vector[field] = _canonical_number(number)
+
+    gpu_types = raw.get("gpu_types")
+    if isinstance(gpu_types, Sequence) and not isinstance(
+        gpu_types, (str, bytes, bytearray)
+    ):
+        normalized_types = sorted({str(gpu_type) for gpu_type in gpu_types if gpu_type})
+        if normalized_types:
+            vector["gpu_types"] = normalized_types
+    if raw.get("tpu"):
+        vector["tpu"] = True
+    return vector
+
+
+def _merge_resource_vectors(
+    vectors: Sequence[Mapping[str, Any]],
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for field in _RESOURCE_DIMENSIONS:
+        values = [vector[field] for vector in vectors if field in vector]
+        if values:
+            merged[field] = sum(values) if operation == "sum" else max(values)
+    gpu_types = sorted(
+        {
+            str(gpu_type)
+            for vector in vectors
+            for gpu_type in vector.get("gpu_types", [])
+        }
+    )
+    if gpu_types:
+        merged["gpu_types"] = gpu_types
+    if any(vector.get("tpu") is True for vector in vectors):
+        merged["tpu"] = True
+    return merged
+
+
+def _sum_resource_vectors(*vectors: Mapping[str, Any]) -> dict[str, Any]:
+    return _merge_resource_vectors(vectors, operation="sum")
+
+
+def _max_resource_vectors(*vectors: Mapping[str, Any]) -> dict[str, Any]:
+    return _merge_resource_vectors(vectors, operation="max")
+
+
+def _resource_capacity(required_resources: str) -> tuple[int, int]:
+    match = _CPU_RESOURCE_RE.fullmatch(required_resources)
+    if match is None:
+        raise ValueError(
+            "nested-Docker capability tasks require a CPU Taiga resource enum; "
+            f"got {required_resources!r}"
+        )
+    return int(match.group("cpus")), int(match.group("memory_gib")) * 1024
+
+
+def _minimum_cpu_capacity_fit(
+    cpus: float,
+    memory_mb: int,
+    *,
+    perf: bool,
+) -> str | None:
+    options = CPU_PERF_RESOURCE_OPTIONS if perf else CPU_RESOURCE_OPTIONS
+    fits = [
+        option
+        for option in options
+        if (
+            _resource_capacity(option)[0] >= cpus
+            and _resource_capacity(option)[1] >= memory_mb
+        )
+    ]
+    if not fits:
+        return None
+    return min(
+        fits,
+        key=lambda option: (
+            _resource_capacity(option)[0],
+            _resource_capacity(option)[1],
+        ),
+    )
+
+
+def _service_resource_vector(service: ServiceSpec) -> dict[str, Any]:
+    return _resource_vector(
+        service.resources,
+        label=f"service {service.name!r} resources",
+    )
+
+
+def _phase_resource_intent(
+    task_toml: TaskToml,
+    capabilities: CapabilityConfig,
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Compute conservative, non-overlapping agent and verifier phase peaks."""
+    missing: list[str] = []
+    agent_resources = _resource_vector(
+        capabilities.agent_resources,
+        label="agent resources",
+    )
+    main_resources = (
+        _service_resource_vector(capabilities.agent_service)
+        if capabilities.agent_service is not None
+        else {}
+    )
+    main_peak = _max_resource_vectors(agent_resources, main_resources)
+    for field in _CPU_MEMORY_DIMENSIONS:
+        if field not in main_peak:
+            missing.append(f"agent-main.{field}")
+
+    agent_components: list[Mapping[str, Any]] = [main_peak]
+    for service in capabilities.services:
+        if service.role in {"agent", "verifier"}:
+            continue
+        service_resources = _service_resource_vector(service)
+        for field in _CPU_MEMORY_DIMENSIONS:
+            if field not in service_resources:
+                missing.append(f"service:{service.name}.{field}")
+        agent_components.append(service_resources)
+    agent_phase = _sum_resource_vectors(*agent_components)
+    # The outer disk must also accommodate the task-level storage request. Child
+    # service storage is additive, while environment.storage_mb is an outer floor.
+    agent_phase = _max_resource_vectors(
+        agent_phase,
+        {"storage_mb": task_toml.environment.storage_mb},
+    )
+
+    verifier_resources = _resource_vector(
+        capabilities.verifier_resources,
+        label="verifier resources",
+    )
+    verifier_service_resources = (
+        _service_resource_vector(capabilities.verifier_service)
+        if capabilities.verifier_service is not None
+        else {}
+    )
+    verifier_phase = _max_resource_vectors(
+        verifier_resources,
+        verifier_service_resources,
+    )
+    for field in _CPU_MEMORY_DIMENSIONS:
+        if field not in verifier_phase:
+            missing.append(f"verifier.{field}")
+    return agent_phase, verifier_phase, sorted(set(missing))
+
+
+def _outer_resource_summary(
+    task_toml: TaskToml,
+    capabilities: CapabilityConfig,
+    *,
+    selected_required_resources: str,
+) -> dict[str, Any]:
+    """Validate known phase peaks while preserving the authored Taiga enum."""
+    authored = validate_required_resources(task_toml.environment.required_resources)
+    selected = validate_required_resources(selected_required_resources)
+    if not is_cpu_resource(selected):
+        raise ValueError(
+            "Taiga nested-Docker capsules require the Firecracker CPU runtime, "
+            f"but selected required_resources {selected!r} is an accelerator tier"
+        )
+
+    agent_phase, verifier_phase, missing = _phase_resource_intent(
+        task_toml,
+        capabilities,
+    )
+    outer_peak = _max_resource_vectors(agent_phase, verifier_phase)
+    if outer_peak.get("gpus", 0) or outer_peak.get("tpu"):
+        raise ValueError(
+            "Taiga nested-Docker capsules currently run under Firecracker and "
+            "cannot satisfy child GPU/TPU resource declarations"
+        )
+
+    selected_cpus, selected_memory_mb = _resource_capacity(selected)
+    complete_cpu_memory = all(field in outer_peak for field in _CPU_MEMORY_DIMENSIONS)
+    minimum_fit: str | None = None
+    exact_fit = False
+    if complete_cpu_memory:
+        outer_cpus = float(outer_peak["cpus"])
+        outer_memory_mb = int(outer_peak["memory_mb"])
+        perf = selected.endswith("+perf")
+        minimum_fit = _minimum_cpu_capacity_fit(
+            outer_cpus,
+            outer_memory_mb,
+            perf=perf,
+        )
+        if minimum_fit is None:
+            raise ValueError(
+                "computed outer capsule resource intent cannot map to any Taiga "
+                f"CPU enum: cpus={outer_peak['cpus']}, "
+                f"memory_mb={outer_peak['memory_mb']}"
+            )
+        if outer_cpus > selected_cpus or outer_memory_mb > selected_memory_mb:
+            raise ValueError(
+                "computed outer capsule resource intent exceeds selected "
+                f"required_resources {selected!r}: peak cpus={outer_peak['cpus']}, "
+                f"memory_mb={outer_peak['memory_mb']}; minimum capacity fit is "
+                f"{minimum_fit!r}"
+            )
+        candidate_options = CPU_PERF_RESOURCE_OPTIONS if perf else CPU_RESOURCE_OPTIONS
+        exact_fit = any(
+            _resource_capacity(option) == (outer_cpus, outer_memory_mb)
+            for option in candidate_options
+        )
+    else:
+        known_shortfalls = []
+        if float(outer_peak.get("cpus", 0)) > selected_cpus:
+            known_shortfalls.append(
+                f"cpus={outer_peak['cpus']} exceeds {selected_cpus}"
+            )
+        if int(outer_peak.get("memory_mb", 0)) > selected_memory_mb:
+            known_shortfalls.append(
+                f"memory_mb={outer_peak['memory_mb']} exceeds {selected_memory_mb}"
+            )
+        if known_shortfalls:
+            raise ValueError(
+                "known outer capsule resource intent exceeds selected "
+                f"required_resources {selected!r} even though some child limits "
+                f"are undeclared: {', '.join(known_shortfalls)}"
+            )
+
+    reasons = ["capsule_image_and_daemon_overhead_not_encoded"]
+    if missing:
+        reasons.append("incomplete_child_cpu_or_memory_declarations")
+    if outer_peak.get("storage_mb", 0):
+        reasons.append("storage_and_named_volume_capacity_not_encoded")
+    if complete_cpu_memory and not exact_fit:
+        reasons.append("aggregate_peak_is_not_an_exact_taiga_enum")
+
+    mapping: dict[str, Any] = {
+        "strategy": "preserve_selected_required_resources",
+        "capacity_validated": complete_cpu_memory and not missing,
+        "preflight_required": True,
+        "preflight_requirement": (
+            "Verify the built outer capsule peak, including child images, dockerd, "
+            "named volumes, and undeclared child limits, fits selected "
+            "required_resources before Taiga submission."
+        ),
+        "reasons": sorted(reasons),
+    }
+    if minimum_fit is not None:
+        mapping["minimum_capacity_fit"] = minimum_fit
+    if missing:
+        mapping["unknown_fields"] = missing
+
+    return {
+        "authored_required_resources": authored,
+        "selected_required_resources": selected,
+        "selection": "authored" if selected == authored else "explicit_override",
+        "agent_service_peak": agent_phase,
+        "verifier_phase": verifier_phase,
+        "outer_peak": outer_peak,
+        "mapping": mapping,
+    }
+
+
+def _timeout_value(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return math.ceil(number)
+
+
+def _capability_effective_timeouts(
+    task_toml: TaskToml,
+    capabilities: CapabilityConfig,
+) -> tuple[int, int, int, int | None]:
+    """Surface long native agent, build, and verifier phase timeouts."""
+    setup, grading, tool, max_episode = _effective_timeouts(task_toml)
+    agent_resource = model_dump(task_toml.agent.resources)
+    verifier_resource = model_dump(task_toml.verifier.resources)
+
+    build_timeouts = [
+        _timeout_value(agent_resource.get("build_timeout_sec")),
+        _timeout_value(verifier_resource.get("build_timeout_sec")),
+    ]
+    agent_runtime_timeouts = [
+        _timeout_value(task_toml.agent.timeout_sec),
+        _timeout_value(agent_resource.get("runtime_timeout_sec")),
+    ]
+    verifier_runtime_timeouts = [
+        _timeout_value(task_toml.verifier.timeout_sec),
+        _timeout_value(verifier_resource.get("runtime_timeout_sec")),
+    ]
+    for service in capabilities.services:
+        raw_resources = model_dump(service.raw.get("resources"))
+        build_timeouts.append(_timeout_value(raw_resources.get("build_timeout_sec")))
+        runtime_timeout = _timeout_value(raw_resources.get("runtime_timeout_sec"))
+        if service.role == "verifier":
+            verifier_runtime_timeouts.append(runtime_timeout)
+        else:
+            agent_runtime_timeouts.append(runtime_timeout)
+
+    setup = max([setup, *(value for value in build_timeouts if value is not None)])
+    tool = max(
+        [tool, *(value for value in agent_runtime_timeouts if value is not None)]
+    )
+    grading = max(
+        [grading, *(value for value in verifier_runtime_timeouts if value is not None)]
+    )
+    if max_episode is not None:
+        max_episode = max(
+            [
+                max_episode,
+                *(value for value in agent_runtime_timeouts if value is not None),
+            ]
+        )
+    return setup, grading, tool, max_episode
+
+
+def _submission_timeouts(
+    task_toml: TaskToml,
+) -> tuple[int, int, int, int | None]:
+    if not is_capability_task(task_toml):
+        return _effective_timeouts(task_toml)
+    return _capability_effective_timeouts(
+        task_toml,
+        resolve_capabilities(task_toml),
+    )
+
+
+def _canonical_service_role(role: str) -> str:
+    return "main" if role == "agent" else role
+
+
+def _service_identity(service: ServiceSpec) -> dict[str, Any]:
+    raw = service.raw
+    identity: dict[str, Any] = {
+        "name": service.name,
+        "role": _canonical_service_role(service.role),
+        "source": (
+            {"kind": "bundled_build"}
+            if service.build is not None
+            else {
+                "kind": "digest_pinned_image",
+                "digest": str(service.image).rsplit("@", 1)[-1].lower(),
+            }
+        ),
+    }
+    platform = (
+        service.build.platform if service.build is not None else None
+    ) or model_dump(raw.get("resources")).get("platform")
+    if platform:
+        identity["platform"] = str(platform)
+
+    dependencies = []
+    for dependency in raw.get("depends_on", []):
+        row = model_dump(dependency)
+        if row.get("service"):
+            dependencies.append(
+                {
+                    "service": str(row["service"]),
+                    "condition": str(row.get("condition") or "started"),
+                }
+            )
+    if dependencies:
+        identity["depends_on"] = sorted(
+            dependencies,
+            key=lambda row: (row["service"], row["condition"]),
+        )
+
+    mounts = []
+    for mount in raw.get("volumes", []):
+        row = model_dump(mount)
+        if row.get("volume") and row.get("target"):
+            mounts.append(
+                {
+                    "volume": str(row["volume"]),
+                    "target": str(row["target"]),
+                    "mode": str(row.get("mode") or "rw"),
+                }
+            )
+    if mounts:
+        identity["volumes"] = sorted(
+            mounts,
+            key=lambda row: (row["volume"], row["target"], row["mode"]),
+        )
+    resources = _service_resource_vector(service)
+    if resources:
+        identity["resources"] = resources
+    return identity
+
+
+def _capability_summary(
+    task_toml: TaskToml,
+    capabilities: CapabilityConfig,
+    *,
+    contract_assertion: str,
+    selected_required_resources: str,
+) -> dict[str, Any]:
+    """Build a deterministic allowlisted summary without commands or secrets."""
+    workspace = model_dump(task_toml.workspace)
+    workspace_root = str(workspace.get("root") or "/workdir")
+    workspace_identity: dict[str, Any] = {
+        "root": workspace_root,
+        "agent_cwd": str(workspace.get("agent_cwd") or workspace_root),
+        "output_root": (
+            task_toml.result.output_root if task_toml.result else "/tmp/output"
+        ),
+        "init_policy": str(workspace.get("init_policy") or "empty"),
+    }
+    if workspace.get("seed"):
+        workspace_identity["seed"] = str(workspace["seed"])
+    if "git_baseline" in workspace:
+        workspace_identity["git_baseline"] = workspace["git_baseline"]
+
+    artifacts = []
+    for artifact in task_toml.artifacts:
+        raw = artifact.model_dump(mode="python", exclude_none=True)
+        artifacts.append(
+            {
+                "name": artifact.name,
+                "kind": str(raw["kind"]),
+                "service": artifact.service,
+                "destination": artifact.destination,
+                "required": artifact.required,
+            }
+        )
+
+    captures = []
+    for index, capture in enumerate(task_toml.captures):
+        capture_identity: dict[str, Any] = {
+            "order": index,
+            "name": capture.name,
+            "service": capture.service,
+            "failure_policy": capture.failure_policy,
+        }
+        if capture.atomic_destination is not None:
+            capture_identity["atomic_destination"] = capture.atomic_destination
+        captures.append(capture_identity)
+
+    tools = [
+        {"name": name, "kind": "builtin"}
+        for name in sorted(set(task_toml.runner.required_tools))
+    ]
+    for server in sorted(task_toml.mcp_servers, key=lambda item: item.name):
+        tool_identity: dict[str, Any] = {
+            "name": server.name,
+            "kind": "mcp",
+            "transport": server.transport,
+            "access": server.access,
+        }
+        if server.service is not None:
+            tool_identity["service"] = server.service
+        if server.depends_on:
+            tool_identity["depends_on"] = sorted(server.depends_on)
+        tools.append(tool_identity)
+
+    gates = [
+        {
+            "order": index,
+            "name": gate.name,
+            "kind": gate.kind,
+            "required": gate.required,
+            **({"report": gate.report} if gate.report is not None else {}),
+        }
+        for index, gate in enumerate(task_toml.gates)
+    ]
+    reports = [
+        {
+            "name": report.name,
+            "format": report.format,
+            "path": report.path,
+            "required": report.required,
+        }
+        for report in sorted(task_toml.reports, key=lambda item: item.name)
+    ]
+
+    return {
+        "schema_version": _CAPABILITY_SUMMARY_SCHEMA,
+        "runtime": {
+            "outer_image_contract": "outer_capsule",
+            "contract_assertion": contract_assertion,
+            "isolation": "firecracker",
+            "orchestration": "nested_docker",
+        },
+        "workspace": workspace_identity,
+        "artifacts": sorted(artifacts, key=lambda row: row["name"]),
+        "services": [
+            _service_identity(service)
+            for service in sorted(capabilities.services, key=lambda item: item.name)
+        ],
+        "volumes": [
+            {"name": volume.name}
+            for volume in sorted(task_toml.volumes, key=lambda item: item.name)
+        ],
+        "captures": captures,
+        "tools": tools,
+        "gates": gates,
+        "reports": reports,
+        "resources": _outer_resource_summary(
+            task_toml,
+            capabilities,
+            selected_required_resources=selected_required_resources,
+        ),
+    }
 
 
 def _problem_set_name(task_toml: TaskToml) -> str:
@@ -595,6 +1225,7 @@ def _build_problem_entry(
     *,
     image_ref: str,
     overrides: dict[str, Any] | None = None,
+    image_is_outer_capsule: bool = False,
 ) -> dict[str, Any]:
     """Build the per-problem entry dict that lives under
     ``problems_metadata.problem_set.problems[]``."""
@@ -602,11 +1233,21 @@ def _build_problem_entry(
 
     task_toml = load_task_toml(problem_dir)
     runner: RunnerConfig = task_toml.runner
+    capabilities: CapabilityConfig | None = None
+    contract_assertion: str | None = None
+    if is_capability_task(task_toml):
+        capabilities = _resolve_capabilities_for_problem(problem_dir, task_toml)
+        contract_assertion = _require_outer_capsule_image(
+            image_ref=image_ref,
+            image_is_outer_capsule=image_is_outer_capsule,
+        )
+        _validate_capability_mcp(task_toml)
     # ml tasks are force-pinned to the hour-scale ML_* timeouts; other task types
-    # keep their author-set / default values (see _effective_timeouts). The
-    # job-level max_episode is applied separately in _job_level_fields.
+    # keep their author-set / default values. Capability tasks additionally
+    # surface their long build/agent/verifier phase limits. The job-level
+    # max_episode is applied separately in _job_level_fields.
     setup_timeout_seconds, grading_timeout_seconds, tool_timeout_seconds, _ = (
-        _effective_timeouts(task_toml)
+        _submission_timeouts(task_toml)
     )
     resources = _derive_resources_from_toml(task_toml)
 
@@ -620,15 +1261,21 @@ def _build_problem_entry(
     prompt = _append_runtime_notices(prompt, required_resources)
     preloaded_manifest = load_preloaded_manifest(problem_dir)
     required_tools = (overrides or {}).get("required_tools", runner.required_tools)
-    # Derive the Taiga isolation runtime from the resolved resource tier so
-    # accelerator tasks deploy under gVisor and CPU tasks under firecracker. The
-    # task.toml runner.container_runtime literal (firecracker/docker) is a
-    # LOCAL-harness knob and is intentionally NOT forwarded to Taiga -- pinning a
-    # GPU task to firecracker would ship it under the wrong sandbox. An explicit
-    # override still wins.
-    container_runtime = (overrides or {}).get(
-        "container_runtime"
-    ) or _taiga_container_runtime(required_resources)
+    runtime_override = (overrides or {}).get("container_runtime")
+    if capabilities is not None:
+        if runtime_override not in (None, "firecracker"):
+            raise ValueError(
+                "capability-aware Taiga export requires container_runtime="
+                f"'firecracker' for nested Docker; got {runtime_override!r}"
+            )
+        container_runtime = "firecracker"
+    else:
+        # Derive the Taiga isolation runtime from the resolved resource tier so
+        # accelerator tasks deploy under gVisor and CPU tasks under firecracker.
+        # The task.toml runner.container_runtime literal is a LOCAL-harness knob.
+        container_runtime = runtime_override or _taiga_container_runtime(
+            required_resources
+        )
     enable_anthropic_api = (overrides or {}).get(
         "enable_anthropic_api", runner.enable_anthropic_api
     )
@@ -638,6 +1285,14 @@ def _build_problem_entry(
         # Keep task.toml [[outputs]] available to local Taiga-format harness
         # readers and QA tools that inspect extra_fields.task_metadata.
         task_metadata["outputs"] = outputs
+    if capabilities is not None:
+        assert contract_assertion is not None
+        task_metadata["capability_summary"] = _capability_summary(
+            task_toml,
+            capabilities,
+            contract_assertion=contract_assertion,
+            selected_required_resources=required_resources,
+        )
     extra_fields: dict[str, Any] = {
         "test_file": shim,
         # The in-image rubric runtime uses this as its internal subprocess
@@ -741,7 +1396,11 @@ def _build_problem_entry(
         "required_resources": required_resources,
         "container_runtime": container_runtime,
         "enable_anthropic_api": enable_anthropic_api,
-        "output_directory": "/tmp/output",
+        "output_directory": (
+            task_toml.result.output_root
+            if capabilities is not None and task_toml.result is not None
+            else "/tmp/output"
+        ),
         # Schema-required per-problem field (Taiga job_runner). ML_Envs pins
         # "allowed" on every problem; omit it and the problem entry fails the
         # per-problem schema's `required` check at submit.
@@ -754,6 +1413,11 @@ def _build_problem_entry(
         "metadata": metadata,
         "extra_fields": extra_fields,
     }
+    if capabilities is not None:
+        workspace = model_dump(task_toml.workspace)
+        entry["code_root"] = str(
+            workspace.get("agent_cwd") or workspace.get("root") or "/workdir"
+        )
     hints = _taiga_hints(task_toml)
     if hints:
         entry["hints"] = hints
@@ -830,17 +1494,26 @@ def build_job_payload(
     problem_dir: Path,
     *,
     image_ref: str,
+    image_is_outer_capsule: bool = False,
     n_attempts: int | None = None,
     turn_limit: int | None = None,
     max_ctx: int | None = None,
     model: str | None = None,
     environment_id: str | None = None,
 ) -> dict[str, Any]:
-    """Build a single-problem Boreal job payload."""
+    """Build a single-problem Boreal job payload.
+
+    Trusted export code must explicitly assert that a capability task's
+    ``image_ref`` is its built outer capsule. Author metadata is not trust evidence.
+    """
     task_toml = load_task_toml(problem_dir)
     runner = task_toml.runner
 
-    problem_entry = _build_problem_entry(problem_dir, image_ref=image_ref)
+    problem_entry = _build_problem_entry(
+        problem_dir,
+        image_ref=image_ref,
+        image_is_outer_capsule=image_is_outer_capsule,
+    )
     job_fields = _job_level_fields(
         runner,
         n_attempts=n_attempts,
@@ -848,7 +1521,7 @@ def build_job_payload(
         max_ctx=max_ctx,
         model=model,
         environment_id=environment_id,
-        max_episode_sec=_effective_timeouts(task_toml)[3],
+        max_episode_sec=_submission_timeouts(task_toml)[3],
     )
 
     payload: dict[str, Any] = {
@@ -875,6 +1548,7 @@ def build_batch_job_payload(
     problem_dirs: list[Path],
     *,
     image_refs: dict[str, str],
+    image_is_outer_capsule: bool = False,
     n_attempts: int | None = None,
     turn_limit: int | None = None,
     max_ctx: int | None = None,
@@ -905,6 +1579,7 @@ def build_batch_job_payload(
                 pd,
                 image_ref=image_refs[pid],
                 overrides=overrides,
+                image_is_outer_capsule=image_is_outer_capsule,
             )
         )
 
@@ -917,7 +1592,7 @@ def build_batch_job_payload(
         max_ctx=max_ctx,
         model=model,
         environment_id=environment_id,
-        max_episode_sec=_effective_timeouts(first_toml)[3],
+        max_episode_sec=_submission_timeouts(first_toml)[3],
     )
 
     shared_resources = validate_required_resources(
@@ -957,6 +1632,7 @@ def export_taiga(
     output_path: Path,
     *,
     image_ref: str = "PLACEHOLDER",
+    image_is_outer_capsule: bool = False,
 ) -> dict[str, Any]:
     """Write the legacy ``problems-metadata.json`` shape and the
     ``.taiga_submit.json`` sidecar.
@@ -968,7 +1644,11 @@ def export_taiga(
     """
     task_toml = load_task_toml(problem_dir)
     resources = _derive_resources_from_toml(task_toml)
-    problem_entry = _build_problem_entry(problem_dir, image_ref=image_ref)
+    problem_entry = _build_problem_entry(
+        problem_dir,
+        image_ref=image_ref,
+        image_is_outer_capsule=image_is_outer_capsule,
+    )
 
     metadata = {
         "problem_set": {

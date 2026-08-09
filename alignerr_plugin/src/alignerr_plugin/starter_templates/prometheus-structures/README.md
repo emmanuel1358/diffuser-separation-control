@@ -36,12 +36,16 @@ Notes:
 - Harbor/Prometheus runs the agent as uid 1000 (`[agent].user = "agent"`) and the
   verifier as root (`[verifier].user = "root"`) so private scorer data under
   `/mcp_server/data` stays out of the agent sandbox.
-- Review readiness: green `trusted-ci/grade` (Prometheus average `<= 0.5`
-  included), Boreal required QA complete on the LBx Validation comment or
-  dashboard, and no unresolved critical findings. Warnings/info are fine;
-  Boreal average is not a blocker. Self-iterate on clear criticals; submit for
-  coaching when stuck or acceptance when gates pass, and name which Boreal
-  surface is latest.
+- Review readiness: clear **either** score lane (see
+  [`docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](../../../../../docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md)):
+  **Prometheus** — green CI, mean `<= 0.6`, stddev `>= 0.08`; or **Achilles** —
+  green CI, Boreal mean `<= 0.4` (independent of Prometheus).
+- Boreal QA is required on **both** lanes: wait for Boreal QA to post results on
+  the current head and clear its criticals before submitting. A passing
+  Prometheus score gate alone is not permission to submit. Warnings/info are
+  fine. Self-iterate on clear criticals; document false positives (including
+  Data Quality treating an output filename as a missing input). When submitting,
+  use the dual-lane PR comment template so the reviewer knows which lane applies.
 - Submit a new, original problem. Problems already submitted to the original CFD
   or structures projects, or previously submitted to Boreal, must not be
   resubmitted to Prometheus. Those submissions will be rejected, count as

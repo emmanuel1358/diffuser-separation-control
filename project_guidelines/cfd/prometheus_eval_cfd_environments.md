@@ -61,7 +61,9 @@ After you finish authoring, the eval acceptance path is:
    instruction.
 4. The only acceptance gate is the Prometheus target average `<= 0.500`.
    Standard deviation and the trainability audit are diagnostic context, not
-   approval gates.
+   approval gates. The dual Prometheus/Achilles submit lanes in
+   [`docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](../../docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md)
+   apply to **non-eval** production CFD/structures only — not to eval rows.
 5. Boreal / LBx Validation QA may still appear for coaching. It is
    **non-blocking** for eval: Boreal findings, required-QA completeness, and
    the Boreal average score do **not** gate eval acceptance. Use them if

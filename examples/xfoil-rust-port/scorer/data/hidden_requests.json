@@ -1,0 +1,94 @@
+[
+  {
+    "protocol": "transform/v1",
+    "case_id": "hidden-geometry-2711",
+    "suite": "geometry",
+    "operation": "naca_geometry",
+    "designation": 2711,
+    "nside": 97
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "hidden-geometry-3514",
+    "suite": "geometry",
+    "operation": "naca_geometry",
+    "designation": 3514,
+    "nside": 111
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "hidden-inviscid-2711-a137",
+    "suite": "inviscid",
+    "operation": "analyze_inviscid",
+    "designation": 2711,
+    "alpha": 1.37,
+    "panels": 140,
+    "mach": 0.0
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "hidden-inviscid-6412-a263",
+    "suite": "inviscid",
+    "operation": "analyze_inviscid",
+    "designation": 6412,
+    "alpha": 2.63,
+    "panels": 140,
+    "mach": 0.07
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "hidden-viscous-4415-a263",
+    "suite": "viscous",
+    "operation": "analyze_viscous",
+    "designation": 4415,
+    "alpha": 2.63,
+    "panels": 140,
+    "reynolds": 1230000.0,
+    "mach": 0.0,
+    "ncrit": 8.5,
+    "iterations": 150
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "hidden-viscous-3514-a075",
+    "suite": "viscous",
+    "operation": "analyze_viscous",
+    "designation": 3514,
+    "alpha": 0.75,
+    "panels": 140,
+    "reynolds": 1100000.0,
+    "mach": 0.0,
+    "ncrit": 9.5,
+    "iterations": 200
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "hidden-polar-2711",
+    "suite": "polar_state",
+    "operation": "polar",
+    "designation": 2711,
+    "alpha_start": -1.5,
+    "alpha_end": 4.5,
+    "alpha_step": 1.5,
+    "panels": 140,
+    "reynolds": 1125000.0,
+    "mach": 0.0,
+    "ncrit": 8.5,
+    "iterations": 120
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "hidden-polar-3514",
+    "suite": "polar_state",
+    "operation": "polar",
+    "designation": 3514,
+    "alpha_start": -0.75,
+    "alpha_end": 5.25,
+    "alpha_step": 1.5,
+    "panels": 140,
+    "reynolds": 1375000.0,
+    "mach": 0.05,
+    "ncrit": 9.25,
+    "iterations": 120
+  }
+]

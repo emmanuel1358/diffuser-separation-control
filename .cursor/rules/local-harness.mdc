@@ -7,9 +7,9 @@ alwaysApply: false
 # Local Harness
 
 - Use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>` while iterating on `solution/solve.sh` (train/solve + grade with persistent cache under `.alignerr/reference_cache/output`). Use `--skip-solve` to re-grade cached artifacts, `--no-grade` to train only, and `--clean-cache` to wipe the cache. For `multi_deterministic_rubrics`, reference also refreshes sealed `scorer/evaluation.plan.json` from `TASK` — commit it; never hand-edit.
-- Use `uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime ground-truth` before opening a PR; this updates `.alignerr/build_proof.json` with `ground_truth_result` and refreshes the rubric evaluation plan when applicable.
+- Use `uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime ground-truth` as optional local oracle preflight; this updates local evidence and refreshes the rubric evaluation plan when applicable.
 - Use `uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime agent` for optional local DeepAgents runs (requires API keys in `.env.local`).
-- A successful ground-truth run creates or overwrites `problems/<task_id>/.alignerr/build_proof.json`; before opening or updating a PR, commit that file with the task (plus any refreshed `scorer/evaluation.plan.json`).
+- Trusted CI generates authoritative build proof/lock evidence from the immutable PR. Do not commit local generated proof/lock files; commit refreshed `scorer/evaluation.plan.json` and declared reviewed media.
 - `lbx-rl-template validate` only **checks** the sealed plan (`check_evaluation_plan`); it does not write it. Trusted CI reseals via an explicit refresh step before validate.
 - If an agent can reason but cannot write `/tmp/output/<artifact>`, check that the task Dockerfile includes `WORKDIR /workdir` and `chown -R 1000:1000 /workdir /tmp/output`.
 - The harness auto-loads `.env.local`; never read or print `.env.local` contents.

@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from grading.faults import InfrastructureFault
 from grading.runtime_hardening import (
     AgentProcessQuiesceError,
     ProcessQuiesceError,
@@ -39,6 +40,11 @@ from grading.runtime_hardening import (
 from grading.secure_io import open_directory_fd, open_regular_file
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+from rubric.service_runtime import (
+    ServiceRuntimeAgentError,
+    TaskServiceRuntime,
+)
+from rubric.tool_runtime import ToolRequestError
 
 mcp = FastMCP("alignerr-rl-tasks")
 
@@ -54,6 +60,39 @@ _TRACE_OUTPUT_DIRNAME = ".lbx-evaluation"
 _TRACE_FILENAME = "evaluation-details.json"
 _TRACE_PATH_ENV = "LBX_EVALUATION_TRACE_PATH"
 _GRADING_TMPDIR = tempfile.gettempdir()
+_TASK_TOML_ENV = "RUBRIC_TASK_TOML_PATH"
+_SERVICE_SNAPSHOT_ENV = "LBX_SERVICE_ARTIFACT_SNAPSHOT"
+_SERVICE_MANIFEST_ENV = "LBX_SERVICE_ARTIFACT_MANIFEST"
+_SERVICE_RUNTIME_UNSET = object()
+_SERVICE_RUNTIME: TaskServiceRuntime | None | object = _SERVICE_RUNTIME_UNSET
+_SERVICE_RUNTIME_LOCK = threading.RLock()
+
+
+def _task_service_runtime() -> TaskServiceRuntime | None:
+    """Lazily load optional nested-service capabilities exactly once."""
+    global _SERVICE_RUNTIME
+    with _SERVICE_RUNTIME_LOCK:
+        if _SERVICE_RUNTIME is _SERVICE_RUNTIME_UNSET:
+            task_toml = Path(os.environ.get(_TASK_TOML_ENV, "/task/task.toml"))
+            _SERVICE_RUNTIME = TaskServiceRuntime.from_task_toml(task_toml)
+        return _SERVICE_RUNTIME  # type: ignore[return-value]
+
+
+def _shutdown_task_service_runtime() -> None:
+    """Best-effort nested-runtime teardown for normal MCP shutdown."""
+    with _SERVICE_RUNTIME_LOCK:
+        runtime = (
+            _SERVICE_RUNTIME if _SERVICE_RUNTIME is not _SERVICE_RUNTIME_UNSET else None
+        )
+    if runtime is not None:
+        try:
+            runtime.cleanup()
+        except Exception as exc:  # noqa: BLE001 - process shutdown must continue
+            print(
+                f"[SERVICE_RUNTIME] cleanup failed during shutdown: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -214,7 +253,7 @@ _SETUP_PRIVATE_ROOTS = (
 @mcp.tool()
 async def setup_problem(
     problem_id: str = Field(description="The id of the problem to solve"),
-    extra_fields: dict = None,
+    extra_fields: dict | None = None,
     use_hinted_problem: bool = True,
 ) -> str:
     """Return the task prompt."""
@@ -242,6 +281,12 @@ async def setup_problem(
     lock_down_public_readonly("/lbx-public-files")
     fields = _extra(extra_fields)
     _verify_continuous_evaluation(fields)
+    service_runtime = _task_service_runtime()
+    if service_runtime is not None:
+        # Service startup errors inherit InfrastructureFault.  Let the MCP
+        # boundary fail the setup call instead of giving the agent a rollout
+        # against a partially initialized stack.
+        service_runtime.start()
     return str(
         fields.get("task_prompt")
         or fields.get("prompt")
@@ -378,6 +423,36 @@ def _bias_agent_child_toward_oom(pid: int, *, proc_root: str = "/proc") -> None:
 @mcp.tool()
 async def bash(command: str = "", restart: bool = False) -> ToolResult:
     """Run a shell command in the agent workdir."""
+    try:
+        service_runtime = _task_service_runtime()
+    except InfrastructureFault as exc:
+        return ToolResult(error=str(exc))
+    if service_runtime is not None:
+        try:
+            if restart:
+                service_runtime.restart_main()
+            if not command:
+                return ToolResult(output="")
+            result = service_runtime.exec_main(command)
+        except InfrastructureFault as exc:
+            return ToolResult(error=str(exc))
+        if result.timed_out:
+            return ToolResult(
+                output=result.stdout,
+                error=(
+                    result.stderr
+                    or f"command timed out with status {result.returncode}"
+                ),
+            )
+        return ToolResult(
+            output=result.stdout,
+            error=(
+                result.stderr or f"command exited with status {result.returncode}"
+                if result.returncode
+                else None
+            ),
+        )
+
     _ = restart
     if not command:
         return ToolResult(output="")
@@ -385,7 +460,7 @@ async def bash(command: str = "", restart: bool = False) -> ToolResult:
         popen_kwargs = _agent_subprocess_kwargs()
     except RuntimeError as exc:
         return ToolResult(error=str(exc))
-    proc = subprocess.Popen(
+    proc = subprocess.Popen(  # noqa: ASYNC220 - legacy streaming tool contract
         command,
         shell=True,
         cwd=WORKDIR,
@@ -397,6 +472,34 @@ async def bash(command: str = "", restart: bool = False) -> ToolResult:
     _bias_agent_child_toward_oom(proc.pid)
     stdout, stderr = proc.communicate()
     return ToolResult(output=stdout, error=stderr if proc.returncode else None)
+
+
+@mcp.tool()
+async def task_mcp_list_tools(
+    server: str = Field(description="Declared task-local MCP server name"),
+) -> dict:
+    """List tools exposed by one ready declared task-local MCP server."""
+    service_runtime = _task_service_runtime()
+    if service_runtime is None:
+        raise ToolRequestError("this task does not declare task-local MCP servers")
+    return await service_runtime.task_mcp_list_tools(server)
+
+
+@mcp.tool()
+async def task_mcp_call(
+    server: str = Field(description="Declared task-local MCP server name"),
+    tool_name: str = Field(description="Tool name returned by task_mcp_list_tools"),
+    arguments: dict | None = None,
+) -> dict:
+    """Call one tool on a ready declared task-local MCP server."""
+    service_runtime = _task_service_runtime()
+    if service_runtime is None:
+        raise ToolRequestError("this task does not declare task-local MCP servers")
+    return await service_runtime.task_mcp_call(
+        server,
+        tool_name,
+        arguments,
+    )
 
 
 # Resolved at module load — before the agent ever gets control — so a later
@@ -501,7 +604,7 @@ async def str_replace_editor(
     new_str: str = "",
     insert_line: int = 0,
     insert_text: str = "",
-    view_range: list = None,
+    view_range: list | None = None,
 ) -> ToolResult:
     """Minimal file editor compatible with common str_replace_editor calls.
 
@@ -514,8 +617,27 @@ async def str_replace_editor(
     """
     _ = view_range
     try:
+        service_runtime = _task_service_runtime()
+    except InfrastructureFault as exc:
+        return ToolResult(error=str(exc))
+    if service_runtime is not None:
+        try:
+            output = service_runtime.edit_main_file(
+                command=command,
+                path=path,
+                file_text=file_text,
+                old_str=old_str,
+                new_str=new_str,
+                insert_line=insert_line,
+                insert_text=insert_text,
+            )
+        except (InfrastructureFault, OSError, ValueError) as exc:
+            return ToolResult(error=f"{type(exc).__name__}: {exc}")
+        return ToolResult(output=output)
+
+    try:
         target = _resolve_agent_path(path)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - untrusted tool argument boundary
         return ToolResult(error=f"{type(exc).__name__}: {exc}")
 
     request = {
@@ -532,7 +654,7 @@ async def str_replace_editor(
     except RuntimeError as exc:
         return ToolResult(error=str(exc))
     editor_args = [sys.executable, "-P", "-c", _EDITOR_WORKER]
-    editor = subprocess.Popen(
+    editor = subprocess.Popen(  # noqa: ASYNC220 - isolated editor worker
         editor_args,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -561,7 +683,7 @@ async def str_replace_editor(
 _RUNNER = textwrap.dedent("""
     import sys
     sys.path[:] = [p for p in sys.path if p not in ("", ".")]
-    import json, math, os, traceback
+    import inspect, json, math, os, traceback
     from pathlib import Path
 
     # Grader-only deps (/mcp_server/grading_deps) must be importable BEFORE the
@@ -640,13 +762,24 @@ _RUNNER = textwrap.dedent("""
                     _transcript = _tf.read()
             except OSError:
                 _transcript = ""
+        _service_root = Path(
+            os.environ.get("LBX_SERVICE_ARTIFACT_SNAPSHOT") or "/tmp/output"
+        )
+        if not _service_root.is_dir():
+            _service_root = Path("/tmp/output")
         namespace = {
             "__name__": "agent_test_module",
             "__file__": "/mcp_server/grader/compute_score.py",
             "__builtins__": __builtins__,
             "TRANSCRIPT": _transcript,
             "TRANSCRIPT_PATH": _transcript_path,
+            "SERVICE_ARTIFACT_ROOT": _service_root,
+            "SERVICE_ARTIFACT_MANIFEST": Path(
+                os.environ.get("LBX_SERVICE_ARTIFACT_MANIFEST")
+                or "/tmp/output/manifest.json"
+            ),
         }
+        namespace["WORKSPACE"] = namespace["SERVICE_ARTIFACT_ROOT"]
         try:
             from grading.faults import AgentFault, GraderFault, InfrastructureFault
         except Exception:
@@ -664,18 +797,45 @@ _RUNNER = textwrap.dedent("""
                 from grading.evaluation import RubricTask
             except Exception:
                 RubricTask = ()
+            workspace = namespace["SERVICE_ARTIFACT_ROOT"]
+            private = Path("/mcp_server/data")
             if isinstance(registered_task, RubricTask):
                 compute = lambda: registered_task.grade(
-                    workspace=Path("/tmp/output"),
+                    workspace=workspace,
                     trajectory=_transcript,
-                    private=Path("/mcp_server/data"),
+                    private=private,
                 )
+            elif callable(compute):
+                original_compute = compute
+                signature = inspect.signature(original_compute)
+                try:
+                    signature.bind(workspace, _transcript, private)
+                except TypeError:
+                    try:
+                        signature.bind()
+                    except TypeError as _signature_exc:
+                        raise RuntimeError(
+                            "compute_score must accept either no arguments or "
+                            "(workspace, trajectory, private)"
+                        ) from _signature_exc
+                    compute = lambda: original_compute()
+                else:
+                    compute = lambda: original_compute(
+                        workspace,
+                        _transcript,
+                        private,
+                    )
             if not callable(compute):
                 raise RuntimeError(
                     "test_file defines neither TASK=RubricTask(...) nor compute_score()"
                 )
             try:
-                result = compute()
+                previous_cwd = os.getcwd()
+                os.chdir(workspace)
+                try:
+                    result = compute()
+                finally:
+                    os.chdir(previous_cwd)
             except AgentFault as exc:
                 payload = _scalar_payload(
                     0.0,
@@ -1543,7 +1703,7 @@ def _evaluate(
             if payload is not None:
                 try:
                     grade = _grade_from_payload(payload)
-                except Exception:
+                except Exception:  # noqa: BLE001 - untrusted result boundary
                     grade = None
                 if grade is not None:
                     grade.metadata = {**metadata, **(grade.metadata or {})}
@@ -1614,7 +1774,7 @@ def _evaluate(
                 )
         try:
             grade = _grade_from_payload(payload)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - untrusted result boundary
             message = f"could not normalize rubric result: {type(exc).__name__}: {exc}"
             return _failure_grade(
                 metadata,
@@ -1659,12 +1819,64 @@ def _evaluate(
 async def grade_problem(
     problem_id: str,
     transcript: str = Field(description="The full transcript produced by the model"),
-    extra_fields: dict = None,
+    extra_fields: dict | None = None,
 ) -> Grade:
     """Grade by executing the image-baked grader through the test_file shim."""
     _ = problem_id
     fields = _extra(extra_fields)
     _verify_continuous_evaluation(fields)
+    os.environ.pop(_SERVICE_SNAPSHOT_ENV, None)
+    os.environ.pop(_SERVICE_MANIFEST_ENV, None)
+    try:
+        service_runtime = _task_service_runtime()
+        service_result = (
+            service_runtime.finalize_and_verify()
+            if service_runtime is not None
+            else None
+        )
+        service_handoff = (
+            service_runtime.grader_handoff() if service_runtime is not None else None
+        )
+        if service_handoff is not None:
+            os.environ[_SERVICE_SNAPSHOT_ENV] = str(service_handoff.workspace)
+            os.environ[_SERVICE_MANIFEST_ENV] = str(service_handoff.manifest)
+    except ServiceRuntimeAgentError as exc:
+        return _failure_grade(
+            {
+                "failure_classification": "service_runtime_agent_fault",
+                "agent_fault": str(exc),
+            },
+            str(exc),
+            env_internal_failure=False,
+        )
+    except InfrastructureFault as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        return _failure_grade(
+            {"failure_classification": "service_runtime_infrastructure"},
+            message,
+            env_internal_failure=True,
+            env_internal_failure_logs=[message],
+        )
+    if service_result is not None:
+        try:
+            grade = _grade_from_payload(service_result.payload)
+        except Exception as exc:  # noqa: BLE001 - untrusted result boundary
+            message = (
+                "could not normalize nested verifier result: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return _failure_grade(
+                {"failure_classification": "service_verifier_result"},
+                message,
+                env_internal_failure=True,
+                env_internal_failure_logs=[message],
+            )
+        grade.metadata = {
+            "service_runtime": "nested-docker",
+            "service_verifier_result_dir": str(service_result.result_dir),
+            **(grade.metadata or {}),
+        }
+        return grade
     test_file = fields.get("test_file")
     if not test_file:
         # A missing test_file is a caller/configuration fault, never an agent
@@ -1706,7 +1918,7 @@ def _shmem_reaper_loop(agent_uid: int, poll_s: float) -> None:
         try:
             if _shmem_over_reap_threshold(meminfo_kib()):
                 cleanup_agent_tmpfs(agent_uid)
-        except Exception:  # noqa: BLE001 - best-effort daemon
+        except Exception:  # noqa: BLE001, S110 - best-effort daemon
             pass
         time.sleep(poll_s)
 
@@ -1725,7 +1937,7 @@ def start_shmem_reaper(poll_s: float = _SHMEM_REAP_POLL_S) -> None:
             daemon=True,
             name="shmem-reaper",
         ).start()
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110 - best-effort startup
         pass
 
 
@@ -1743,7 +1955,7 @@ def main() -> None:
     _protect_grader_from_oom()
     try:
         _pre_grade_resource_cleanup()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - best-effort startup
         pass
     WORKDIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1764,4 +1976,7 @@ def main() -> None:
             file=sys.stderr,
             flush=True,
         )
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        _shutdown_task_service_runtime()

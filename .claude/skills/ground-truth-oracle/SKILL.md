@@ -13,8 +13,9 @@ description: Guides Alignerr RL task ground-truth/oracle submissions. Use when c
 - `reward_type = "continuous_scoring_function"` references must score `0.5 ± 0.05`.
 - Continuous ML (`task_type=ml`) commits an inference-only strategy plus digest manifest. Keep `model.manifest.json` for existing trained models; use `strategy.manifest.json` with explicit `trained_model` / `committed_artifact` kind for procedural training or hand-authored policies/static artifacts. Non-tabular calibration also commits `WorkspaceDegenerateProbes` under `baselines/degenerate/`. Trusted CI / ground-truth never train. See `docs/ML_TASKS.md` §4 / `docs/GROUND_TRUTH.md`.
 - If a MuJoCo task needs a trained policy/model, commit the trained artifact or deterministic exporter under `solution/`; full training code is optional provenance, not the validation path.
-- Reviewer video is required for `mujoco` tasks. Declare it in `[ground_truth]` and generate it with `solution/render.sh`.
-- Reviewer videos are MuJoCo-specific and must be 16:9 720p: exactly `1280x720`.
+- Reviewer video is required for `mujoco` tasks. Any task may declare reviewer
+  media through `[ground_truth].render_outputs`.
+- MuJoCo videos must be H.264, exactly `1280x720`.
 
 ## Required `task.toml`
 
@@ -46,7 +47,7 @@ uv run lbx-rl-harness reference --problem-dir problems/<task_id>
 uv run lbx-rl-harness reference --problem-dir problems/<task_id> --skip-solve
 ```
 
-### Before PR
+### Optional local preflight
 
 Run:
 
@@ -54,7 +55,7 @@ Run:
 uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime ground-truth
 ```
 
-This command must:
+This command should:
 
 1. run `solution/solve.sh`;
 2. grade with `scorer/compute_score.py`;
@@ -62,12 +63,13 @@ This command must:
 4. for `mujoco` tasks, run `[ground_truth].render_command`;
 5. for `mujoco` tasks, fail unless each video exists, is non-empty, and is `1280x720`;
 6. for `mujoco` tasks, copy videos to `problems/<task_id>/.alignerr/ground_truth/`;
-7. record `ground_truth_result.review_artifacts[]` in `.alignerr/build_proof.json` with `path`, `logical_path`, `sha256`, `bytes`, `width`, and `height`.
+7. record local development evidence for inspection.
 
-Commit both:
+Trusted CI generates the authoritative `.alignerr/build_proof.json` from the
+immutable PR revision. Do not commit local generated proof/lock files. Commit
+declared, reviewed media:
 
 ```bash
-git add problems/<task_id>/.alignerr/build_proof.json
 git add problems/<task_id>/.alignerr/ground_truth/
 ```
 
@@ -75,13 +77,15 @@ git add problems/<task_id>/.alignerr/ground_truth/
 
 - Do not treat agent difficulty scores as oracle/reference scores. Agents should generally remain below the task difficulty threshold, while ground-truth submissions must match the declared `reward_type` target.
 - Do not store generated review videos in `solution/` or `.harness-runs/` as the PR artifact.
-- Do not require rendering videos for `ml` tasks unless the task explicitly needs one.
-- Do not accept videos without checksum/size/dimension metadata in `build_proof.json`.
+- Do not require rendering videos for `ml` tasks unless the task explicitly
+  needs one.
+- Do not accept videos without checksum/size/dimension metadata in trusted CI
+  evidence.
 
 ## References
 
 - `docs/GROUND_TRUTH.md`
+- `docs/AUTHORING.md`
 - `examples/mujoco-pendulum/solution/render_config.py`
-
 - `lbx_rl_tasks_harness.render_mujoco`
 - MuJoCo policies should expose `act(obs)` or `class Policy` with `act(obs)`.

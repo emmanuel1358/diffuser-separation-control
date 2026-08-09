@@ -1,0 +1,5 @@
+# Harbor merges this trusted runtime override onto its generated main service.
+services:
+  main:
+    cap_add:
+      - SYS_PTRACE

@@ -93,6 +93,13 @@ task Dockerfile generic with `ARG BASE_IMAGE`, `ARG BASE_TAG`, and
 automatically. Local GPU execution still requires Docker/NVIDIA GPU support on
 the authoring machine.
 
+MuJoCo and NumPy are centrally pinned in `base/requirements-runtime.txt` and
+the sealed rubric runtime. Do not install a different version in the task
+Dockerfile or override those pins in task dependency files. The MuJoCo starter
+lists the base-provided packages in `environment/requirements.txt` to declare
+the agent-visible dependency set; keep those declarations compatible with the
+base rather than adding independent version pins.
+
 The grader should still be deterministic. GPU may be required for training or
 policy/model execution, but scoring must use fixed seeds, fixed scenarios,
 bounded rollouts, and reproducible metrics.
@@ -107,6 +114,45 @@ A task has three pieces:
    evaluator returns the declared deterministic criterion values.
 
 The grader is the whole game. A wrong grader teaches the wrong lesson. A gameable grader gets gamed.
+
+## Scene and Simulation Assets
+
+Make the task's public simulation contract explicit. When the agent is meant to
+solve against a disclosed plant, put its scene builder and required assets in
+`data/` so the same implementation is visible at `/data` and can be reused by
+the scorer and `solution/render.sh`. Put only held-out cases, seeds, targets, or
+genuinely hidden dynamics in `scorer/data/`, which is exposed to the grader at
+root-only `/mcp_server/data`.
+
+If hidden dynamics are essential to the task, use the repository's
+[`hidden_env`](../../docs/HIDDEN_ENV.md) contract instead of quietly hiding a
+second implementation of an otherwise public plant. This keeps the agent's
+observation and interaction boundary explicit and reviewable.
+
+Follow these conventions:
+
+- **Treat `/data` as immutable.** The runtime locks the public tree read-only
+  before the agent starts. Do not weaken that boundary in the task Dockerfile,
+  and never place secrets or expected answers there.
+- **Address state by name, not by position.** Resolve joints, actuators,
+  sensors, bodies, sites, and their `qpos`/`qvel`/`ctrl` addresses from the
+  compiled model. Positional assumptions break when the MJCF hierarchy or
+  attach order changes.
+- **Controllers see observations; scorers may inspect simulator state.** Pass
+  only the declared public observation through `context.policy(...)`. Do not
+  send `MjModel`, `MjData`, hidden targets, private paths, or grader-owned
+  objects to submitted policy code.
+- **Keep assets in the correct visibility boundary.** Public MJCF, meshes, and
+  textures belong under `data/`; held-out evaluation assets belong under
+  `scorer/data/`. Record upstream provenance and use only assets whose licenses
+  permit the task's use and redistribution.
+- **Release rendering resources.** Close MuJoCo renderers and GL contexts after
+  each rollout, including failure paths, so repeated hidden cases do not leak
+  contexts or GPU memory.
+
+The legacy pipeline's `lbx_assets` package and `/opt/lbx-assets` catalog are not
+part of the ISO template. Do not copy those imports into ISO tasks; vendor the
+required public assets under `data/` with their provenance instead.
 
 ## Grader Contract
 
@@ -143,7 +189,7 @@ TASK = RubricTask(
 ```
 
 Before writing rubric criteria, read the shared
-[rubric guidance](../docs/RUBRIC_GUIDANCE.md). MuJoCo rubrics should capture
+[rubric guidance](../../docs/RUBRIC_GUIDANCE.md). MuJoCo rubrics should capture
 the task-specific properties a robotics expert would evaluate, not generic
 robotics preferences or one arbitrary solution path.
 
@@ -176,7 +222,7 @@ such as the checked-in `examples/mujoco-pendulum` model-XML task do not need
 - create a fresh worker per hidden case when policy state should reset between
   cases.
 
-See [`docs/POLICY_ISOLATION.md`](../docs/POLICY_ISOLATION.md) before authoring
+See [`docs/POLICY_ISOLATION.md`](../../docs/POLICY_ISOLATION.md) before authoring
 or reviewing executable policy tasks.
 
 ## Three Properties of a Good Task
@@ -465,11 +511,11 @@ A PR attempt is eligible for payment when it meets all of these before review:
   criteria**. Strong MuJoCo tasks should still aim for the 10+ criterion
   structure described above.
 - If the task uses a continuous reward, follow the
-  [continuous reward functions](../docs/GRADING.md#continuous-reward-functions)
+  [continuous reward functions](../../docs/GRADING.md#continuous-reward-functions)
   pattern. The scoring function should be calibrated so current model attempts
   score at or below the human/reference baseline, not near the perfect score.
   See the grading guide's
-  [difficulty targets](../docs/GRADING.md#difficulty-targets) for the expected
+  [difficulty targets](../../docs/GRADING.md#difficulty-targets) for the expected
   baseline, reference, and perfect-score anchors.
 
 ### $$ Paid Accepted Task Criteria
@@ -538,7 +584,7 @@ A task is not ready until:
 ## Further Reading
 
 - Standard rubric guidance for task-specific, measurable criteria:
-  [`docs/RUBRIC_GUIDANCE.md`](../docs/RUBRIC_GUIDANCE.md).
+  [`docs/RUBRIC_GUIDANCE.md`](../../docs/RUBRIC_GUIDANCE.md).
 - MuJoCo documentation, especially model structure and `MjModel` / `MjData`.
 - MJX documentation for batched simulator throughput.
 - MuJoCo Playground for RL environment patterns.

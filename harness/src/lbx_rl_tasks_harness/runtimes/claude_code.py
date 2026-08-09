@@ -16,6 +16,7 @@ from lbx_rl_tasks_harness.docker import (
     copy_output_from_container,
     start_task_container,
     stop_task_container,
+    verifier_container_capabilities,
 )
 from lbx_rl_tasks_harness.mcp_bridge import RubricMcpBridge
 from lbx_rl_tasks_harness.models import HarnessProblem
@@ -389,7 +390,10 @@ async def run_claude_code(
     effective_model = effective_model_name(model_name)
     build = build_task_image(problem)
     image_tag = build.image_tag
-    started = start_task_container(image_tag)
+    started = start_task_container(
+        image_tag,
+        verifier_capabilities=verifier_container_capabilities(problem),
+    )
     try:
         async with RubricMcpBridge(started.container_id) as bridge:
             extra_fields = extra_fields_for_mcp(problem, image_tag)

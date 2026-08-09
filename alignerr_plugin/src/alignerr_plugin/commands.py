@@ -19,8 +19,9 @@ def create_problem(
         "ml",
         "--template",
         help=(
-            "Starter template: ml | mujoco | cfd | structures | prometheus | "
-            "prometheus-cfd | prometheus-structures | prometheus-eval-cfd | "
+            "Starter template: ml | mujoco | cfd | structures | "
+            "software-engineering | prometheus | prometheus-cfd | "
+            "prometheus-structures | prometheus-eval-cfd | "
             "prometheus-eval-structures"
         ),
     ),
@@ -53,9 +54,23 @@ def export_taiga(
     problem_dir: Path = typer.Option(..., "--problem-dir", "-d"),
     output: Path = typer.Option(Path("problems-metadata.json"), "--out", "-o"),
     image: str = typer.Option("PLACEHOLDER", "--image"),
+    outer_capsule: bool = typer.Option(
+        False,
+        "--outer-capsule",
+        help=(
+            "Trusted assertion that --image is the built outer capsule. Required "
+            "for capability tasks; production images must be digest-pinned "
+            "(LOCAL_IMAGE is allowed for local validation)."
+        ),
+    ),
 ) -> None:
     """Export task metadata for Boreal submission."""
-    sidecar = export_taiga_impl(problem_dir, output, image_ref=image)
+    sidecar = export_taiga_impl(
+        problem_dir,
+        output,
+        image_ref=image,
+        image_is_outer_capsule=outer_capsule,
+    )
     console.print(f"[green]Wrote Boreal metadata:[/green] {output}")
     console.print(sidecar)
 
@@ -64,12 +79,22 @@ def export_harbor(
     problem_dir: Path = typer.Option(..., "--problem-dir", "-d"),
     output_dir: Path = typer.Option(Path("harbor-export"), "--out", "-o"),
     image: str | None = typer.Option(
-        None, "--image", help="Digest-pinned Docker image to write into task.toml"
+        None,
+        "--image",
+        help=(
+            "Digest-pinned image to stamp for capability/separate-service tasks; "
+            "ignored for legacy self-contained exports."
+        ),
     ),
     runtime_notices: bool = typer.Option(
         True,
         "--runtime-notices/--no-runtime-notices",
         help="Include generated non-prompt runtime notices such as GPU/TPU availability.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Atomically replace an existing exporter-owned directory.",
     ),
 ) -> None:
     """Export a task directory in Harbor layout."""
@@ -78,5 +103,6 @@ def export_harbor(
         output_dir,
         image_ref=image,
         include_runtime_notices=runtime_notices,
+        force=force,
     )
     console.print(f"[green]Wrote Harbor export:[/green] {path}")

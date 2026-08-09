@@ -3,15 +3,17 @@ from __future__ import annotations
 import errno
 import os
 import stat
+import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
-from grading import helpers, runtime_hardening, score_kfold_cv
+from grading import helpers, policy_runner, runtime_hardening, score_kfold_cv
 from grading import kfold as kfold_module
-from grading.faults import AgentFault
+from grading.faults import AgentFault, GraderFault
 from grading.policy_runner import PolicyWorker
 
 
@@ -21,25 +23,67 @@ def _write_script(path: Path, body: str) -> Path:
     return path
 
 
-# ── run_submitted_executable (capture + streaming, uid-1000 drop) ──
-# The privilege drop no-ops as a non-root test process, so these run without setuid.
+# ── run_submitted_executable (capture + streaming, configured identity) ──
 
 
-def test_executable_capture_returns_stdout_and_returncode(tmp_path: Path) -> None:
+@pytest.fixture
+def local_submitted_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise process mechanics without pretending a local verifier is root."""
+    identity = (os.geteuid(), os.getegid(), str(Path.home()), "local-test-agent")
+    monkeypatch.setattr(
+        helpers,
+        "resolve_submitted_process_identity",
+        lambda: identity,
+    )
+
+    def local_spawn_config(_identity, *, cwd_fd, ipc_status_fd):
+        def enter_cwd() -> None:
+            try:
+                os.write(ipc_status_fd, b"\0")
+            finally:
+                os.close(ipc_status_fd)
+            if cwd_fd is not None:
+                os.fchdir(cwd_fd)
+                os.close(cwd_fd)
+
+        pass_fds = tuple(
+            descriptor
+            for descriptor in (cwd_fd, ipc_status_fd)
+            if descriptor is not None
+        )
+        return {"preexec_fn": enter_cwd, "pass_fds": pass_fds}
+
+    monkeypatch.setattr(
+        helpers,
+        "_submitted_process_spawn_config",
+        local_spawn_config,
+    )
+
+
+def test_executable_capture_returns_stdout_and_returncode(
+    tmp_path: Path,
+    local_submitted_execution: None,
+) -> None:
     exe = _write_script(tmp_path / "run.sh", "#!/bin/sh\necho hello\nexit 0\n")
     proc = helpers.run_submitted_executable([str(exe)], timeout_s=10)
     assert proc.returncode == 0
     assert b"hello" in proc.stdout
 
 
-def test_executable_passes_args_and_returncode(tmp_path: Path) -> None:
+def test_executable_passes_args_and_returncode(
+    tmp_path: Path,
+    local_submitted_execution: None,
+) -> None:
     exe = _write_script(tmp_path / "run.sh", '#!/bin/sh\necho "$1"\nexit 3\n')
     proc = helpers.run_submitted_executable([str(exe), "payload"], timeout_s=10)
     assert proc.returncode == 3
     assert proc.stdout.strip() == b"payload"
 
 
-def test_executable_stdin_bytes_piped_to_child(tmp_path: Path) -> None:
+def test_executable_stdin_bytes_piped_to_child(
+    tmp_path: Path,
+    local_submitted_execution: None,
+) -> None:
     exe = _write_script(tmp_path / "cat.sh", "#!/bin/sh\ncat\n")
     proc = helpers.run_submitted_executable(
         [str(exe)], stdin_bytes=b"ping", timeout_s=10
@@ -48,7 +92,9 @@ def test_executable_stdin_bytes_piped_to_child(tmp_path: Path) -> None:
 
 
 def test_executable_sanitized_env_hides_grader_secrets(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    local_submitted_execution: None,
 ) -> None:
     # Default (no explicit env / passthrough): a grading-server secret is not
     # visible to the agent binary.
@@ -61,7 +107,9 @@ def test_executable_sanitized_env_hides_grader_secrets(
 
 
 def test_executable_env_passthrough_exposes_parent_env(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    local_submitted_execution: None,
 ) -> None:
     monkeypatch.setenv("MY_TASK_CONFIG", "visible")
     exe = _write_script(
@@ -73,7 +121,10 @@ def test_executable_env_passthrough_exposes_parent_env(
     assert proc.stdout.strip() == b"visible"
 
 
-def test_executable_timeout_raises_agent_fault(tmp_path: Path) -> None:
+def test_executable_timeout_raises_agent_fault(
+    tmp_path: Path,
+    local_submitted_execution: None,
+) -> None:
     # A capture-mode timeout is an agent-caused failure: it must raise AgentFault
     # (kept 0.0), NOT the builtin TimeoutExpired, which would escape compute_score
     # as env_internal_failure and DISCARD the rollout (a free veto).
@@ -82,7 +133,10 @@ def test_executable_timeout_raises_agent_fault(tmp_path: Path) -> None:
         helpers.run_submitted_executable([str(exe)], timeout_s=0.3)
 
 
-def test_executable_stdout_flood_raises_agent_fault(tmp_path: Path) -> None:
+def test_executable_stdout_flood_raises_agent_fault(
+    tmp_path: Path,
+    local_submitted_execution: None,
+) -> None:
     # A stdout flood past max_output_bytes is killed and raised as AgentFault
     # (kept 0.0), so the child cannot OOM the grader (MemoryError would be a
     # non-AgentFault -> DISCARDED free veto).
@@ -96,7 +150,10 @@ def test_executable_stdout_flood_raises_agent_fault(tmp_path: Path) -> None:
         )
 
 
-def test_executable_capture_discards_stderr(tmp_path: Path) -> None:
+def test_executable_capture_discards_stderr(
+    tmp_path: Path,
+    local_submitted_execution: None,
+) -> None:
     # Capture mode discards stderr at the kernel (memory safety); stdout still
     # returned. The returned stderr is empty.
     exe = _write_script(
@@ -116,7 +173,11 @@ def test_executable_streaming_rejects_stdin_and_timeout(tmp_path: Path) -> None:
         helpers.run_submitted_executable([str(exe)], streaming=True, timeout_s=5)
 
 
-def test_executable_streaming_filters_rubric_score(tmp_path: Path, capsys) -> None:
+def test_executable_streaming_filters_rubric_score(
+    tmp_path: Path,
+    capsys,
+    local_submitted_execution: None,
+) -> None:
     # Streaming pumps to sys.stderr with RUBRIC_SCORE= dropped, so the child
     # cannot reach or forge the score-parsed stdout.
     exe = _write_script(
@@ -129,6 +190,146 @@ def test_executable_streaming_filters_rubric_score(tmp_path: Path, capsys) -> No
     err = capsys.readouterr().err
     assert "hello" in err and "world" in err
     assert "RUBRIC_SCORE=" not in err
+
+
+def test_executable_fails_closed_when_verifier_is_not_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        helpers,
+        "resolve_submitted_process_identity",
+        lambda: (1234, 1235, "/home/candidate", "candidate"),
+    )
+    monkeypatch.setattr(helpers.os, "geteuid", lambda: 501)
+    with pytest.raises(GraderFault, match="verifier must run as root"):
+        helpers.run_submitted_executable(["/bin/true"], timeout_s=1)
+
+
+def test_executable_isolates_ipc_before_using_configured_uid_gid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUBRIC_AGENT_USER", "configured-agent")
+    monkeypatch.setenv("RUBRIC_AGENT_UID", "2345")
+    monkeypatch.setenv("RUBRIC_AGENT_GID", "2346")
+    identity = helpers.resolve_submitted_process_identity()
+    assert identity[:2] == (2345, 2346)
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(helpers.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        helpers.os, "setgroups", lambda groups: calls.append(("groups", groups))
+    )
+    monkeypatch.setattr(helpers.os, "setgid", lambda gid: calls.append(("gid", gid)))
+    monkeypatch.setattr(helpers.os, "setuid", lambda uid: calls.append(("uid", uid)))
+    monkeypatch.setattr(
+        policy_runner,
+        "_LIBC",
+        type(
+            "FakeLibc",
+            (),
+            {
+                "unshare": staticmethod(
+                    lambda _arg: calls.append(("unshare", None)) or 0
+                )
+            },
+        )(),
+    )
+
+    ipc_status_r, ipc_status_w = os.pipe()
+    try:
+        config = helpers._submitted_process_spawn_config(
+            identity,
+            cwd_fd=None,
+            ipc_status_fd=ipc_status_w,
+        )
+        assert config["pass_fds"] == (ipc_status_w,)
+        config["preexec_fn"]()
+        ipc_status_w = -1
+        assert os.read(ipc_status_r, 1) == b"\0"
+    finally:
+        os.close(ipc_status_r)
+        if ipc_status_w >= 0:
+            os.close(ipc_status_w)
+
+    assert calls == [
+        ("unshare", None),
+        ("groups", []),
+        ("gid", 2346),
+        ("uid", 2345),
+    ]
+
+
+@pytest.mark.parametrize("failure_mode", ["timeout", "overflow"])
+def test_executable_kills_descendant_process_group(
+    tmp_path: Path,
+    local_submitted_execution: None,
+    failure_mode: str,
+) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    program = (
+        "import os, subprocess, sys, time\n"
+        "child = subprocess.Popen(['/bin/sleep', '30'])\n"
+        "with open(sys.argv[1], 'w') as handle:\n"
+        "    handle.write(str(child.pid))\n"
+        "if sys.argv[2] == 'overflow':\n"
+        "    while True:\n"
+        "        os.write(1, b'A' * 65536)\n"
+        "else:\n"
+        "    time.sleep(30)\n"
+    )
+    kwargs = (
+        {"timeout_s": 10, "max_output_bytes": 4096}
+        if failure_mode == "overflow"
+        else {"timeout_s": 1.0}
+    )
+    with pytest.raises(AgentFault):
+        helpers.run_submitted_executable(
+            [sys.executable, "-c", program, str(child_pid_path), failure_mode],
+            **kwargs,
+        )
+
+    child_pid = int(child_pid_path.read_text().strip())
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"descendant process {child_pid} survived {failure_mode}")
+
+
+def test_executable_kills_descendants_after_successful_leader_exit(
+    tmp_path: Path,
+    local_submitted_execution: None,
+) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    program = (
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(['/bin/sleep', '30'])\n"
+        "with open(sys.argv[1], 'w') as handle:\n"
+        "    handle.write(str(child.pid))\n"
+        "print('done')\n"
+    )
+
+    result = helpers.run_submitted_executable(
+        [sys.executable, "-c", program, str(child_pid_path)],
+        timeout_s=5,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == b"done\n"
+    child_pid = int(child_pid_path.read_text().strip())
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"descendant process {child_pid} survived successful leader exit")
 
 
 # ── load_submission_h5_or_fault ───────────────────────────────────────────

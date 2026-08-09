@@ -196,6 +196,12 @@ def test_every_self_contained_template_sets_the_shared_hf_home() -> None:
         assert f"ENV HF_HOME={HF_HOME}" in template
 
 
+def test_self_contained_templates_do_not_inherit_python_patch_version() -> None:
+    """The official Python image exports an exact version uv may not publish yet."""
+    for template in (_SELF_CONTAINED_DOCKERFILE, _SOLVER_SELF_CONTAINED_DOCKERFILE):
+        assert "ENV PYTHON_VERSION=3.13" in template
+
+
 def test_export_omits_task_deps_block_when_no_channels_declared(tmp_path: Path) -> None:
     problem_dir = _write_native_env_task(tmp_path / "no-channels")
     for rel in (

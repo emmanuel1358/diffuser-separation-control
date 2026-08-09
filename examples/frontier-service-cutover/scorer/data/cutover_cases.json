@@ -1,0 +1,38 @@
+{
+  "cases": [
+    {
+      "expected": {
+        "id": 11,
+        "value": "blue"
+      },
+      "record": {
+        "current": "blue",
+        "id": 11,
+        "legacy": "azure"
+      }
+    },
+    {
+      "expected": {
+        "id": 12,
+        "value": "green"
+      },
+      "record": {
+        "current": "green",
+        "id": 12,
+        "legacy": "olive"
+      }
+    },
+    {
+      "expected": {
+        "id": 13,
+        "value": "violet"
+      },
+      "record": {
+        "current": "violet",
+        "id": 13,
+        "legacy": "purple"
+      }
+    }
+  ],
+  "schema_version": "cutover-cases.v1"
+}

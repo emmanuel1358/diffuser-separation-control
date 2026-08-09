@@ -18,13 +18,14 @@ alwaysApply: false
 - Available resource enums: CPU `2vcpu+6gib`, `4vcpu+16gib`, `6vcpu+32gib`, `8vcpu+64gib`, `16vcpu+64gib`, `16vcpu+128gib`; CPU perf `2vcpu+6gib+perf`, `4vcpu+16gib+perf`, `6vcpu+32gib+perf`, `8vcpu+64gib+perf`, `16vcpu+64gib+perf`, `16vcpu+128gib+perf`; TPU `13vcpu+32gib+tpuv5e1x1`, `16vcpu+64gib+tpuv5e2x2`, `50vcpu+128gib+tpuv5e2x2`; H100 `3vcpu+25gib+h100/8`, `6vcpu+50gib+h100/4`, `12vcpu+100gib+h100/2`, `24vcpu+200gib+h100/1`; H100 graphics `3vcpu+25gib+h100/8+graphics`, `6vcpu+50gib+h100/4+graphics`, `12vcpu+100gib+h100/2+graphics`, `24vcpu+200gib+h100/1+graphics`.
 - For accelerator tasks, keep Dockerfiles generic with `ARG BASE_IMAGE`, `ARG BASE_TAG`, and `FROM ${BASE_IMAGE}:${BASE_TAG}` so the harness and mothership can inject the right base (`base_flavor = "auto"` infers CPU/GPU/graphics/TPU from `required_resources`).
 - Use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>` while developing the reference solution (especially ML training loops); use `--skip-solve` to re-grade cached outputs without rerunning training. For rubric tasks this also refreshes sealed `scorer/evaluation.plan.json` from `TASK` — commit that generated file.
-- Use `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` before opening or updating a PR; commit the generated `problems/<task_id>/.alignerr/build_proof.json` (and any refreshed `scorer/evaluation.plan.json`).
+- Use `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` as local preflight; commit refreshed `scorer/evaluation.plan.json` and declared reviewer media, not local generated proof/lock files. Trusted CI generates authoritative evidence.
 - Run `uv run lbx-rl-harness run --problem-dir problems/<task_id>` after changing task config, Dockerfile, grader code, or image-copied data when you need a full local check including optional agent feedback.
 - Every task must include a ground-truth/reference `solution/solve.sh` that matches the declared `[difficulty].reward_type` target under the same `scorer/compute_score.py` used for agents. Rubric tasks declare `TASK = RubricTask(...)` (no author `compute_score()`); see `docs/RUBRIC_EVALUATION.md`.
 - Every task must declare enum-backed `[difficulty].task_type`, `[difficulty].domain`, and `[difficulty].reward_type`; master values live in `alignerr_plugin.task_metadata`.
-- `task_type` values are `ml`, `mujoco`, `cfd`, `structures`; `domain` is scoped by task type and includes multiple values per type (see `alignerr_plugin.task_metadata`).
+- `task_type` values are `ml`, `mujoco`, `cfd`, `structures`, `software_engineering`; `domain` is scoped by task type and includes multiple values per type (see `alignerr_plugin.task_metadata`).
+- `software_engineering` may use the simple single-image `/tmp/output/repo` contract or a service graph with a service-owned repository artifact, per-service Dockerfiles, an isolated verifier, and a canonical result under `/tmp/output`. Read the software rule/skills; acceptance requires green trusted CI and Boreal aggregate `<= 0.4`.
 - `reward_type` values are `continuous_scoring_function` (reference target `0.5 ± 0.05`) and `multi_deterministic_rubrics` (oracle target `1.0`).
-- `ml` tasks must declare `[difficulty].license`: a permissive SPDX id from `task_metadata.LICENSES` (MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unlicense, CC0-1.0, CC-BY-4.0, PDDL-1.0, UPL-1.0), or `not_applicable` for edge cases with no external dataset. Trace the license upstream; copyleft / non-commercial / research-only data is rejected. Other task types may omit it.
+- `ml` tasks must declare `[difficulty].license`: a permissive SPDX id from `task_metadata.LICENSES`, or `self_generated` for fully synthetic data. Trace licenses upstream; copyleft/non-commercial/research-only data is rejected. Other task types may omit it.
 - For continuous-scored ml tasks (dataset/CSV, model module, executable, HDF5,
   k-fold), read submissions via sanctioned component-safe loaders (use
   `open_submission_file_or_fault` for a custom parser) and calibrate with
@@ -40,5 +41,5 @@ alwaysApply: false
 - MuJoCo policy artifacts should expose `act(obs)` or `class Policy` with `act(obs)`; optional `reset(seed=None, metadata=None)` is supported.
 - Use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>` to check the oracle without calling an LLM and without refreshing build proof (ideal for ML iteration).
 - Use `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` before PR to update build proof.
-- Commit both `problems/<task_id>/.alignerr/build_proof.json` and generated videos under `problems/<task_id>/.alignerr/ground_truth/`.
+- Commit declared reviewed videos under `.alignerr/ground_truth/`; trusted CI owns authoritative `build_proof.json`.
 - `ground_truth_result.review_artifacts[]` must include `path`, `logical_path`, `sha256`, `bytes`, `width`, and `height`.

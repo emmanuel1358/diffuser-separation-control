@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,7 @@ from grading.evaluation import (
     RubricEvaluation,
     RubricTask,
     TrustedJson,
+    WorkspaceArtifact,
 )
 from grading.evaluation.plan import validate_serialized_plan
 from grading.numeric import NumericContractError, safe_mean, safe_ratio
@@ -213,6 +216,337 @@ def test_rubric_spec_is_stable_and_json_serializable() -> None:
     payload = {**plan.to_dict(), "plan_sha256": plan.sha256}
     assert payload["schema_version"] == "evaluation-plan.v2"
     assert validate_serialized_plan(payload) == plan.sha256
+
+
+def test_workspace_artifact_cleans_caches_and_validates_source(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    (repo / "src").mkdir(parents=True)
+    source = b"fn main() {}\n"
+    (repo / "src" / "main.rs").write_bytes(source)
+    (repo / "target").mkdir()
+    (repo / "target" / "cached-binary").write_bytes(b"\x7fELF")
+
+    artifact = WorkspaceArtifact(
+        "repo",
+        clean_paths=("target",),
+        forbidden_text_patterns=("std::process::Command",),
+        text_suffixes=(".rs",),
+    )
+    loaded = artifact.load(workspace)
+
+    assert loaded.path != repo
+    assert loaded.snapshot_path == loaded.path
+    assert loaded.original_path == repo
+    assert (loaded.path / "src" / "main.rs").read_bytes() == source
+    assert loaded.file_count == 1
+    assert loaded.total_bytes == len(source)
+    assert not (repo / "target").exists()
+    assert not (loaded.path / "target").exists()
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "match"),
+    [
+        ("payload.bin", b"\x7fELF\x00\x00", "native payload"),
+        (
+            "main.rs",
+            b'fn main() { std::process::Command::new("legacy"); }',
+            "forbidden pattern",
+        ),
+        (
+            "main.rs",
+            b'fn main() { std :: process :: Command :: new("legacy"); }',
+            "forbidden pattern",
+        ),
+    ],
+)
+def test_workspace_artifact_rejects_delegation_payloads(
+    tmp_path: Path,
+    filename: str,
+    payload: bytes,
+    match: str,
+) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / filename).write_bytes(payload)
+    artifact = WorkspaceArtifact(
+        "repo",
+        forbidden_text_patterns=("std::process::Command",),
+        text_suffixes=(".rs",),
+    )
+
+    with pytest.raises(AgentFault, match=match):
+        artifact.load(workspace)
+
+
+@pytest.mark.parametrize(
+    ("filename", "artifact", "match"),
+    [
+        (
+            "build.rs",
+            WorkspaceArtifact("repo", forbidden_names=("build.rs",)),
+            "forbidden file",
+        ),
+        (
+            "payload.o",
+            WorkspaceArtifact("repo", forbidden_suffixes=(".o",)),
+            "forbidden suffix",
+        ),
+    ],
+)
+def test_workspace_artifact_rejects_forbidden_names_and_suffixes(
+    tmp_path: Path,
+    filename: str,
+    artifact: WorkspaceArtifact,
+    match: str,
+) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / filename).write_text("candidate\n")
+
+    with pytest.raises(AgentFault, match=match):
+        artifact.load(workspace)
+
+
+@pytest.mark.parametrize("target_kind", ["file", "directory"])
+def test_workspace_artifact_rejects_nested_symlinks(
+    tmp_path: Path,
+    target_kind: str,
+) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / "main.rs").write_text("fn main() {}\n")
+    target = tmp_path / "private"
+    if target_kind == "directory":
+        target.mkdir()
+    else:
+        target.write_text("private\n")
+    os.symlink(target, repo / "linked")
+
+    with pytest.raises(AgentFault, match="non-regular"):
+        WorkspaceArtifact("repo").load(workspace)
+
+
+def test_workspace_artifact_rejects_special_files(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs are unavailable on this platform")
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / "main.rs").write_text("fn main() {}\n")
+    os.mkfifo(repo / "candidate.pipe")
+
+    with pytest.raises(AgentFault, match="non-regular"):
+        WorkspaceArtifact("repo").load(workspace)
+
+
+def test_workspace_artifact_rejects_sibling_payload(tmp_path: Path) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / "main.rs").write_text("fn main() {}\n")
+    (workspace / "stashed-oracle").write_bytes(b"\x7fELF")
+
+    with pytest.raises(AgentFault, match="undeclared entries"):
+        WorkspaceArtifact("repo").load(workspace)
+
+
+def test_workspace_cache_cleanup_precedes_replay_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / "main.rs").write_text("fn main() {}\n")
+    private = tmp_path / "private"
+    private.mkdir()
+    cache = repo / "target"
+    os.symlink(private, cache)
+    digest_calls: list[Path] = []
+
+    def committed_digest(path: Path) -> str:
+        digest_calls.append(path)
+        assert not cache.exists()
+        assert not cache.is_symlink()
+        assert path != workspace
+        assert (path / "repo" / "main.rs").read_text() == "fn main() {}\n"
+        return "0" * 64
+
+    monkeypatch.setattr(
+        "grading.evaluation.rubric.workspace_artifact_digest",
+        committed_digest,
+    )
+    task = RubricTask(
+        artifact=WorkspaceArtifact("repo", clean_paths=("target",)),
+        criteria=(RubricCriterion("quality"),),
+        evaluate=lambda _context: {"quality": 1.0},
+    )
+
+    grade = task.grade(workspace=workspace, private=private)
+
+    assert grade.score() == 1.0
+    assert len(digest_calls) == 1
+
+
+def test_workspace_rubric_routes_candidate_through_uid_dropped_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / "main.rs").write_text("fn main() {}\n")
+    seen: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        cwd_fd = kwargs.pop("cwd_fd")
+        seen["cwd_identity"] = (
+            os.fstat(cwd_fd).st_dev,
+            os.fstat(cwd_fd).st_ino,
+        )
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"ok\n", stderr=b"")
+
+    monkeypatch.setattr("grading.helpers.run_submitted_executable", fake_run)
+
+    def evaluate(context):
+        result = context.run_candidate(["candidate"], stdin_bytes=b"request\n")
+        return {"quality": result.stdout == b"ok\n"}
+
+    task = RubricTask(
+        artifact=WorkspaceArtifact("repo"),
+        criteria=(RubricCriterion("quality"),),
+        evaluate=evaluate,
+    )
+    grade = task.grade(workspace=workspace, private=tmp_path)
+
+    assert grade.score() == 1.0
+    assert seen["cwd_identity"] != (repo.stat().st_dev, repo.stat().st_ino)
+    assert seen["stdin_bytes"] == b"request\n"
+    assert seen["timeout_s"] == 120.0
+
+
+def test_workspace_candidate_stays_on_snapshot_after_original_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / "marker.txt").write_text("committed\n")
+    seen_inodes: list[tuple[int, int]] = []
+
+    def fake_run(cmd, **kwargs):
+        cwd_fd = kwargs["cwd_fd"]
+        info = os.fstat(cwd_fd)
+        seen_inodes.append((info.st_dev, info.st_ino))
+        marker_fd = os.open("marker.txt", os.O_RDONLY, dir_fd=cwd_fd)
+        try:
+            output = os.read(marker_fd, 1024)
+        finally:
+            os.close(marker_fd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr("grading.helpers.run_submitted_executable", fake_run)
+
+    def evaluate(context):
+        first = context.run_candidate(["candidate"])
+        original = context.candidate.original_path
+        original.rename(workspace / "replaced-original")
+        original.mkdir()
+        (original / "marker.txt").write_text("attacker replacement\n")
+        second = context.run_candidate(["candidate"])
+        return {
+            "quality": first.stdout == second.stdout == b"committed\n",
+        }
+
+    task = RubricTask(
+        artifact=WorkspaceArtifact("repo"),
+        criteria=(RubricCriterion("quality"),),
+        evaluate=evaluate,
+    )
+
+    assert task.grade(workspace=workspace, private=tmp_path).score() == 1.0
+    assert len(seen_inodes) == 2
+
+
+def test_workspace_candidate_cwd_rejects_symlink_and_escape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / "main.rs").write_text("fn main() {}\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    calls = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("grading.helpers.run_submitted_executable", fake_run)
+
+    def evaluate(context):
+        master_mode = stat.S_IMODE(context.candidate.path.stat().st_mode)
+        os.chmod(context.candidate.path, 0o700)
+        os.symlink(outside, context.candidate.path / "escape")
+        try:
+            with pytest.raises(GraderFault, match="could not be cloned safely"):
+                context.run_candidate(["candidate"], cwd="escape")
+        finally:
+            (context.candidate.path / "escape").unlink()
+            os.chmod(context.candidate.path, master_mode)
+        with pytest.raises(GraderFault, match="stay within"):
+            context.run_candidate(["candidate"], cwd="../outside")
+        return {"quality": 1.0}
+
+    task = RubricTask(
+        artifact=WorkspaceArtifact("repo"),
+        criteria=(RubricCriterion("quality"),),
+        evaluate=evaluate,
+    )
+
+    assert task.grade(workspace=workspace, private=tmp_path).score() == 1.0
+    assert calls == 0
+
+
+@pytest.mark.skipif(
+    os.geteuid() != 0,
+    reason="actual uid drop only occurs when the grader runs as root",
+)
+def test_workspace_rubric_run_candidate_executes_as_uid_1000(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUBRIC_AGENT_UID", "1000")
+    monkeypatch.setenv("RUBRIC_AGENT_GID", "1000")
+    workspace = tmp_path / "output"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    (repo / "main.rs").write_text("fn main() {}\n")
+
+    def evaluate(context):
+        result = context.run_candidate(["/usr/bin/id", "-u"])
+        return {"quality": result.stdout.strip() == b"1000"}
+
+    task = RubricTask(
+        artifact=WorkspaceArtifact("repo"),
+        criteria=(RubricCriterion("quality"),),
+        evaluate=evaluate,
+    )
+
+    assert task.grade(workspace=workspace, private=tmp_path).score() == 1.0
 
 
 def _write_rubric_problem(problem_dir: Path) -> None:

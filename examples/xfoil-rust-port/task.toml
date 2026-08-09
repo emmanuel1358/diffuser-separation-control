@@ -1,0 +1,85 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/xfoil-rust-port"
+description = "Port the graded headless analysis surface of XFOIL 6.97 into a standalone Rust repository using unrestricted public differential testing."
+
+[environment]
+required_resources = "16vcpu+64gib"
+storage_mb = 50000
+allow_internet = false
+
+[agent]
+timeout_sec = 21600
+user = "agent"
+
+[verifier]
+timeout_sec = 3600
+user = "root"
+env = []
+capabilities = ["SYS_PTRACE"]
+
+[ground_truth]
+in_container = true
+score_epsilon = 0.000001
+max_trivial_score = 0.0
+
+[reference]
+execution = "container"
+
+[runner]
+attempts = 1
+turn_limit = 1430
+max_ctx = 1000000
+context_mode = "autocompact"
+api_model_name = "claude-fable-5"
+required_tools = ["bash", "str_replace_editor", "tmux"]
+container_runtime = "firecracker"
+
+[runner.timeouts]
+setup_sec = 1800
+grading_sec = 10800
+tool_sec = 3600
+max_episode_sec = 21600
+
+[difficulty]
+level = "very-hard"
+task_type = "software_engineering"
+domain = "legacy_modernization"
+reward_type = "multi_deterministic_rubrics"
+
+[metadata.transformation]
+workspace_root = "/tmp/output/repo"
+submission_mode = "workspace"
+target_profile = "rust-cargo"
+driver = "stdio-jsonl"
+reference_mode = "public_unrestricted"
+
+[[metadata.transformation.suites]]
+id = "geometry"
+weight = 0.25
+cases = "hidden_requests.json"
+comparator = "structured"
+
+[[metadata.transformation.suites]]
+id = "inviscid"
+weight = 0.25
+cases = "hidden_requests.json"
+comparator = "structured"
+
+[[metadata.transformation.suites]]
+id = "viscous"
+weight = 0.25
+cases = "hidden_requests.json"
+comparator = "structured"
+
+[[metadata.transformation.suites]]
+id = "polar_state"
+weight = 0.25
+cases = "hidden_requests.json"
+comparator = "structured"
+
+[[outputs]]
+path = "/tmp/output/repo"
+required = true
+description = "Final directly edited Rust repository implementing the transform/v1 XFOIL compatibility protocol"

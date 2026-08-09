@@ -1,0 +1,30 @@
+---
+description: Secure long-horizon software engineering task contracts
+globs: "{problems,examples}/**/task.toml,{problems,examples}/**/instruction.md,{problems,examples}/**/environment/**,{problems,examples}/**/scorer/**,{problems,examples}/**/baselines/**,{problems,examples}/**/attacks/**"
+alwaysApply: false
+---
+
+# Software Engineering Tasks
+
+- Use `task_type = "software_engineering"`,
+  `reward_type = "multi_deterministic_rubrics"`, and the narrowest software
+  domain. Start brand-new tasks from the `software-engineering` starter.
+- Prefer the secure single-image `/tmp/output/repo` contract. Add capability
+  sections/services only when workspace lifecycle or live topology is essential.
+- Graders declare `TASK = RubricTask(...)` with
+  `WorkspaceArtifact("repo", reject_native_payloads=True)`.
+- Candidate code runs only through `context.run_candidate` or
+  `run_candidate_suite`; trusted references run before candidate code.
+- Keep `allow_internet = false`, main unprivileged, hidden fixtures root-only,
+  and verifier isolated from agent networks/volumes/dependencies.
+- Explicit services require exactly one main; verifier requires explicit
+  `[result]`; images are local-build or digest pinned; named volumes only.
+- Captures are ordered/atomic/bounded; artifacts are service-qualified and
+  byte/file/depth bounded; Taiga service tasks use a trusted outer capsule.
+- Taiga MCP uses only the audited capsule service-DNS SSE proxy.
+- Include no-op/unchanged-starter and task-specific attack regressions.
+- Acceptance requires every trusted CI check green and Boreal aggregate
+  `<= 0.4` across valid attempts.
+
+Read `software-engineering-tasks`, `service-capsule-tasks`,
+`reward-hacking-security`, and `docs/SOFTWARE_ENGINEERING_FRAMEWORK.md`.

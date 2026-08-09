@@ -14,12 +14,41 @@ console = Console()
 class TaskCreator:
     """Create a task from one of the starter templates."""
 
+    @staticmethod
+    def _replace_template_identity(
+        problem_dir: Path,
+        *,
+        name: str,
+        template: str,
+        task_id: str,
+    ) -> None:
+        """Replace the conventional starter identity in copied text files."""
+
+        replace_me = f"{template}-replace-me"
+        replacements = (
+            (f"labelbox/{replace_me}", name),
+            (replace_me, task_id),
+        )
+        for path in problem_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                source = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            rendered = source
+            for placeholder, value in replacements:
+                rendered = rendered.replace(placeholder, value)
+            if rendered != source:
+                path.write_text(rendered, encoding="utf-8")
+
     def collect_inputs(self) -> dict[str, str]:
         """Collect task creation inputs interactively."""
         name = typer.prompt("Task name, e.g. labelbox/reacher-control", type=str)
         template = typer.prompt(
-            "Starter template (ml | mujoco | cfd | structures | prometheus | "
-            "prometheus-cfd | prometheus-structures | prometheus-eval-cfd | "
+            "Starter template (ml | mujoco | cfd | structures | "
+            "software-engineering | prometheus | prometheus-cfd | "
+            "prometheus-structures | prometheus-eval-cfd | "
             "prometheus-eval-structures)",
             type=str,
             default="ml",
@@ -48,6 +77,12 @@ class TaskCreator:
 
         problem_dir = output_dir / task_id
         shutil.copytree(template_dir, problem_dir, dirs_exist_ok=True)
+        self._replace_template_identity(
+            problem_dir,
+            name=name,
+            template=template,
+            task_id=task_id,
+        )
         try:
             from grading.evaluation.plan import refresh_evaluation_plan
 

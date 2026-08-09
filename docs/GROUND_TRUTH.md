@@ -14,7 +14,7 @@ development evidence for feedback. The **oracle proof** is its
 
 | | Rubric tasks (`multi_deterministic_rubrics`) | ML / continuous tasks (`continuous_scoring_function`) |
 | --- | --- | --- |
-| **Typical `task_type`** | `mujoco`, `cfd`, `structures` | `ml` |
+| **Typical `task_type`** | `mujoco`, `cfd`, `structures`, `software_engineering` | `ml` |
 | **Expected oracle score** | **1.0** (within `[ground_truth].score_epsilon`) | **0.5 ± 0.05** (within `[ground_truth].continuous_score_epsilon`) |
 | **What proof means** | Reference is a perfect oracle under deterministic rubrics | Reference is a **calibrated anchor**: competent, not optimal; agents should beat it toward 1.0 |
 | **Reviewer video** | Required for `mujoco`; optional for other types if `[ground_truth].render_outputs` is declared | Usually none unless you explicitly declare render outputs |
@@ -37,6 +37,12 @@ separately by `lbx-rl-template validate`, not by the oracle score alone.
   or `solution.py` for a continuous ML strategy (see `docs/ML_TASKS.md`).
 - Running the inference entrypoint must create all required `[[outputs]]`
   artifacts.
+- `software_engineering` may use a simple single-image repository output or a
+  service/capsule graph. In the service path, the agent service owns the
+  repository artifact and an isolated verifier publishes the canonical result
+  under `/tmp/output`; trusted export tooling packages the graph as an outer
+  capsule. Declared SSE MCP is supported on Taiga only through that capsule's
+  audited service-DNS proxy, never as an arbitrary unbundled endpoint.
 - `[difficulty].reward_type = "multi_deterministic_rubrics"` tasks must score
   `1.0` within `[ground_truth].score_epsilon`.
 - `[difficulty].reward_type = "continuous_scoring_function"` tasks must score
@@ -94,7 +100,7 @@ Declare the task metadata for every task:
 
 ```toml
 [difficulty]
-task_type = "mujoco" # ml | mujoco | cfd | structures
+task_type = "mujoco" # ml | mujoco | cfd | structures | software_engineering
 domain = "model_environment_construction"  # enum scoped by task_type
 reward_type = "multi_deterministic_rubrics" # or continuous_scoring_function
 ```
@@ -104,12 +110,13 @@ sets are:
 
 | Field | Values |
 | --- | --- |
-| `task_type` | `ml`, `mujoco`, `cfd`, `structures` |
+| `task_type` | `ml`, `mujoco`, `cfd`, `structures`, `software_engineering` |
 | `reward_type` | `continuous_scoring_function`, `multi_deterministic_rubrics` |
 | `domain` for `ml` | Production taxonomy subjects/subdomains such as `physical_sciences`, `physical_chemistry`, `robotics_embodied_ai`, `robot_dynamics_system_identification`, `multimodal_vision_perception`, `world_models`, `online_system_identification`, etc. |
 | `domain` for `mujoco` | `policy_training_improvement`, `model_environment_construction`, `manipulation`, `locomotion`, `balance_recovery`, etc. |
 | `domain` for `cfd` | `aerodynamics`, `airfoil_design`, `flow_control`, `vortex_suppression`, `rans_simulation`, etc. |
 | `domain` for `structures` | `seismic_retrofit`, `structural_mechanics`, `topology_optimization`, `truss_design`, `modal_analysis`, etc. |
+| `domain` for `software_engineering` | `repo_debugging`, `data_database_systems`, and other repository/service engineering domains defined in `task_metadata` |
 
 For `mujoco` tasks, declare the render command and video output:
 
@@ -197,6 +204,15 @@ media:
 ```bash
 git add problems/<task_id>/.alignerr/ground_truth/
 ```
+
+### FAQ: do I commit `build_proof.json`?
+
+**No** for authored tasks under `problems/`. `.gitignore` ignores
+`problems/**/.alignerr/*` except `.alignerr/ground_truth/`. A local
+`--runtime ground-truth` run is development feedback only. Trusted CI runs
+ground-truth on the immutable PR revision, then verifies that CI-generated
+proof (G3 → G4). Some checked-in `examples/` intentionally vendor proofs via
+gitignore exceptions; do not copy that pattern into `problems/`.
 
 The template validation workflow checks that each committed video exists and
 matches the checksum in trusted CI's generated proof.

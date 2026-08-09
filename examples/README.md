@@ -17,6 +17,17 @@ The current end-to-end examples are:
   CFD/OpenFOAM scoring with solver-backed oracle/grader logic.
 - [`opensees-base-isolation`](opensees-base-isolation/):
   structures/OpenSeesPy scoring with solver-backed oracle/grader logic.
+- [`wal-recovery-ordering`](wal-recovery-ordering/):
+  the canonical repository-debugging example, migrated from FrontierBench with
+  hidden concurrency checks, performance gates, determinism, and attack tests.
+- [`xfoil-rust-port`](xfoil-rust-port/):
+  a long-horizon legacy-modernization task with public differential tooling,
+  hidden behavioral suites, and subprocess-delegation defenses.
+- [`frontier-service-cutover`](frontier-service-cutover/):
+  nested services, init jobs, health gates, ordered state capture, and a
+  separate verifier.
+- [`frontier-mcp-workspace`](frontier-mcp-workspace/):
+  shared service state plus an audited task-local MCP/SSE tool bridge.
 
 ### `mujoco-pendulum`
 
@@ -55,6 +66,7 @@ uv run lbx-rl-harness reference --problem-dir examples/mujoco-pendulum
 uv run lbx-rl-harness reference --problem-dir examples/mle-tabular-classification
 uv run lbx-rl-harness reference --problem-dir examples/openfoam-hydrofoil-flap
 uv run lbx-rl-harness reference --problem-dir examples/opensees-base-isolation
+uv run lbx-rl-harness reference --problem-dir examples/wal-recovery-ordering
 ```
 
 Expected scores on the checked-in references:
@@ -66,6 +78,9 @@ Expected scores on the checked-in references:
 | `hidden-env-bandit` | container | `1.0` |
 | `openfoam-hydrofoil-flap` | container | `1.0` |
 | `opensees-base-isolation` | container | `1.0` |
+| `wal-recovery-ordering` | host/container | `1.0` |
+| `frontier-service-cutover` | capsule | `1.0` |
+| `frontier-mcp-workspace` | capsule | `1.0` |
 
 Read the closest example before creating your own task:
 
@@ -74,10 +89,14 @@ ls examples/mujoco-pendulum
 ls examples/mle-tabular-classification
 ls examples/openfoam-hydrofoil-flap
 ls examples/opensees-base-isolation
+ls examples/wal-recovery-ordering
+ls examples/frontier-service-cutover
+ls examples/frontier-mcp-workspace
 ```
 
 Then scaffold a new task in `problems/` by copying the starter that matches your
-`task_type` (`ml`, `mujoco`, `cfd`, or `structures`):
+`task_type` (`ml`, `mujoco`, `cfd`, `structures`, or
+`software_engineering`):
 
 ```bash
 mkdir -p problems

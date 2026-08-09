@@ -9,12 +9,17 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from alignerr_plugin.capabilities import (
+    CapabilityConfig,
+    resolve_capabilities,
+)
 from alignerr_plugin.ground_truth import (
     VIDEO_SUFFIXES,
     artifact_matches_proof,
@@ -75,6 +80,102 @@ _ASCII_SCAN_FILES = ("instruction.md", "scorer/compute_score.py")
 _MCP_SERVER_ROOT = "/mcp_server"
 _PRIVATE_ROOTS = ("/mcp_server/data", "/mcp_server/grader")
 _PUBLIC_ROOTS = ("/data", "/workdir", "/tmp/output", "/app", "/workspace")
+
+_SOFTWARE_TASK_TYPE = "software_engineering"
+_SOFTWARE_REWARD_TYPE = "multi_deterministic_rubrics"
+_SOFTWARE_SEED_CACHE_NAMES = frozenset(
+    {
+        ".cache",
+        ".git",
+        ".gradle",
+        ".mypy_cache",
+        ".next",
+        ".nox",
+        ".npm",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".yarn",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "target",
+    }
+)
+_SOFTWARE_SEED_SECRET_DIR_NAMES = frozenset({".aws", ".gnupg", ".ssh"})
+_SOFTWARE_SEED_SECRET_FILENAMES = frozenset(
+    {
+        ".env",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "credentials.json",
+        "id_dsa",
+        "id_ed25519",
+        "id_rsa",
+        "service-account.json",
+        "service_account.json",
+        "secrets.json",
+    }
+)
+_SOFTWARE_SEED_SECRET_SOURCE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".go",
+        ".h",
+        ".hpp",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".scala",
+        ".sh",
+        ".swift",
+        ".ts",
+        ".tsx",
+    }
+)
+_SOFTWARE_SEED_NATIVE_SUFFIXES = frozenset(
+    {
+        ".a",
+        ".class",
+        ".dll",
+        ".dylib",
+        ".exe",
+        ".jar",
+        ".o",
+        ".pyc",
+        ".pyo",
+        ".so",
+        ".wasm",
+        ".zip",
+    }
+)
+_SOFTWARE_SEED_NATIVE_MAGICS = (
+    b"\x7fELF",
+    b"MZ",
+    b"!<arch>\n",
+    b"\x00asm",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xfe\xed\xfa\xce",
+)
+_SOFTWARE_PRIVATE_KEY_MARKERS = (
+    b"-----BEGIN PRIVATE KEY-----",
+    b"-----BEGIN RSA PRIVATE KEY-----",
+    b"-----BEGIN DSA PRIVATE KEY-----",
+    b"-----BEGIN EC PRIVATE KEY-----",
+    b"-----BEGIN OPENSSH PRIVATE KEY-----",
+)
 
 
 # Fixed native-layout paths, relative to the problem dir.
@@ -433,6 +534,7 @@ class TaskValidator:
             ),
             "continuous_calibration": self._continuous_calibration(problem_dir),
             "rubric_protocol": self._rubric_protocol(problem_dir),
+            "software_contract": self._software_contract(problem_dir),
             "outputs": self._outputs(problem_dir),
             "ground_truth": self._ground_truth(problem_dir),
             "private_data_layout": self._private_data_layout(problem_dir),
@@ -1229,6 +1331,24 @@ class TaskValidator:
                     sys.path.remove(path)
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
+    def _software_contract(self, problem_dir: Path) -> StageResult:
+        """Validate the repository-submission contract for software tasks only."""
+        start = time.monotonic()
+        try:
+            task_toml = load_task_toml(problem_dir)
+        except (OSError, ValueError):
+            # The schema stage owns malformed or missing task.toml diagnostics.
+            return StageResult(passed=True, issues=[], duration_ms=0)
+        if normalize_enum_value(task_toml.difficulty.task_type) != _SOFTWARE_TASK_TYPE:
+            return StageResult(passed=True, issues=[], duration_ms=0)
+
+        issues = _software_contract_issues(problem_dir, task_toml)
+        return StageResult(
+            passed=not issues,
+            issues=issues,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+
     def _outputs(self, problem_dir: Path) -> StageResult:
         issues: list[str] = []
         try:
@@ -1787,7 +1907,9 @@ class TaskValidator:
                 # them against the temp workspace. Hand it the same directory
                 # variables the container exports.
                 probe_env = os.environ.copy()
-                probe_env["LBX_SOLUTION_DIR"] = str((problem_dir / "solution").resolve())
+                probe_env["LBX_SOLUTION_DIR"] = str(
+                    (problem_dir / "solution").resolve()
+                )
                 probe_env["LBT_OUTPUT_DIR"] = str(workspace)
                 if host_data.exists():
                     probe_env["LBT_DATA_DIR"] = str(host_data)
@@ -2037,6 +2159,845 @@ class TaskValidator:
             ),
             meta,
         )
+
+
+def _software_contract_issues(problem_dir: Path, task_toml: Any) -> list[str]:
+    issues: list[str] = []
+    uses_service_capsule = bool(task_toml.services)
+    capabilities: CapabilityConfig | None = None
+    if uses_service_capsule:
+        try:
+            capabilities = resolve_capabilities(task_toml)
+        except (TypeError, ValueError) as exc:
+            issues.append(f"invalid software capability contract: {exc}")
+
+    if normalize_enum_value(task_toml.difficulty.reward_type) != _SOFTWARE_REWARD_TYPE:
+        issues.append(
+            "software_engineering tasks must set "
+            "[difficulty].reward_type = 'multi_deterministic_rubrics'"
+        )
+    if task_toml.environment.allow_internet:
+        issues.append(
+            "software_engineering tasks must set "
+            "[environment].allow_internet = false for offline reproducibility"
+        )
+
+    seed, seed_issues = _software_workspace_seed(problem_dir, task_toml)
+    issues.extend(seed_issues)
+    if seed is not None:
+        issues.extend(_software_seed_tree_issues(problem_dir, seed))
+
+    scorer_isolation_issues = _software_scorer_isolation_issues(
+        problem_dir, seed, task_toml.outputs
+    )
+    issues.extend(scorer_isolation_issues)
+    issues.extend(_software_candidate_execution_issues(problem_dir))
+
+    registration: Any = None
+    rubric_task_type: Any = ()
+    workspace_artifact_type: Any = ()
+    if scorer_isolation_issues:
+        issues.append(
+            "software TASK registration could not be safely inspected until scorer "
+            "candidate-code import/exec findings are fixed"
+        )
+    else:
+        try:
+            from grading.evaluation import RubricTask, WorkspaceArtifact
+
+            rubric_task_type = RubricTask
+            workspace_artifact_type = WorkspaceArtifact
+            registration = _load_software_registration(problem_dir)
+        except Exception as exc:  # noqa: BLE001 - report authored import failures
+            issues.append(f"could not import software TASK registration: {exc}")
+
+    artifact: Any = None
+    if registration is not None:
+        if not isinstance(registration, rubric_task_type):
+            issues.append(
+                f"{GRADER_SOURCE_REL} must register TASK = RubricTask(...) "
+                "for software_engineering tasks"
+            )
+        elif not isinstance(registration.artifact, workspace_artifact_type):
+            issues.append(
+                "software_engineering TASK must declare artifact=WorkspaceArtifact(...)"
+            )
+        else:
+            artifact = registration.artifact
+            if not artifact.reject_native_payloads:
+                issues.append(
+                    "software WorkspaceArtifact must keep reject_native_payloads=True"
+                )
+    elif not scorer_isolation_issues:
+        issues.append(
+            f"{GRADER_SOURCE_REL} must register TASK = RubricTask(...) "
+            "for software_engineering tasks"
+        )
+
+    if artifact is not None:
+        if not uses_service_capsule:
+            issues.extend(_software_output_issues(task_toml, artifact))
+        elif capabilities is not None:
+            issues.extend(
+                _software_capability_issues(
+                    problem_dir,
+                    task_toml,
+                    artifact,
+                    capabilities,
+                )
+            )
+        try:
+            from grading.evaluation.plan import check_evaluation_plan
+
+            plan_sync = check_evaluation_plan(problem_dir)
+            if plan_sync.status != "unchanged":
+                issues.append(
+                    plan_sync.message
+                    or "scorer/evaluation.plan.json must match the registered TASK"
+                )
+        except Exception as exc:  # noqa: BLE001 - plan loading imports task code
+            issues.append(f"could not verify scorer/evaluation.plan.json: {exc}")
+
+    issues.extend(_software_private_fixture_issues(problem_dir))
+    if not uses_service_capsule:
+        issues.extend(_software_private_layout_issues(problem_dir))
+    issues.extend(_software_oracle_baseline_issues(problem_dir))
+    issues.extend(_software_timeout_issues(task_toml))
+    return list(dict.fromkeys(issues))
+
+
+def _load_software_registration(problem_dir: Path) -> Any:
+    grader_path = problem_dir / GRADER_SOURCE_REL
+    if not grader_path.is_file():
+        raise FileNotFoundError(f"missing required file: {GRADER_SOURCE_REL}")
+
+    repo_root = Path(__file__).resolve().parents[5]
+    candidate_paths = (repo_root / "grader" / "src", grader_path.parent)
+    added = [str(path) for path in candidate_paths if str(path) not in sys.path]
+    for path in reversed(added):
+        sys.path.insert(0, path)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "task_software_contract_probe", grader_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot import {grader_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, "TASK", None)
+    finally:
+        for path in added:
+            if path in sys.path:
+                sys.path.remove(path)
+
+
+def _software_output_issues(task_toml: Any, artifact: Any) -> list[str]:
+    artifact_path = PurePosixPath(artifact.path)
+    workspace_root = PurePosixPath("/tmp/output") / artifact_path
+    issues: list[str] = []
+    if not any(
+        output.required and PurePosixPath(output.path) == workspace_root
+        for output in task_toml.outputs
+    ):
+        issues.append(
+            "software_engineering tasks must declare a required [[outputs]] entry "
+            f"for the WorkspaceArtifact root {workspace_root.as_posix()!r}"
+        )
+
+    transformation = task_toml.metadata.get("transformation")
+    if isinstance(transformation, dict) and "workspace_root" in transformation:
+        declared = transformation["workspace_root"]
+        if not isinstance(declared, str) or PurePosixPath(declared) != workspace_root:
+            issues.append(
+                "[metadata.transformation].workspace_root must match the "
+                f"WorkspaceArtifact output root {workspace_root.as_posix()!r}"
+            )
+    return issues
+
+
+def _software_capability_issues(
+    problem_dir: Path,
+    task_toml: Any,
+    artifact: Any,
+    capabilities: CapabilityConfig,
+) -> list[str]:
+    """Validate the equivalent repository and trust boundary for task capsules."""
+    issues: list[str] = []
+    agent_service = capabilities.agent_service
+    verifier_service = capabilities.verifier_service
+    issues.extend(_software_service_network_issues(capabilities))
+    if agent_service is None:
+        issues.append(
+            "software capability tasks require exactly one service with role='main'"
+        )
+    if verifier_service is None:
+        issues.append(
+            "software capability tasks require an isolated service with role='verifier'"
+        )
+
+    artifact_path = PurePosixPath(artifact.path)
+    workspace = task_toml.workspace
+    workspace_root = PurePosixPath(
+        workspace.root if workspace is not None else "/workdir"
+    )
+    expected_source = workspace_root / artifact_path
+    matching_artifacts = [
+        item
+        for item in capabilities.artifacts
+        if PurePosixPath(str(item.get("destination", ""))) == artifact_path
+    ]
+    if not matching_artifacts:
+        issues.append(
+            "software capability tasks must collect the WorkspaceArtifact root "
+            f"{artifact_path.as_posix()!r} as a service-owned artifact"
+        )
+    elif agent_service is not None and not any(
+        item.get("service") == agent_service.harbor_name
+        and PurePosixPath(str(item.get("source", ""))) == expected_source
+        for item in matching_artifacts
+    ):
+        issues.append(
+            "software capability WorkspaceArtifact must be collected from the "
+            f"agent service at {expected_source.as_posix()!r}"
+        )
+
+    result = task_toml.result
+    if result is None:
+        issues.append(
+            "software capability tasks require a canonical [result] declaration"
+        )
+    else:
+        result_root = PurePosixPath(result.output_root)
+        reward_file = PurePosixPath(result.reward_file)
+        if (
+            result_root != PurePosixPath("/tmp/output")
+            or reward_file.is_absolute()
+            or ".." in reward_file.parts
+            or reward_file in {PurePosixPath(), PurePosixPath(".")}
+        ):
+            issues.append(
+                "software capability tasks must publish a relative canonical "
+                "[result].reward_file under /tmp/output"
+            )
+        else:
+            canonical_result = result_root / reward_file
+            if not any(
+                output.required and PurePosixPath(output.path) == canonical_result
+                for output in task_toml.outputs
+            ):
+                issues.append(
+                    "software capability tasks must declare the canonical verifier "
+                    f"result {canonical_result.as_posix()!r} as a required "
+                    "[[outputs]] entry"
+                )
+
+    if agent_service is not None:
+        agent_user = _container_user_identity(agent_service.raw.get("user"))
+        if agent_user in {"", "0", "root"}:
+            issues.append(
+                f"software agent service {agent_service.name!r} must run as non-root"
+            )
+    if verifier_service is not None:
+        verifier_user = _container_user_identity(verifier_service.raw.get("user"))
+        if verifier_user not in {"0", "root"}:
+            issues.append(
+                f"software verifier service {verifier_service.name!r} must run as root"
+            )
+        if _service_network_policy(verifier_service) != "none":
+            issues.append(
+                f"software verifier service {verifier_service.name!r} must disable "
+                "network access"
+            )
+
+    for service in capabilities.services:
+        if service.build is None:
+            continue
+        build_root = _contained_task_path(
+            problem_dir,
+            service.build.context,
+            label=f"service {service.name!r} build context",
+            issues=issues,
+        )
+        if build_root is None:
+            continue
+        dockerfile = _contained_task_path(
+            build_root,
+            service.build.dockerfile,
+            label=f"service {service.name!r} Dockerfile",
+            issues=issues,
+        )
+        if dockerfile is None or not dockerfile.is_file() or dockerfile.is_symlink():
+            issues.append(
+                f"software service {service.name!r} requires a regular build Dockerfile"
+            )
+            continue
+        if service.role == "verifier":
+            continue
+        try:
+            for line_number, instruction in _dockerfile_instructions(dockerfile):
+                if not instruction.lower().startswith(("copy ", "add ")):
+                    continue
+                try:
+                    tokens = shlex.split(instruction)
+                except ValueError:
+                    tokens = instruction.split()
+                _flags, positional = _dockerfile_copy_parts(tokens)
+                for source in positional[:-1]:
+                    normalized = source.replace("\\", "/").casefold()
+                    if any(
+                        private in f"/{normalized.strip('/')}/"
+                        for private in (
+                            "/scorer/",
+                            "/solution/",
+                            "/mcp_server/",
+                        )
+                    ):
+                        issues.append(
+                            f"{dockerfile.relative_to(problem_dir)}:{line_number}: "
+                            "agent-facing service images must not copy scorer, "
+                            "solution, or /mcp_server private material"
+                        )
+        except OSError as exc:
+            issues.append(
+                f"could not inspect software service Dockerfile {dockerfile}: {exc}"
+            )
+    return issues
+
+
+def _container_user_identity(value: Any) -> str:
+    """Return the UID/name portion of Docker's optional ``user:group`` form."""
+    return str(value or "").strip().split(":", 1)[0].strip().lower()
+
+
+def _service_network_policy(service: Any) -> str:
+    """Read the authored policy without collapsing ``isolated`` into offline."""
+    resources = service.raw.get("resources")
+    if not isinstance(resources, dict):
+        return "isolated"
+    return str(resources.get("network") or "isolated").strip().lower()
+
+
+def _software_service_network_issues(capabilities: CapabilityConfig) -> list[str]:
+    """Keep every agent-phase software service on a reproducible offline network."""
+    return [
+        f"software service {service.name!r} must not enable internet access"
+        for service in capabilities.services
+        if service.role != "verifier" and _service_network_policy(service) == "internet"
+    ]
+
+
+def _contained_task_path(
+    root: Path,
+    raw_path: str,
+    *,
+    label: str,
+    issues: list[str],
+) -> Path | None:
+    relative = Path(raw_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        issues.append(f"{label} must stay inside the task directory")
+        return None
+    candidate = root / relative
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError):
+        issues.append(f"{label} escapes the task directory")
+        return None
+    return candidate
+
+
+def _software_workspace_seed(
+    problem_dir: Path, task_toml: Any
+) -> tuple[Path | None, list[str]]:
+    workspace = task_toml.workspace
+    if (
+        workspace is not None
+        and workspace.init_policy == "empty"
+        and workspace.seed is None
+    ):
+        return None, []
+    raw_seed = workspace.seed if workspace is not None and workspace.seed else "starter"
+    raw_path = Path(raw_seed)
+    if (
+        raw_path.is_absolute()
+        or ".." in raw_path.parts
+        or raw_path in {Path(), Path(".")}
+    ):
+        return None, [
+            (
+                "software_engineering workspace seed must be a dedicated "
+                "task-relative directory (declare [workspace].seed or provide starter/)"
+            )
+        ]
+
+    seed = problem_dir / raw_path
+    if not seed.exists() and not seed.is_symlink():
+        return None, [
+            f"software_engineering workspace seed is missing: {raw_path.as_posix()}"
+        ]
+    if seed.is_symlink():
+        return None, [
+            (
+                "software_engineering workspace seed must not be a symlink: "
+                f"{raw_path.as_posix()}"
+            )
+        ]
+    if not seed.is_dir():
+        return None, [
+            (
+                "software_engineering workspace seed must be a directory: "
+                f"{raw_path.as_posix()}"
+            )
+        ]
+    return seed, []
+
+
+def _software_seed_tree_issues(problem_dir: Path, seed: Path) -> list[str]:
+    issues: list[str] = []
+    regular_files = 0
+    for directory, dirnames, filenames in os.walk(
+        seed, topdown=True, followlinks=False
+    ):
+        base = Path(directory)
+        kept_directories: list[str] = []
+        for name in sorted(dirnames):
+            path = base / name
+            rel = path.relative_to(problem_dir).as_posix()
+            if path.is_symlink():
+                issues.append(f"software workspace seed contains a symlink: {rel}")
+                continue
+            folded = name.casefold()
+            if folded in _SOFTWARE_SEED_CACHE_NAMES:
+                issues.append(
+                    f"software workspace seed contains generated cache/build "
+                    f"directory: {rel}"
+                )
+                continue
+            if folded in _SOFTWARE_SEED_SECRET_DIR_NAMES:
+                issues.append(
+                    f"software workspace seed contains credential directory: {rel}"
+                )
+                continue
+            kept_directories.append(name)
+        dirnames[:] = kept_directories
+
+        for name in sorted(filenames):
+            path = base / name
+            rel = path.relative_to(problem_dir).as_posix()
+            if path.is_symlink():
+                issues.append(f"software workspace seed contains a symlink: {rel}")
+                continue
+            if name.casefold() in _SOFTWARE_SEED_CACHE_NAMES or name.casefold() in {
+                ".coverage",
+                ".ds_store",
+            }:
+                issues.append(
+                    f"software workspace seed contains generated cache/build file: {rel}"
+                )
+                continue
+            try:
+                info = path.lstat()
+            except OSError as exc:
+                issues.append(
+                    f"could not inspect software workspace seed file {rel}: {exc}"
+                )
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                issues.append(
+                    f"software workspace seed contains a non-regular file: {rel}"
+                )
+                continue
+            regular_files += 1
+
+            if _software_seed_secret_name(name):
+                issues.append(
+                    f"software workspace seed contains a secret/credential file: {rel}"
+                )
+            if path.suffix.casefold() in _SOFTWARE_SEED_NATIVE_SUFFIXES:
+                issues.append(
+                    f"software workspace seed contains a compiled/native payload: {rel}"
+                )
+                continue
+            try:
+                with path.open("rb") as handle:
+                    prefix = handle.read(8192)
+            except OSError as exc:
+                issues.append(
+                    f"could not read software workspace seed file {rel}: {exc}"
+                )
+                continue
+            if any(prefix.startswith(magic) for magic in _SOFTWARE_SEED_NATIVE_MAGICS):
+                issues.append(
+                    f"software workspace seed contains a compiled/native payload: {rel}"
+                )
+            if any(marker in prefix for marker in _SOFTWARE_PRIVATE_KEY_MARKERS):
+                issues.append(
+                    f"software workspace seed contains private key material: {rel}"
+                )
+
+    if regular_files == 0:
+        issues.append("software_engineering workspace seed contains no source files")
+    return issues
+
+
+def _software_seed_secret_name(name: str) -> bool:
+    folded = name.casefold()
+    if folded in _SOFTWARE_SEED_SECRET_FILENAMES:
+        return True
+    if folded.startswith(".env."):
+        return not folded.endswith((".example", ".sample", ".template"))
+    if Path(folded).suffix in _SOFTWARE_SEED_SECRET_SOURCE_SUFFIXES:
+        return False
+    tokens = set(filter(None, re.split(r"[^a-z0-9]+", Path(folded).stem)))
+    return bool(tokens & {"credential", "credentials", "secret", "secrets"})
+
+
+def _software_scorer_paths(problem_dir: Path) -> list[Path]:
+    scorer = problem_dir / "scorer"
+    if not scorer.is_dir():
+        return []
+    paths: list[Path] = []
+    for path in sorted(scorer.rglob("*.py")):
+        relative = path.relative_to(scorer)
+        if "__pycache__" in relative.parts or relative.parts[:1] == ("data",):
+            continue
+        paths.append(path)
+    return paths
+
+
+def _software_seed_module_names(seed: Path | None) -> set[str]:
+    if seed is None:
+        return set()
+    names = {seed.name} if seed.name.isidentifier() else set()
+    for directory, dirnames, filenames in os.walk(
+        seed, topdown=True, followlinks=False
+    ):
+        base = Path(directory)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not (base / name).is_symlink()
+            and name.casefold() not in _SOFTWARE_SEED_CACHE_NAMES
+        ]
+        relative = base.relative_to(seed)
+        if relative.parts and "__init__.py" in filenames:
+            package = relative.parts[-1]
+            if package.isidentifier():
+                names.add(package)
+        for name in filenames:
+            path = base / name
+            if path.is_symlink() or path.suffix.casefold() != ".py":
+                continue
+            if path.stem.isidentifier() and path.stem != "__init__":
+                names.add(path.stem)
+        if relative == Path():
+            for name in dirnames:
+                if name.isidentifier():
+                    names.add(name)
+    return names
+
+
+def _software_scorer_isolation_issues(
+    problem_dir: Path, seed: Path | None, outputs: list[Any]
+) -> list[str]:
+    candidate_modules = _software_seed_module_names(seed)
+    candidate_modules.update(
+        PurePosixPath(output.path).name
+        for output in outputs
+        if PurePosixPath(output.path).name.isidentifier()
+    )
+    issues: list[str] = []
+    for source in _software_scorer_paths(problem_dir):
+        rel = source.relative_to(problem_dir).as_posix()
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            issues.append(f"could not inspect software scorer {rel}: {exc}")
+            continue
+        issues.extend(_grader_sandbox_issues(rel, text))
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        imports = _import_aliases(tree)
+        for node in ast.walk(tree):
+            imported: list[str] = []
+            if isinstance(node, ast.Import):
+                imported = [alias.name.split(".", 1)[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported = [node.module.split(".", 1)[0]]
+            for name in imported:
+                if name in candidate_modules:
+                    issues.append(
+                        f"{rel}:{node.lineno}: root scorer must not import candidate "
+                        f"workspace module {name!r}; execute it through "
+                        "context.run_candidate() or context.run_candidate_suite()"
+                    )
+
+            if isinstance(node, ast.Call):
+                name = _canonical_call_name(node.func, imports)
+                if name in {
+                    "__import__",
+                    "builtins.__import__",
+                    "import_module",
+                    "importlib.import_module",
+                }:
+                    issues.append(
+                        f"{rel}:{node.lineno}: root scorer must not dynamically import "
+                        "candidate modules; execute them through context.run_candidate() "
+                        "or context.run_candidate_suite()"
+                    )
+    return list(dict.fromkeys(issues))
+
+
+def _software_candidate_execution_issues(problem_dir: Path) -> list[str]:
+    issues: list[str] = []
+    safe_call_found = False
+    for source in _software_scorer_paths(problem_dir):
+        rel = source.relative_to(problem_dir).as_posix()
+        try:
+            text = source.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        imports = _import_aliases(tree)
+        reachable = _reachable_from_compute_score(tree)
+        enclosing = _enclosing_func_name(tree)
+        has_entrypoint = bool(reachable)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            scope = enclosing.get(id(node))
+            live = not has_entrypoint or scope is None or scope in reachable
+            if not live:
+                continue
+            name = _canonical_call_name(node.func, imports)
+            if name.endswith((".run_candidate", ".run_candidate_suite")):
+                safe_call_found = True
+                issues.extend(_software_bound_issues(rel, node, name))
+            elif name == "CandidateCommandSpec" or name.endswith(
+                ".CandidateCommandSpec"
+            ):
+                issues.extend(_software_bound_issues(rel, node, name))
+
+            if name.startswith("subprocess.") or name in {"os.popen", "os.system"}:
+                issues.append(
+                    f"{rel}:{node.lineno}: software scorer must run external candidate "
+                    "code through context.run_candidate() or "
+                    "context.run_candidate_suite(), not direct process APIs"
+                )
+            elif name.startswith(("os.exec", "os.spawn")):
+                issues.append(
+                    f"{rel}:{node.lineno}: software scorer must not exec/spawn candidate "
+                    "code directly; use context.run_candidate() or "
+                    "context.run_candidate_suite()"
+                )
+    if not safe_call_found:
+        issues.append(
+            "software RubricTask evaluate path must execute the submitted workspace "
+            "through context.run_candidate() or context.run_candidate_suite()"
+        )
+    return list(dict.fromkeys(issues))
+
+
+def _software_bound_issues(rel: str, call: ast.Call, call_name: str) -> list[str]:
+    issues: list[str] = []
+    bounded_fields = {
+        "timeout_s",
+        "max_output_bytes",
+        "max_attempt_elapsed_s",
+        "max_total_elapsed_s",
+    }
+    for keyword in call.keywords:
+        if keyword.arg not in bounded_fields:
+            continue
+        known, value = _numeric_literal(keyword.value)
+        if known and (value is None or value <= 0):
+            issues.append(
+                f"{rel}:{call.lineno}: {call_name} {keyword.arg} must be positive"
+            )
+    return issues
+
+
+def _numeric_literal(node: ast.AST) -> tuple[bool, float | None]:
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or node.value is None:
+            return True, None
+        if isinstance(node.value, (int, float)):
+            return True, float(node.value)
+        return False, None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        known, value = _numeric_literal(node.operand)
+        if known and value is not None:
+            return True, -value if isinstance(node.op, ast.USub) else value
+    return False, None
+
+
+def _software_private_fixture_issues(problem_dir: Path) -> list[str]:
+    issues: list[str] = []
+    private_data = problem_dir / PRIVATE_DATA_REL
+    if not private_data.is_dir():
+        issues.append(
+            "software_engineering tasks must keep hidden fixtures under scorer/data/"
+        )
+    elif not any(
+        path.is_file() and not path.is_symlink() for path in private_data.rglob("*")
+    ):
+        issues.append("software_engineering scorer/data/ must contain hidden fixtures")
+    return issues
+
+
+def _software_private_layout_issues(problem_dir: Path) -> list[str]:
+    issues: list[str] = []
+
+    dockerfile = problem_dir / "environment" / "Dockerfile"
+    if not dockerfile.is_file():
+        issues.append(
+            "software_engineering tasks require environment/Dockerfile with a "
+            "root-only scorer/data layout"
+        )
+        return issues
+    try:
+        issues.extend(_dockerfile_private_layout_issues(dockerfile))
+        copied_data = False
+        copied_grader = False
+        for _line_number, instruction in _dockerfile_instructions(dockerfile):
+            if not instruction.lower().startswith(("copy ", "add ")):
+                continue
+            try:
+                tokens = shlex.split(instruction)
+            except ValueError:
+                tokens = instruction.split()
+            _flags, positional = _dockerfile_copy_parts(tokens)
+            if len(positional) < 2:
+                continue
+            sources = positional[:-1]
+            destination = positional[-1]
+            destination_root = _matching_private_root(destination)
+            for source in sources:
+                source_kind = _software_private_source_kind(source)
+                if source_kind == "data" and destination_root == "/mcp_server/data":
+                    copied_data = True
+                if source_kind == "scorer" and destination_root == "/mcp_server/grader":
+                    copied_grader = True
+        if not copied_data:
+            issues.append(
+                "environment/Dockerfile must copy scorer/data/ to root-only "
+                "/mcp_server/data/"
+            )
+        if not copied_grader:
+            issues.append(
+                "environment/Dockerfile must copy scorer/ to root-only "
+                "/mcp_server/grader/"
+            )
+    except OSError as exc:
+        issues.append(f"could not inspect software Dockerfile private layout: {exc}")
+    return issues
+
+
+def _software_private_source_kind(source: str) -> str | None:
+    normalized = source.replace("\\", "/").rstrip("/")
+    parts = [part for part in normalized.split("/") if part and part != "."]
+    if len(parts) >= 2 and parts[-2:] == ["scorer", "data"]:
+        return "data"
+    if parts and parts[-1] == "scorer":
+        return "scorer"
+    return None
+
+
+def _software_oracle_baseline_issues(problem_dir: Path) -> list[str]:
+    issues: list[str] = []
+    oracle = problem_dir / "solution" / "solve.sh"
+    if not _regular_nonempty_file(oracle):
+        issues.append(
+            "software_engineering tasks require a non-empty regular "
+            "solution/solve.sh oracle"
+        )
+
+    baselines = problem_dir / "baselines"
+    baseline_found = False
+    if baselines.is_dir() and not baselines.is_symlink():
+        for child in baselines.iterdir():
+            raw_name = child.stem if child.is_file() else child.name
+            normalized = re.sub(r"[^a-z0-9]", "", raw_name.casefold())
+            if not normalized.startswith(("naive", "noop")):
+                continue
+            if _regular_nonempty_file(child) or _directory_has_regular_file(child):
+                baseline_found = True
+                break
+    if not baseline_found:
+        issues.append(
+            "software_engineering tasks require a committed no-op or naive baseline "
+            "under baselines/"
+        )
+    return issues
+
+
+def _regular_nonempty_file(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size > 0
+
+
+def _directory_has_regular_file(path: Path) -> bool:
+    if path.is_symlink() or not path.is_dir():
+        return False
+    return any(
+        _regular_nonempty_file(candidate)
+        for candidate in path.rglob("*")
+        if not candidate.is_symlink()
+    )
+
+
+def _software_timeout_issues(task_toml: Any) -> list[str]:
+    values = {
+        "[agent].timeout_sec": task_toml.agent.timeout_sec,
+        "[verifier].timeout_sec": task_toml.verifier.timeout_sec,
+        "[runner.timeouts].setup_sec": task_toml.runner.timeouts.setup_sec,
+        "[runner.timeouts].grading_sec": task_toml.runner.timeouts.grading_sec,
+        "[runner.timeouts].tool_sec": task_toml.runner.timeouts.tool_sec,
+        "[runner.timeouts].max_episode_sec": (
+            task_toml.runner.timeouts.max_episode_sec
+        ),
+    }
+    positive: dict[str, float] = {}
+    issues: list[str] = []
+    for label, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            issues.append(f"software_engineering {label} must be a positive timeout")
+        else:
+            positive[label] = float(value)
+
+    agent = "[agent].timeout_sec"
+    verifier = "[verifier].timeout_sec"
+    setup = "[runner.timeouts].setup_sec"
+    grading = "[runner.timeouts].grading_sec"
+    tool = "[runner.timeouts].tool_sec"
+    episode = "[runner.timeouts].max_episode_sec"
+    if (
+        verifier in positive
+        and grading in positive
+        and positive[verifier] > positive[grading]
+    ):
+        issues.append(
+            "software_engineering [runner.timeouts].grading_sec must cover "
+            "[verifier].timeout_sec"
+        )
+    if tool in positive and agent in positive and positive[tool] > positive[agent]:
+        issues.append(
+            "software_engineering [agent].timeout_sec must cover "
+            "[runner.timeouts].tool_sec"
+        )
+    if episode in positive:
+        for label in (agent, verifier, setup, grading, tool):
+            if label in positive and positive[label] > positive[episode]:
+                issues.append(
+                    "software_engineering [runner.timeouts].max_episode_sec must "
+                    f"cover {label}"
+                )
+    return issues
 
 
 def _output_relative_path(path: str) -> Path | None:

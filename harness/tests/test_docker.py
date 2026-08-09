@@ -152,3 +152,31 @@ def test_start_task_container_isolates_network(monkeypatch) -> None:
     # model still runs on the host, driving the container over docker exec.
     assert "--network" in args
     assert args[args.index("--network") + 1] == "none"
+
+
+def test_start_task_container_grants_declared_verifier_capability(
+    monkeypatch,
+) -> None:
+    import subprocess
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_docker(args: list[str], *, timeout: int = 1200):  # noqa: ANN202
+        captured["args"] = args
+        return subprocess.CompletedProcess(args, 0, stdout="cid123\n", stderr="")
+
+    monkeypatch.setattr(docker, "_docker", fake_docker)
+    monkeypatch.setattr(docker, "patch_rubric_stdout_noise", lambda cid: None)
+    problem = HarnessProblem(
+        id="ptrace-task",
+        source_format="problem-dir",
+        prompt="demo",
+        outputs=[],
+        metadata={"verifier": {"capabilities": ["SYS_PTRACE"]}},
+    )
+
+    capabilities = docker.verifier_container_capabilities(problem)
+    docker.start_task_container("img:tag", verifier_capabilities=capabilities)
+
+    args = captured["args"]
+    assert args[args.index("--cap-add") + 1] == "SYS_PTRACE"

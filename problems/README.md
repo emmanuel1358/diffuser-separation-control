@@ -6,46 +6,47 @@ Put authored tasks in this directory. Each task gets exactly one directory:
 problems/<task_id>/
 ```
 
-Create a task from the repo root by copying the starter that matches your
-`[difficulty].task_type`:
+Prefer scaffolding from the repo root:
 
 ```bash
-mkdir -p problems
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/ml problems/my-task
-# or: mujoco | cfd | structures | prometheus-cfd | prometheus-structures
-# or: prometheus-eval-cfd | prometheus-eval-structures
-cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/mujoco problems/reacher-control
+uv run lbx-rl-template create \
+  --name labelbox/my-task \
+  --template ml \
+  --out problems
+# templates: ml | mujoco | cfd | structures | software-engineering
+#            prometheus-cfd | prometheus-structures
+#            prometheus-eval-cfd | prometheus-eval-structures
 ```
 
-Use `examples/` as references for patterns, but put new submitted work under
+Manual copy still works (`cp -R alignerr_plugin/.../starter_templates/<starter>
+problems/<task_id>`). Use `examples/` as patterns; put submitted work under
 `problems/`.
 
 ## Expected Layout
 
 ```text
 problems/<task_id>/
-├── task.toml
-├── metadata.json
-├── instruction.md
+├── task.toml                 # required
+├── metadata.json             # required
+├── instruction.md            # required
 ├── environment/
-│   └── Dockerfile
+│   └── Dockerfile            # required for submit / build proof
 ├── scorer/
-│   ├── compute_score.py
-│   └── data/
-├── data/
-├── solution/
-│   └── solve.sh
-├── baselines/
-│   └── naive.sh
-└── README.md
+│   ├── compute_score.py      # required
+│   └── data/                 # as needed
+├── data/                     # optional public inputs
+├── solution/                 # oracle / render as needed
+├── baselines/                # optional (layout varies by starter)
+└── README.md                 # optional
 ```
 
-Mothership validation always requires `metadata.json`, `task.toml`,
-`instruction.md`, and `scorer/compute_score.py`. The local build proof also needs
-`environment/Dockerfile`. For submitted tasks, `solution/solve.sh` is part of the
-contract: the ground-truth verifier uses it to prove the checked-in reference
-reaches the declared score target. `baselines/` is optional but recommended,
-especially for continuous scoring tasks.
+Validation always requires `metadata.json`, `task.toml`, `instruction.md`, and
+`scorer/compute_score.py`. The local/CI build-proof path also needs
+`environment/Dockerfile`. For submitted tasks, an oracle under `solution/` is
+part of the contract (typically `solve.sh`; ML may use committed-strategy
+layouts). `baselines/` is optional but recommended, especially for continuous
+scoring. Render scripts are required only for MuJoCo or when
+`[ground_truth].render_outputs` is declared.
 
 Keep `metadata.json` aligned with the directory:
 
@@ -80,7 +81,7 @@ allow_internet = true
 env = []
 
 [difficulty]
-task_type = "ml"                         # ml | mujoco | cfd | structures
+task_type = "ml"                         # ml | mujoco | cfd | structures | software_engineering
 domain = "scientific_discovery_computational_science"
 reward_type = "continuous_scoring_function" # or multi_deterministic_rubrics
 license = "MIT"                         # required for ml tasks
@@ -108,8 +109,10 @@ Important validation details:
 - `ml` tasks must declare `[difficulty].license` as a permissive SPDX id from
   `task_metadata.LICENSES` (`MIT`, `Apache-2.0`, `BSD-2-Clause`,
   `BSD-3-Clause`, `ISC`, `Unlicense`, `CC0-1.0`, `CC-BY-4.0`, `PDDL-1.0`,
-  `UPL-1.0`) or `not_applicable` for cases with no external dataset license.
-  Copyleft, non-commercial, research-only, and share-alike data is rejected.
+  `UPL-1.0`) or `self_generated` when the task generates its own data (no
+  external dataset license). `not_applicable` remains a back-compat alias for
+  `self_generated`. Copyleft, non-commercial, research-only, and share-alike
+  data is rejected.
 - `[runner]` and `[runner.timeouts]` are optional Boreal/Taiga knobs. The
   exporter has defaults, but starters include useful values for attempts,
   context mode, model, tools, and timeouts.
@@ -204,19 +207,21 @@ Before opening or updating a PR, run:
 
 ```bash
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
+uv run lbx-rl-template check --problem-dir problems/<task_id>
 ```
 
-Commit the generated `problems/<task_id>/.alignerr/build_proof.json` and any
-`problems/<task_id>/.alignerr/ground_truth/` reviewer artifacts. Rerun the
-ground-truth verifier after any task file, Dockerfile, scorer, data, or solution
-change so the proof hash is fresh.
+Do **not** commit `problems/<task_id>/.alignerr/build_proof.json` (gitignored
+under `problems/`). Trusted CI regenerates the authoritative proof from the
+immutable PR revision. Do commit reviewer media under
+`problems/<task_id>/.alignerr/ground_truth/` when render is expected. Rerun
+ground-truth after task file, Dockerfile, scorer, data, or solution changes so
+local feedback stays fresh.
 
 Use `--runtime rubric-quality`, `--runtime claude-code`, `--runtime deepagents`,
 or the default local run only when you want optional local feedback before
-opening your fork PR. Trusted
-CI in `lbx-rl-tasks-iso-mothership` reruns proof checks, static validation,
-agent harness, rubric QA, Auto QA, and advisory Taiga/Boreal submission on your
-assigned fork PR.
+opening your fork PR. Trusted CI in `lbx-rl-tasks-iso-mothership` runs
+ground-truth, proof verify, static validation, agent harness, rubric QA, Auto
+QA, and advisory Taiga/Boreal submission on your assigned fork PR.
 
 ## No Secrets
 

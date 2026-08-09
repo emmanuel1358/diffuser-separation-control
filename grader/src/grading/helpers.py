@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -824,7 +825,7 @@ def load_submitted_model(
     """
     if deserializer not in _WRAPPERS:
         raise ValueError(
-            "deserializer must be one of %s; got %r" % (sorted(_WRAPPERS), deserializer)
+            f"deserializer must be one of {sorted(_WRAPPERS)}; got {deserializer!r}"
         )
     original = Path(path)
     try:
@@ -942,24 +943,104 @@ def world_integrity(
 # ── Submission loaders: executable + HDF5 (per-type attack closures) ──────
 
 
-# uid/gid 1000 is the base image's `model` user; /mcp_server is 0700 root-only,
-# so after the drop this UID cannot read /mcp_server/data.
-SUBPROCESS_UID = 1000
-SUBPROCESS_GID = 1000
+def resolve_submitted_process_identity() -> tuple[int, int, str, str]:
+    """Resolve the configured non-root identity for submitted executables."""
+    from grading.policy_runner import PolicyWorkerError, _agent_identity
+
+    try:
+        return _agent_identity()
+    except PolicyWorkerError as exc:
+        raise GraderFault(
+            f"cannot establish submitted-process identity: {exc}"
+        ) from exc
 
 
-def _drop_privileges_to_model() -> None:
-    """preexec_fn (after fork, before exec): demote the child to uid/gid 1000.
+def _submitted_process_preexec(
+    uid: int,
+    gid: int,
+    cwd_fd: int | None,
+    ipc_status_fd: int | None,
+):
+    """Isolate IPC, enter a pinned cwd, and irreversibly drop privileges."""
+    from grading.policy_runner import _agent_preexec
 
-    setgroups([]) must come first (needs CAP_SETGID) to drop supplementary
-    groups. Only runs when the grader is root; otherwise there is nothing to
-    demote and setgroups/setgid would EPERM.
-    """
+    return _agent_preexec(
+        uid,
+        gid,
+        ipc_status_fd=ipc_status_fd,
+        cwd_fd=cwd_fd,
+    )
+
+
+def _submitted_process_spawn_config(
+    identity: tuple[int, int, str, str],
+    *,
+    cwd_fd: int | None,
+    ipc_status_fd: int | None = None,
+) -> dict[str, Any]:
+    """Build fail-closed Popen kwargs for the submitted-process boundary."""
     if os.geteuid() != 0:
-        return
-    os.setgroups([])
-    os.setgid(SUBPROCESS_GID)
-    os.setuid(SUBPROCESS_UID)
+        raise GraderFault(
+            "cannot establish submitted-process identity separation: "
+            "the verifier must run as root"
+        )
+    uid, gid, _home, _name = identity
+    if uid <= 0 or gid <= 0:
+        raise GraderFault(
+            "submitted-process identity must use a configured non-root uid/gid"
+        )
+    pass_fds = tuple(
+        descriptor for descriptor in (cwd_fd, ipc_status_fd) if descriptor is not None
+    )
+    return {
+        "preexec_fn": _submitted_process_preexec(
+            uid,
+            gid,
+            cwd_fd,
+            ipc_status_fd,
+        ),
+        "pass_fds": pass_fds,
+    }
+
+
+def _spawn_submitted_process(
+    cmd: list[str],
+    *,
+    identity: tuple[int, int, str, str],
+    cwd_fd: int | None,
+    **popen_kwargs: Any,
+) -> subprocess.Popen:
+    """Spawn one submitted process and report its best-effort IPC boundary."""
+    try:
+        ipc_status_r, ipc_status_w = os.pipe()
+    except OSError as exc:
+        raise GraderFault(
+            f"cannot establish submitted-process IPC status channel: {exc}"
+        ) from exc
+
+    try:
+        spawn_config = _submitted_process_spawn_config(
+            identity,
+            cwd_fd=cwd_fd,
+            ipc_status_fd=ipc_status_w,
+        )
+        proc = subprocess.Popen(cmd, **popen_kwargs, **spawn_config)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(ipc_status_r)
+        with contextlib.suppress(OSError):
+            os.close(ipc_status_w)
+        raise
+
+    with contextlib.suppress(OSError):
+        os.close(ipc_status_w)
+    from grading.policy_runner import _warn_if_ipc_unisolated
+
+    _warn_if_ipc_unisolated(
+        ipc_status_r,
+        boundary="submitted executable",
+    )
+    return proc
 
 
 # Minimal env for an agent subprocess: only what bash/interpreters/locale need,
@@ -981,9 +1062,22 @@ def _build_sanitized_env() -> dict[str, str]:
     return {key: os.environ[key] for key in _DEFAULT_ENV_ALLOWLIST if key in os.environ}
 
 
-def _kill_quietly(proc: subprocess.Popen) -> None:
-    with contextlib.suppress(OSError):
-        proc.kill()
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        with contextlib.suppress(OSError):
+            proc.kill()
+
+
+def _kill_and_reap_process_group(proc: subprocess.Popen) -> None:
+    _kill_process_group(proc)
+    try:
+        proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        proc.wait()
 
 
 def run_trusted_solver(
@@ -1070,14 +1164,23 @@ def run_submitted_executable(
     *,
     stdin_bytes: bytes | None = None,
     cwd: str | Path | None = None,
+    cwd_fd: int | None = None,
     env: dict[str, str] | None = None,
     env_passthrough: bool = False,
     timeout_s: float | None = None,
     max_output_bytes: int = _DEFAULT_MAX_EXECUTABLE_OUTPUT_BYTES,
     streaming: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Spawn an agent-supplied executable with privileges dropped to uid/gid 1000
-    and stdout isolated from the RUBRIC_SCORE= parser (the OS-process companion to
+    """Spawn an agent executable as the configured non-root identity.
+
+    ``cwd_fd`` pins execution to an already-open directory and is mutually
+    exclusive with ``cwd``. The verifier must be root so supplementary groups
+    can be cleared and the requested uid/gid separation can be established.
+    Each process also attempts a fresh IPC namespace before dropping
+    privileges, preventing a rollout from relaying state through persistent
+    SysV shared memory, semaphores, or message queues. Runtimes without the
+    required namespace capability warn and continue. Stdout remains isolated
+    from the RUBRIC_SCORE= parser (the OS-process companion to
     ``load_submitted_policy``).
 
     Two output modes:
@@ -1117,7 +1220,17 @@ def run_submitted_executable(
                 "grading_timeout_seconds for the wall-clock cap."
             )
 
+    if cwd is not None and cwd_fd is not None:
+        raise ValueError("cwd and cwd_fd are mutually exclusive")
+    if cwd_fd is not None:
+        try:
+            cwd_info = os.fstat(cwd_fd)
+        except OSError as exc:
+            raise GraderFault(f"submitted executable cwd descriptor is invalid: {exc}")
+        if not stat.S_ISDIR(cwd_info.st_mode):
+            raise GraderFault("submitted executable cwd descriptor is not a directory")
     cwd_str = str(cwd) if cwd is not None else None
+    identity = resolve_submitted_process_identity()
 
     if env is not None:
         child_env: dict[str, str] | None = env
@@ -1125,6 +1238,12 @@ def run_submitted_executable(
         child_env = None
     else:
         child_env = _build_sanitized_env()
+    if child_env is not None:
+        child_env = dict(child_env)
+        _uid, _gid, home, name = identity
+        child_env.setdefault("HOME", home)
+        child_env["USER"] = name
+        child_env["LOGNAME"] = name
 
     if not streaming:
         # Bounded capture: stream stdout through a capped reader that kills the
@@ -1134,15 +1253,24 @@ def run_submitted_executable(
         # child that fills the stdout pipe. An agent-caused timeout / over-cap is
         # converted to AgentFault (kept 0.0) instead of escaping as
         # TimeoutExpired / MemoryError -> a DISCARDED (free-veto) rollout.
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            cwd=cwd_str,
-            env=child_env,
-            preexec_fn=_drop_privileges_to_model,
-        )
+        try:
+            proc = _spawn_submitted_process(
+                cmd,
+                identity=identity,
+                cwd_fd=cwd_fd,
+                stdin=(
+                    subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd=cwd_str,
+                env=child_env,
+                start_new_session=True,
+            )
+        except subprocess.SubprocessError as exc:
+            raise GraderFault(
+                f"could not establish submitted-process boundary: {exc}"
+            ) from exc
         captured = bytearray()
         cap_limit = max_output_bytes + 1
         over_cap = threading.Event()
@@ -1158,7 +1286,7 @@ def run_submitted_executable(
                         captured.extend(chunk)
                     if len(captured) > max_output_bytes:
                         over_cap.set()
-                        _kill_quietly(proc)
+                        _kill_process_group(proc)
                         break
             except (OSError, ValueError):
                 pass
@@ -1181,10 +1309,15 @@ def run_submitted_executable(
         try:
             proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired as exc:
-            _kill_quietly(proc)
+            _kill_and_reap_process_group(proc)
             raise AgentFault(
                 f"submitted executable timed out after {timeout_s:.1f}s"
             ) from exc
+        else:
+            # A successful leader may have daemonized descendants that still
+            # hold the disposable workspace or stdout pipe. The candidate
+            # boundary owns the whole session, so no process may outlive it.
+            _kill_process_group(proc)
         finally:
             reader.join(timeout=5.0)
             writer.join(timeout=5.0)
@@ -1192,6 +1325,7 @@ def run_submitted_executable(
                 if proc.stdout is not None:
                     proc.stdout.close()
         if over_cap.is_set():
+            _kill_and_reap_process_group(proc)
             raise AgentFault(
                 f"submitted executable produced more than {max_output_bytes} "
                 f"bytes of stdout"
@@ -1205,17 +1339,24 @@ def run_submitted_executable(
 
     # Streaming: pump lines to sys.stderr (never the score-parsed sys.stdout),
     # dropping RUBRIC_SCORE= lines; utf-8/replace so a bad byte can't break the pump.
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        cwd=cwd_str,
-        env=child_env,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        preexec_fn=_drop_privileges_to_model,
-    )
+    try:
+        proc = _spawn_submitted_process(
+            cmd,
+            identity=identity,
+            cwd_fd=cwd_fd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=cwd_str,
+            env=child_env,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            start_new_session=True,
+        )
+    except subprocess.SubprocessError as exc:
+        raise GraderFault(
+            f"could not establish submitted-process boundary: {exc}"
+        ) from exc
     assert proc.stdout is not None
     for line in proc.stdout:
         if "RUBRIC_SCORE=" in line:
@@ -1325,15 +1466,17 @@ def _np_load_regular_nofollow(
     not symlink traversal.)
     """
     try:
-        with regular_file_snapshot(
-            path,
-            max_bytes=max_bytes,
-        ) as snapshot:
-            with open_regular_file(
+        with (
+            regular_file_snapshot(
+                path,
+                max_bytes=max_bytes,
+            ) as snapshot,
+            open_regular_file(
                 snapshot,
                 max_bytes=max_bytes,
-            ) as (handle, _info):
-                return np.load(handle, allow_pickle=False)
+            ) as (handle, _info),
+        ):
+            return np.load(handle, allow_pickle=False)
     except Exception as exc:
         raise AgentFault(
             f"HDF5 readback file {path} could not be snapshotted and parsed "
