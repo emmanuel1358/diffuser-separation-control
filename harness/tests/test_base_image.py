@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -30,6 +31,189 @@ def test_build_script_handles_empty_cpu_suffix_and_parent_args() -> None:
     text = script.read_text()
     assert "IFS='|' read -r suffix dockerfile tag_prefix" in text
     assert 'if [[ "${#parent_build_args[@]}" -gt 0 ]]' in text
+
+
+def test_build_script_defaults_to_every_flavor() -> None:
+    """A partial default is never correct.
+
+    ``base_drift_hash`` hashes all base inputs globally, not per flavor, so any
+    base edit moves every flavor's tag. ``expand_base_flavors`` only pulls in
+    parents, so a flavor left out of the default list simply never gets built at
+    the new tag.
+    """
+    script = (REPO_ROOT / "base" / "build_and_push.sh").read_text()
+    default = next(
+        line.split("=", 1)[1].strip('"')
+        for line in script.splitlines()
+        if line.startswith("FLAVORS=")
+    )
+    assert set(default.split(",")) == set(BASE_FLAVORS)
+
+
+def test_install_common_restores_torchs_nccl_after_the_extras() -> None:
+    """xgboost's nvidia-nccl-cu12 overwrites torch's nvidia-nccl-cu13.
+
+    Both distributions install the same ``nvidia/nccl/lib/libnccl.so.2``, so the
+    last one installed wins and torch loads whatever is left there. The repair
+    only works if it is ordered after every install that can pull in the cu12
+    build, and it has to be verified against the file on disk -- torch's own
+    ``torch.cuda.nccl.version()`` reads a compile-time header constant and
+    reports the pinned version either way.
+    """
+    text = (REPO_ROOT / "base" / "install-common.sh").read_text()
+
+    extras = 'uv pip install --python "${RUNTIME_VENV_DIR}/bin/python" --no-cache "${runtime_constraints[@]}" "${torch_constraint_args[@]}" -r "${BASE_EXTRA_REQUIREMENTS}"'
+    reinstall = "--reinstall-package nvidia-nccl-cu13"
+    assert extras in text
+    assert reinstall in text
+    assert text.index(extras) < text.index(reinstall)
+
+    # Version comes from torch's metadata, not a literal, so the two cannot drift.
+    assert 'md.requires("torch")' in text
+    assert '"nvidia-nccl-cu13==${nccl_pin}"' in text
+
+    # The check has to dlopen the resolved library rather than trust metadata,
+    # and it has to run again after the reinstall so a repair that did not take
+    # fails the build.
+    assert "ncclGetVersion" in text
+    assert text.rindex('nccl_verify "${nccl_pin}"') > text.index(reinstall)
+
+
+def test_nccl_check_skips_flavors_whose_torch_bundles_no_cuda() -> None:
+    """The skip has to key off torch's metadata, not off package presence.
+
+    cpu and tpu install a CPU-only torch, so nothing there declares an NCCL
+    dependency and there is nothing to protect -- that must be a silent skip. But
+    a flavor whose torch *does* pin nvidia-nccl-cu13 while the library is missing
+    or disagrees has to fail loudly. Keying the guard on whether the distribution
+    happens to be installed would collapse those two cases into one.
+    """
+    text = (REPO_ROOT / "base" / "install-common.sh").read_text()
+
+    # No torch, or a torch that pins no NCCL -> print nothing and exit clean.
+    assert "except md.PackageNotFoundError:\n    raise SystemExit(0)" in text
+    assert "if not pins:\n    raise SystemExit(0)" in text
+    # Empty pin is the skip branch, not an error branch.
+    assert 'if [[ -z "${nccl_pin}" ]]; then' in text
+    # But a declared pin with no installed distribution is a hard failure.
+    assert "but it is not installed" in text
+
+
+def test_every_flavor_pins_the_torch_build_it_installs() -> None:
+    """An unpinned torch floats, and on cpu/tpu it floats all the way to CUDA.
+
+    uv searches --extra-index-url before --index-url, so a bare `torch` against
+    the PyTorch CPU index still resolves to PyPI's plain CUDA wheel and drags the
+    whole nvidia-* stack -- cuDNN, cuBLAS, a 200 MB NCCL -- into an image that has
+    no GPU. Every flavor that installs torch therefore names exact versions, and
+    the accelerator-less flavors name +cpu builds and opt into best-match so that
+    the local version is reachable at all.
+    """
+    cpu_only = {"cpu", "tpu"}
+    seen: set[str] = set()
+    for dockerfile in sorted((REPO_ROOT / "base").glob("*/Dockerfile")):
+        flavor = dockerfile.parent.name
+        text = dockerfile.read_text()
+        if "TORCH_INDEX_URL" not in text:
+            continue
+        seen.add(flavor)
+
+        match = re.search(r'ARG TORCH_PACKAGES="([^"]+)"', text)
+        assert match, f"{flavor} installs torch but does not pin TORCH_PACKAGES"
+        packages = match.group(1).split()
+        assert packages, f"{flavor} has an empty TORCH_PACKAGES"
+        for package in packages:
+            assert "==" in package, f"{flavor} leaves {package} unpinned"
+
+        if flavor in cpu_only:
+            for package in packages:
+                assert package.endswith("+cpu"), (
+                    f"{flavor} has no accelerator, so {package} must be a +cpu "
+                    "build or the CUDA wheel comes back"
+                )
+            assert "ENV TORCH_INDEX_STRATEGY=unsafe-best-match" in text, (
+                f"{flavor} pins a +cpu local version, which uv cannot reach "
+                "under its default first-index strategy"
+            )
+
+    assert cpu_only <= seen, f"cpu/tpu must install torch explicitly, saw {seen}"
+    assert {"gpu", "gpu-blackwell", "cuda-graphics"} <= seen, seen
+
+
+def test_install_common_seeds_pip_into_the_runtime_venv() -> None:
+    """`uv venv` does not seed pip, so it must be installed explicitly.
+
+    Without this, /usr/local/bin/pip is a dangling symlink, `python -m pip`
+    fails, and the only pip3 on PATH belongs to the system CPython whose
+    site-packages the runtime venv cannot see.
+    """
+    script = REPO_ROOT / "base" / "install-common.sh"
+    completed = subprocess.run(
+        ["bash", "-n", str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    text = script.read_text()
+    seed_pip = 'uv pip install --python "${RUNTIME_VENV_DIR}/bin/python" --no-cache pip'
+    assert seed_pip in text
+    # Both pip names must resolve to the runtime venv, not the system CPython.
+    assert "rm -f /usr/local/bin/pip /usr/local/bin/pip3" in text
+    assert 'ln -sf "${RUNTIME_VENV_DIR}/bin/pip" /usr/local/bin/pip\n' in text
+    assert 'ln -sf "${RUNTIME_VENV_DIR}/bin/pip" /usr/local/bin/pip3\n' in text
+    # pip must be seeded before the venv is made world-readable, or the agent
+    # uid cannot execute it.
+    world_readable = 'chmod -R a+rX "${UV_PYTHON_INSTALL_DIR}"'
+    assert text.index(seed_pip) < text.index(world_readable)
+
+
+def test_base_ships_a_headless_gl_backend() -> None:
+    """mujoco ships in every flavor, so every flavor needs a usable GL backend.
+
+    `libgl1` alone is only the client-side dispatch library; without a platform
+    library mujoco.Renderer dies with "an OpenGL platform library has not been
+    loaded". osmesa rasterizes on CPU, so it works on every flavor regardless of
+    whether an accelerator is attached.
+    """
+    common = (REPO_ROOT / "base" / "install-common.sh").read_text()
+    for package in ("libosmesa6", "libegl1"):
+        assert f"  {package} \\\n" in common, f"{package} missing from apt list"
+
+    # The osmesa backend is reached through PyOpenGL, and mujoco lives in the
+    # runtime venv, so pyopengl has to be a runtime requirement too.
+    runtime_reqs = (REPO_ROOT / "base" / "requirements-runtime.txt").read_text()
+    assert "mujoco==" in runtime_reqs
+    assert "pyopengl==" in runtime_reqs
+
+    # Every flavor that installs the GL libraries must also pin the backend,
+    # rather than let mujoco probe into one that cannot make a context. The set
+    # is derived from the Dockerfiles instead of hardcoded so a newly added
+    # flavor cannot inherit the libraries and silently skip the pin.
+    flavors = sorted(
+        path.parent.name
+        for path in (REPO_ROOT / "base").glob("*/Dockerfile")
+        if any(
+            line.lstrip().startswith("RUN") and "install-common.sh" in line
+            for line in path.read_text().splitlines()
+        )
+    )
+    assert {"cpu", "cuda-graphics", "gpu", "gpu-blackwell", "tpu"} <= set(
+        flavors
+    ), flavors
+    for flavor in flavors:
+        dockerfile = (REPO_ROOT / "base" / flavor / "Dockerfile").read_text()
+        # No exceptions, including cuda-graphics: its CUDA-native raster path
+        # (pytorch3d/nvdiffrast) does not go through PyOpenGL, and hardware EGL
+        # is not deployable under Taiga's gVisor + nvproxy sandbox anyway, so
+        # pinning egl there only broke mujoco.Renderer.
+        assert (
+            "ENV PYOPENGL_PLATFORM=osmesa" in dockerfile
+        ), f"{flavor} does not pin PYOPENGL_PLATFORM=osmesa"
+        assert (
+            "ENV MUJOCO_GL=osmesa" in dockerfile
+        ), f"{flavor} does not pin MUJOCO_GL=osmesa"
 
 
 def _fake_repo(tmp_path: Path) -> Path:

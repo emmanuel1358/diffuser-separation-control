@@ -4,8 +4,8 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
-from alignerr_plugin.local_runtime import VALID_FLAVORS
 
 from lbx_rl_tasks_harness import __version__
 from lbx_rl_tasks_harness.env import load_env_file
@@ -66,7 +66,6 @@ def _run(
     run_dir: Path,
     model: str | None,
     max_steps: int | None = None,
-    flavor: str = "auto",
     calibration_check: bool = False,
 ) -> None:
     load_env_file()
@@ -80,12 +79,14 @@ def _run(
                     run_dir_base=run_dir,
                     model=model,
                     max_steps=max_steps,
-                    flavor=flavor,
                     calibration_check=calibration_check,
                 )
             )
     except Exception as exc:  # noqa: BLE001 - CLI boundary
-        console.print(f"[red]Harness failed:[/red] {exc}")
+        # escape: failure text carries bracketed phase headers such as
+        # "[rubric-quality container grade ...]" that Rich would parse as markup
+        # tags and drop, leaving an error message with no error in it.
+        console.print(f"[red]Harness failed:[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
     for result in results:
         _emit(result)
@@ -139,10 +140,9 @@ def reference(
         "solution",
         "--solution-dir",
         help=(
-            "Directory under the task root holding the reference to run. "
-            "ML_Envs tasks run <solution-dir>/solution.py (default reference_solution; "
-            "e.g. --solution-dir baselines/naive to run a baseline instead). "
-            "Native tasks run <solution-dir>/solve.sh (default solution)."
+            "Directory under the task root holding the reference to run; "
+            "<solution-dir>/solve.sh is executed (default solution). Use e.g. "
+            "--solution-dir baselines/naive to run a baseline instead."
         ),
     ),
     skip_solve: bool = typer.Option(
@@ -173,7 +173,7 @@ def reference(
             solution_dir=solution_dir,
         )
     except Exception as exc:  # noqa: BLE001 - CLI boundary
-        console.print(f"[red]Reference run failed:[/red] {exc}")
+        console.print(f"[red]Reference run failed:[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
     _emit(result)
     manifest = problem_dir / ".alignerr" / "reference_run" / "latest" / "manifest.json"
@@ -214,18 +214,6 @@ def run(
             "once the cap is reached."
         ),
     ),
-    flavor: str = typer.Option(
-        "auto",
-        "--flavor",
-        help=(
-            "Compute base flavor for ML_Envs tasks. 'auto' (default): build the "
-            "heavy production-equivalent base and, on a build-time OOM, fall back "
-            "to the local-only slim base (agent pip-installs ML wheels at runtime; "
-            "turn budget bumped to compensate). 'heavy': force the production base "
-            "(required for graphics/TPU tasks). 'slim': force the stripped base "
-            "for low-RAM hosts (ML_Envs compute tasks only)."
-        ),
-    ),
     calibration_check: bool = typer.Option(
         False,
         "--calibration-check",
@@ -237,17 +225,12 @@ def run(
     ),
 ) -> None:
     """Run a local authoring-format task directory."""
-    if flavor not in VALID_FLAVORS:
-        raise typer.BadParameter(
-            f"--flavor must be one of {list(VALID_FLAVORS)}; got {flavor!r}"
-        )
     _run(
         load_problem_dir(problem_dir),
         runtime,
         run_dir,
         model,
         max_steps=max_steps,
-        flavor=flavor,
         calibration_check=calibration_check,
     )
 
@@ -325,7 +308,7 @@ def autoqa(
             require=require,
         )
     except Exception as exc:  # noqa: BLE001 - CLI boundary
-        console.print(f"[red]Auto QA failed:[/red] {exc}")
+        console.print(f"[red]Auto QA failed:[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
 
 

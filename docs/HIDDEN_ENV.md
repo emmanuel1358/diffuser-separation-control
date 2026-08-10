@@ -27,8 +27,16 @@ Do NOT use it for:
 - Tasks where the "environment" is just a public helper the agent may read --
   put it in `data/` and skip the server.
 
-`hidden_env` is **orthogonal to `task_type`**: an `ml`, `mujoco`, `cfd`, or
-`structures` task can each opt in. It is a runtime capability, not a domain.
+`hidden_env` is **orthogonal to `task_type`**: an `ml`, `mujoco`, `cfd`,
+`structures`, or `software_engineering` task can opt in. It is a runtime
+capability, not a domain.
+
+For `software_engineering`, do not use `hidden_env` as a substitute for a
+declared service graph. Simple tasks use the single-image repository contract;
+multi-service tasks declare service-owned artifacts, per-service Dockerfiles,
+and an isolated verifier, then trusted tooling packages them as an outer
+capsule. Task-local SSE MCP is available on Taiga only through that capsule's
+audited service-DNS proxy; unbundled SSE remains unsupported.
 
 ## How it works
 
@@ -134,12 +142,12 @@ resolves under `/mcp_server` (so a rollout cannot redirect a privileged read).
 ## Reward-hacking closures (built in)
 
 - **No source access**: env baked root-only (0700) at `/mcp_server/data`.
-- **No server-only dependency access** (`env_dependencies`): a simulator the
+- **No server-only dependency access** (`scorer/env-requirements.txt`): a simulator the
   hidden env imports (e.g. `myosuite`) is agent-visible if it sits in the shared
   site-packages — the agent can then `import` it and drive the raw env, skipping
   the constraints your RPC layer imposes (partial observability, action limits,
-  noise, ...). Declare such packages in `metadata.json`'s `env_dependencies`
-  instead of `dependencies`: they install into the root-only
+  noise, ...). Declare such packages in `scorer/env-requirements.txt`
+  instead of `environment/requirements.txt`: they install into the root-only
   `/mcp_server/env_deps` (on the env server's `sys.path`, unreadable by the
   uid-1000 agent, which is blocked at the 0700 `/mcp_server`), so the env server
   can import them but the agent must go through the RPC. See below.
@@ -156,40 +164,36 @@ resolves under `/mcp_server` (so a rollout cannot redirect a privileged read).
 
 See [REWARD_HACKING.md](REWARD_HACKING.md) for the full catalog.
 
-## Server-only dependencies (`env_dependencies`)
+## Server-only dependencies (`scorer/env-requirements.txt`)
 
 If your hidden env is built on a pip-installed simulator, put that package in
-`metadata.json`'s **`env_dependencies`** (not `dependencies`):
+`scorer/env-requirements.txt` rather than `environment/requirements.txt`:
 
-```json
-{
-  "ml_task_type": "env",
-  "required_resources": "12vcpu+100gib+h100/2",
-  "domain": "...",
-  "license": "...",
-  "license_source": "...",
-  "env_dependencies": ["myosuite==2.9.0"]
-}
+```text
+# scorer/env-requirements.txt
+myosuite==2.9.0
 ```
 
-- **How it isolates.** The build installs `env_dependencies` into the root-only
-  `/mcp_server/env_deps` (via `pip install --target`), *not* into the system
-  site-packages. The env server (which runs as root) prepends that directory to
-  its `sys.path` before loading `env.py`, so `import myosuite` works there. The
-  agent runs as uid 1000 and is blocked at the `0700 /mcp_server`, so it cannot
-  read `/mcp_server/env_deps` — `import myosuite` from the agent's shell fails,
-  and there is no runtime internet to install it. The simulator is reachable
-  **only** through your RPC surface.
-- **`dependencies` vs `env_dependencies`.** `dependencies` install system-wide
-  and are **agent-visible** (use them for what the agent legitimately needs, e.g.
-  `torch`). `env_dependencies` are **server-only**. A package must be in exactly
-  one list — putting the simulator in both re-exposes it to the agent, so the
-  validator rejects the overlap. `env_dependencies` is only valid on `env` /
-  `hybrid` tasks.
+- **How it isolates.** `install-task-deps.sh` installs this channel into the
+  root-only `/mcp_server/env_deps` (via `uv pip install --target`), *not* into
+  the agent-visible runtime venv. The env server (which runs as root) prepends
+  that directory to its `sys.path` before loading `env.py`, so `import myosuite`
+  works there. The agent runs as uid 1000 and is blocked at the
+  `0700 /mcp_server`, so it cannot read `/mcp_server/env_deps` —
+  `import myosuite` from the agent's shell fails, and there is no runtime
+  internet to install it. The simulator is reachable **only** through your RPC
+  surface.
+- **Agent-visible vs server-only.** `environment/requirements.txt` installs into
+  the runtime venv and is **agent-visible** (use it for what the agent
+  legitimately needs, e.g. `torch`). `scorer/env-requirements.txt` is
+  **server-only**. A package must be in exactly one channel — putting the
+  simulator in both re-exposes it to the agent, so the validator rejects the
+  overlap. `scorer/env-requirements.txt` is only valid on `env` / `hybrid`
+  tasks.
 - **Caveat.** Shared transitive deps stay shared: if the simulator needs
   `mujoco` and the base image already ships it, the agent has the *engine* but
   not the simulator's wrappers / model assets (those ship inside the package and
-  are now root-only). Keep any task-specific model files in `data/private`
+  are now root-only). Keep any task-specific model files in `scorer/data/`
   (already root-only) so the agent can't rebuild the env from generic pieces.
 
 ## Reference

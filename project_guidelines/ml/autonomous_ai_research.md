@@ -1,8 +1,9 @@
 # Autonomous AI Research ML Task Authoring Guide
 
 This guide is for authors creating continuous ML tasks in the ISO template for
-the Autonomous AI Research Taiga environment. It uses the current
-`lbx-rl-tasks-iso-template` metadata-mode contract.
+the Autonomous AI Research Taiga environment. It uses the native
+`lbx-rl-tasks-iso-template` `task.toml` contract, which is the only supported
+task format.
 
 An ML task here is not a one-off Kaggle clone. It is a verifiable research
 problem where an agent reads a prompt, uses public data or a public simulator,
@@ -13,22 +14,28 @@ shortcuts.
 
 ## 1. Current ISO ML layout
 
-New continuous ML tasks use the template's metadata-mode ML contract. Operational
-fields are synthesized centrally, while authors keep task-specific grading in
-`test_file.py`:
+Continuous ML tasks declare their contract in `task.toml` and keep task-specific
+grading in `scorer/compute_score.py`:
 
 ```text
 problems/<task_id>/
-|-- metadata.json
-|-- prompt.md
-|-- test_file.py
-|-- calibration.lock.json         # generated, never hand-edited
-|-- data-generation/
+|-- task.toml                      # contract
+|-- instruction.md                 # agent-facing prompt
+|-- calibration.lock.json          # generated, never hand-edited
+|-- environment/
+|   |-- Dockerfile                 # thin layer on a native base image
+|   |-- requirements.txt           # agent-visible pip deps (optional)
+|   `-- apt.txt                    # agent-visible apt packages (optional)
+|-- data_generation/
 |   `-- generate.py
-|-- data/
-|   |-- public/                    # mounted read-only at /data
-|   `-- private/                   # root-only at /mcp_server/data
-|-- reference_solution/
+|-- data/                          # mounted read-only at /data
+|-- scorer/
+|   |-- compute_score.py           # root-only at /mcp_server/grader
+|   |-- data/                      # root-only at /mcp_server/data
+|   |-- requirements.txt           # grader-only pip deps (optional)
+|   `-- env-requirements.txt       # hidden-env-server-only deps (optional)
+|-- solution/
+|   |-- solve.sh
 |   |-- train.py
 |   |-- solution.py
 |   |-- model.*
@@ -42,13 +49,13 @@ problems/<task_id>/
 `-- README.md
 ```
 
-`task_type = "ml"` remains the broad platform category. Dataset, model,
-executable, HDF5, k-fold, hidden-environment, and learned-policy tasks are
-evaluation paradigms expressed inside the hand-authored grader.
+`task_type = "ml"` is the broad platform category. The evaluation shape is not
+declared anywhere: dataset, model, executable, HDF5, k-fold, hidden-environment,
+and learned-policy tasks are all expressed inside the hand-authored grader, and
+`[environment].hidden_env` switches on the env server when one is needed.
 
-Native `task.toml` ML tasks remain supported for migration and specialized
-images, but new authors should start from the metadata-mode ML starter and
-`docs/MLENVS_TASKS.md`.
+Dependencies are never named in `task.toml`. Each requirements file installs to
+a different place, and that placement is the isolation boundary — see section 16.
 
 ## 2. The Mental Model
 
@@ -57,10 +64,10 @@ Every strong ML task has five pieces:
 1. A domain-faithful problem that actually requires machine learning.
 2. Public artifacts under `data/` that are sufficient for a capable agent to
    train, adapt, probe, or infer a useful solution without seeing hidden truth.
-3. Hidden fixtures under `data/private/` that define the held-out evaluation.
-4. A deterministic hand-authored evaluator in `test_file.py`, composed with
+3. Hidden fixtures under `scorer/data/` that define the held-out evaluation.
+4. A deterministic hand-authored evaluator in `scorer/compute_score.py`, composed with
    `ContinuousTask` for reviewed anchors and generated PWL scoring.
-5. A committed reference model and inference path in `reference_solution/` that proves the problem is
+5. A committed reference model and inference path in `solution/` that proves the problem is
    solvable and scores `0.5 +/- 0.05` for continuous scoring tasks.
 
 The goal is not to make the reference perfect. The reference is the expert
@@ -79,40 +86,49 @@ cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/ml problems/<task_id
 
 Then update:
 
-- `metadata.json`: set ML paradigm, resources, domain, license, and description.
-- `prompt.md`: the agent-facing task prompt.
-- `data/public/`: public training data, public simulator, public schema, or public
+- `task.toml`: set resources, domain, license, and description.
+- `instruction.md`: the agent-facing task prompt.
+- `data/`: public training data, public simulator, public schema, or public
   helper files.
-- `data/private/`: hidden labels, hidden seeds, held-out cases, private eval
+- `scorer/data/`: hidden labels, hidden seeds, held-out cases, private eval
   distributions, and grader-only metadata.
-- `test_file.py`: hand-authored loading and raw evaluation composed with `TASK`.
-- `reference_solution/`: committed model, train/inference scripts, and manifest.
+- `scorer/compute_score.py`: hand-authored loading and raw evaluation composed
+  with `TASK`.
+- `solution/`: committed model, train/inference scripts, and manifest.
 - `baselines/naive/`: weak input-dependent model and reproducible recipe.
 
 Do not edit shared template code unless the task genuinely needs a reusable
 tooling improvement. Authored task work should stay inside one
 `problems/<task_id>/` directory.
 
-## 4. `metadata.json` contract for ML tasks
+## 4. `task.toml` contract for ML tasks
 
-The starter synthesizes `task_type = "ml"`,
+The starter pre-fills `task_type = "ml"`,
 `reward_type = "continuous_scoring_function"`, offline runtime, timeouts, and
 output conventions. Authors provide:
 
-```json
-{
-  "ml_task_type": "dataset",
-  "required_resources": "12vcpu+100gib+h100/2",
-  "domain": "scientific_discovery_computational_science",
-  "license": "CC0-1.0",
-  "license_source": "https://example.com/upstream-license",
-  "description": "Concise description of the ML task."
-}
+```toml
+[task]
+name = "labelbox/<task_id>"
+description = "Concise description of the ML task."
+
+[environment]
+required_resources = "12vcpu+100gib+h100/2"
+allow_internet = false
+
+[difficulty]
+task_type = "ml"
+domain = "scientific_discovery_computational_science"
+reward_type = "continuous_scoring_function"
+license = "CC0-1.0"
+license_source = "https://example.com/upstream-license"
 ```
 
 Important details:
 
-- `ml_task_type` selects `dataset`, `env`, `hybrid`, or `sim_policy`.
+- There is no `[ml]` section. A task that needs a live env sets
+  `[environment].hidden_env`; a task graded on a rolled-out policy says so by
+  declaring `PolicyEvaluationTask` in its grader. Nothing else to keep in sync.
 - `domain` must be one of the ML domains in
   `alignerr_plugin.task_metadata.DOMAINS_BY_TASK_TYPE["ml"]`.
 - The generated reference score must remain `0.5 +/- 0.05`.
@@ -155,8 +171,7 @@ important gates for ML authors are:
 - Mothership applies ML/GPU overrides at submit time: ML tasks route to the
   Autonomous AI Research environment and use the `12vcpu+100gib+h100/2` GPU tier
   with the GPU model override.
-- For metadata-mode `ml` tasks, trusted CI packs `data/public/` and
-  `data/private/` into read-only
+- Trusted CI packs `data/` and `scorer/data/` into read-only
   content-addressed mounts before Taiga submission, then slims them out of the
   image build context. Do not rely on large data being baked into the Docker
   image.
@@ -185,7 +200,7 @@ families include:
 
 Prefer domains where you have enough expertise to defend the data generator,
 simulator, targets, and reference approach. A reviewer should be able to inspect
-`data/public/`, `data/private/`, `test_file.py`, and the generator/provenance
+`data/`, `scorer/data/`, `scorer/compute_score.py`, and the generator/provenance
 and agree that the task is an instance of the named domain.
 
 Strong ML tasks usually have these properties:
@@ -228,7 +243,7 @@ A task is domain-faithful when:
   simulator outcome, value function, physical observable, geometric measurement,
   biological label, or perception output, the generator or private evaluator
   actually computes that thing.
-- Public descriptions match the code. `prompt.md`, `data/public/column_mapping.json`,
+- Public descriptions match the code. `instruction.md`, `data/column_mapping.json`,
   schemas, and README text describe what is actually generated and scored.
 - Citations describe implemented methods, not just vocabulary.
 - The public information is sufficient for an expert to recognize the task's
@@ -286,9 +301,9 @@ For dataset tasks:
 
 For public simulators or learned-policy tasks:
 
-- Put inspectable training simulators or helpers under `data/public/`.
+- Put inspectable training simulators or helpers under `data/`.
 - Keep hidden evaluation dynamics, hidden seeds, or private scenarios under
-  `data/private/`.
+  `scorer/data/`.
 - If the agent must interact live with a hidden black-box environment during the
   solve, use `[environment].hidden_env = "env" | "hybrid"` and follow
   `docs/HIDDEN_ENV.md`.
@@ -310,7 +325,7 @@ For external data:
 The prompt and grader must define an artifact under `/tmp/output`. Match it to a
 sanctioned loader:
 
-| Submission paradigm | Output path example | Scorer loader |
+| Submission shape | Output path example | Scorer loader |
 | --- | --- | --- |
 | CSV/dataframe predictions | `/tmp/output/submission.csv` | `helpers.load_submission_or_fault` |
 | HDF5 arrays | `/tmp/output/submission.h5` | `helpers.load_submission_h5_or_fault` |
@@ -345,7 +360,7 @@ def predict(X):
     ...
 ```
 
-Then call it from `test_file.py` with:
+Then call it from `scorer/compute_score.py` with:
 
 ```python
 from grading import AgentFault, helpers
@@ -376,7 +391,7 @@ runs the executable in a non-root sandbox.
 
 ## 10. Scorer Contract
 
-Metadata-mode ML `test_file.py` must define the no-argument platform entrypoint
+Metadata-mode ML `scorer/compute_score.py` must define the no-argument platform entrypoint
 and should separate raw evaluation:
 
 ```python
@@ -587,11 +602,11 @@ passes; tighten the engineering challenge fairly and rerun QA.
 ## 14. Reference Solution
 
 The reference solution is the expert anchor and must be checked in under
-`reference_solution/`. Commit the trained model and complete reproduction
+`solution/`. Commit the trained model and complete reproduction
 surface:
 
 ```text
-reference_solution/
+solution/
 |-- train.py
 |-- solution.py
 |-- model.*
@@ -607,7 +622,7 @@ Reference expectations:
 - It should demonstrate domain knowledge.
 - It should be deterministic under fixed seeds.
 - It should use only public files available to the agent at solve time, plus
-  normal package dependencies. Do not read `data/private/`.
+  normal package dependencies. Do not read `scorer/data/`.
 - It should run within the task's timeouts and resource allocation.
 - It should score `0.5 +/- 0.05` for `continuous_scoring_function`.
 - It should beat all weak baselines by a meaningful margin.
@@ -618,7 +633,7 @@ Trained weights are required provenance. Use Git LFS or approved immutable
 storage for large artifacts, and bind them to scripts/data/config/seeds through
 `model.manifest.json`. Never train from private hidden truth.
 
-## 15. Prompt guidelines for `prompt.md`
+## 15. Prompt guidelines for `instruction.md`
 
 The prompt is the only natural-language assignment the agent sees. It should
 describe what to do, not how to solve it.
@@ -661,9 +676,11 @@ anchors, hidden split, or engineered transforms.
 
 ## 16. Dockerfile Rules
 
-Metadata-mode ML uses the shared `base/task.mlenvs.Dockerfile`; authors do not
-write a per-task Dockerfile. Declare additional pip/apt/grader dependencies in
-`metadata.json`.
+ML tasks write a thin `environment/Dockerfile` on a native base image and
+declare dependencies through the isolated channels
+(`environment/apt.txt`, `environment/requirements.txt`,
+`scorer/requirements.txt`, `scorer/env-requirements.txt`), which
+`install-task-deps.sh` routes to the right isolation boundary.
 
 Rules:
 
@@ -673,72 +690,72 @@ Rules:
   uid `1000`.
 - Do not copy private data or grader/calibration files into `/data`, `/workdir`, `/tmp/output`,
   `/app`, or `/workspace`.
-- Put task-specific Python dependencies in `metadata.json:dependencies`; use
-  `grading_dependencies` only for root-only grader packages.
+- Put agent-visible Python dependencies in `environment/requirements.txt`; use
+  `scorer/requirements.txt` only for root-only grader packages.
 - Prefer packages already in the base image. Add heavy dependencies only when
   the task needs them.
 - Do not bake large datasets or model weights into the image. Use conventional
-  `data/public/` and `data/private/` mounts plus approved model storage.
+  `data/` and `scorer/data/` mounts plus approved model storage.
 
-For GPU rendering or differentiable graphics, select matching resources and
-base in `metadata.json`:
+For GPU rendering or differentiable graphics, request a graphics resource tier
+in `task.toml`. `base_flavor` defaults to `"auto"`, which resolves a graphics
+tier to the `cuda-graphics` base; set it explicitly only to be self-documenting.
 
-```json
-{
-  "required_resources": "12vcpu+100gib+h100/2+graphics",
-  "docker-base": "cuda-graphics"
-}
+```toml
+[environment]
+required_resources = "12vcpu+100gib+h100/2+graphics"
+base_flavor = "cuda-graphics"
 ```
 
+That base runs Python 3.13 on CUDA 13.0 / torch 2.9.1+cu130, matching the other
+CUDA bases. Kaolin and Open3D are **not** installed: neither publishes wheels
+for this CUDA and Python, so do not import them.
+
 Hardware GL/EGL/Vulkan is not deployable under the Taiga gVisor sandbox. Use
-CUDA-native stacks such as PyTorch3D, nvdiffrast, gsplat, nerfacc, kaolin,
+CUDA-native stacks such as PyTorch3D, nvdiffrast, gsplat, nerfacc, PyG,
 MJX, Warp, or other image-base-supported libraries.
 
 ## 17. Large Data And Preloaded Files
 
-For metadata-mode `ml` tasks, `data/public/`, `data/private/`, and the promoted
+For `ml` tasks, `data/`, `scorer/data/`, and the promoted
 calibration lock are mounted automatically by trusted CI. Declare Hugging Face
-resources in `metadata.json`:
+resources as preloaded files in `task.toml`:
 
-```json
-{
-  "hf_resources": [
-    {
-      "repo_id": "org/model-name",
-      "revision": "<commit-sha>",
-      "repo_type": "model"
-    }
-  ]
-}
+```toml
+[[preloaded_files]]
+hf_repo = "org/model-name"
+hf_revision = "<commit-sha>"
+repo_type = "model"
+allow_patterns = ["*.safetensors", "*.json"]
 ```
 
-Pin `revision` to a commit for reproducibility. The base image sets
-`HF_HOME=/tmp/hf-cache`, so `from_pretrained` can resolve mounted weights
-offline.
+Pin `hf_revision` to a commit for reproducibility, and narrow large repos with
+`allow_patterns` / `ignore_patterns`. `mount_path` is optional for `hf_repo`
+mounts: it defaults to the canonical hub-cache location derived from the repo id
+and `repo_type`. The base image sets `HF_HOME=/tmp/hf-cache`, so
+`from_pretrained` and `load_dataset` resolve mounted weights offline.
 
 Do not commit `.alignerr/preloaded_files.json`; trusted CI generates the stamp at
 submit time.
 
 ## 18. Hidden Environment Pattern
 
-Set `metadata.json:ml_task_type` to `env` or `hybrid` only when the agent must
-interact with a live black-box environment. Static datasets and public
-simulators use `dataset`.
+Set `[environment].hidden_env` only when the agent must interact with a live
+black-box environment. Static datasets and public simulators leave it unset.
+Use `env` when the socket is the only interface and `hybrid` when the agent also
+reads static `data/` files.
 
-Minimal shape:
-
-```json
-{
-  "ml_task_type": "env"
-}
+```toml
+[environment]
+hidden_env = "env"
 ```
 
 Files:
 
 ```text
-data/public/env_client.py          # public RPC client
-data/private/env.py                # hidden env with make_env()
-data/private/env_config.json       # optional factory/config override
+data/env_client.py            # public RPC client
+scorer/data/env.py            # hidden env with make_env()
+scorer/data/env_config.json   # optional factory/config override
 ```
 
 The agent connects to `/tmp/env.sock`; the env source stays root-only under
@@ -751,12 +768,12 @@ An ML task can opt into it when interaction is part of the benchmark.
 ## 19. Data Generation And Provenance
 
 For v3 continuous ML, keep deterministic synthetic-data provenance under
-`data-generation/`. Reviewers must be able to audit how public and hidden data
+`data_generation/`. Reviewers must be able to audit how public and hidden data
 were produced.
 
 Required provenance:
 
-- Include generation scripts under `data-generation/`.
+- Include generation scripts under `data_generation/`.
 - Keep scripts deterministic with fixed seeds.
 - Document commands used to regenerate public and hidden fixtures.
 - Record external data sources, versions, licenses, and transformations.
@@ -769,12 +786,13 @@ sampling distributions. Treat generation code as part of the scientific claim.
 
 ## 20. Quality Gates Before PR
 
-While iterating on committed reference/naive models, use their task-local
-training scripts and the reference harness without grading:
+While iterating on trained reference/naive strategies, use their task-local
+training scripts and the reference harness without grading. Hand-authored
+`committed_artifact` strategies skip the training commands:
 
 ```bash
 uv sync
-uv run python problems/<task_id>/reference_solution/train.py
+uv run python problems/<task_id>/solution/train.py
 uv run python problems/<task_id>/baselines/naive/train.py
 uv run lbx-rl-harness reference --problem-dir problems/<task_id> --no-grade
 ```
@@ -791,12 +809,10 @@ uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id
 uv run lbx-rl-template validate --problem-dir problems/<task_id>
 ```
 
-Commit:
-
-```text
-problems/<task_id>/calibration.lock.json
-problems/<task_id>/.alignerr/build_proof.json
-```
+Do not commit generated `calibration.lock.json` or build proof cache files;
+Trusted CI generates or restores the production bundle. Commit
+`model.manifest.json` / `strategy.manifest.json`, reference/naive artifacts,
+and any explicit `baselines/degenerate/` probe workspaces instead.
 
 For ML tasks, `.alignerr/ground_truth/` is usually absent unless you explicitly
 declare reviewer artifacts.
@@ -810,12 +826,12 @@ uv run lbx-rl-harness autoqa --problem-dir problems/<task_id> --require
 
 Rerun ground truth and validation after any change to:
 
-- `metadata.json`;
-- `prompt.md` when it changes task requirements rather than prose only;
-- `data-generation/`;
-- `data/public/` or `data/private/`;
-- `test_file.py`;
-- `reference_solution/`;
+- `task.toml`;
+- `instruction.md` when it changes task requirements rather than prose only;
+- `data_generation/`;
+- `data/` or `scorer/data/`;
+- `scorer/compute_score.py`;
+- `solution/`;
 - `baselines/`;
 - calibration floor/perfect values or rationales.
 
@@ -843,11 +859,11 @@ This can leak hidden truth or execute agent code as root. Use
 `helpers.run_model_module`, `helpers.run_policy`, `PolicyWorker`,
 `load_submitted_policy`, or another sanctioned helper.
 
-### Hidden truth is in `data/public/`
+### Hidden truth is in `data/`
 
-Anything under `data/public/` is public to the agent. Move labels, eval seeds, private
-cases, and grader-only fixtures to `data/private/`; only `data/public/` is
-mounted for the agent in metadata-mode ML.
+Anything under `data/` is public to the agent. Move labels, eval seeds, private
+cases, and grader-only fixtures to `scorer/data/`; only `data/` is
+mounted for the agent in native ML.
 
 ### The Prompt Reveals Anchors
 
@@ -857,7 +873,7 @@ weighting details should stay hidden.
 ### Public Data Is Too Sparse
 
 If a domain expert cannot infer what the data represents or what the targets
-measure from `prompt.md`, public schemas, and normal EDA, the prompt is too
+measure from `instruction.md`, public schemas, and normal EDA, the prompt is too
 vague or the data is not domain-faithful.
 
 ### The Task Needs GPU But Uses CPU Base
@@ -869,7 +885,7 @@ Dockerfile.
 
 ### The Image Bakes Large Data
 
-ML `data/public/` and `data/private/` are mounted by trusted CI. Extra large resources
+ML `data/` and `scorer/data/` are mounted by trusted CI. Extra large resources
 should use `[[preloaded_files]]`, not image layers.
 
 ## 22. Review Checklist
@@ -877,22 +893,22 @@ should use `[[preloaded_files]]`, not image layers.
 Use this checklist before asking for review:
 
 - [ ] The task lives under one `problems/<task_id>/` directory.
-- [ ] `metadata.json` declares valid `ml_task_type`, resources, domain, and license provenance.
-- [ ] `prompt.md` states public files, output format, metric names, and the
+- [ ] `task.toml` declares valid resources, domain, and license provenance.
+- [ ] `instruction.md` states public files, output format, metric names, and the
       required tmux final sentence.
-- [ ] `prompt.md` does not reveal anchors, transforms, architecture hints,
+- [ ] `instruction.md` does not reveal anchors, transforms, architecture hints,
       or hidden evaluation details.
-- [ ] Public data is in `data/public/`; hidden truth is in `data/private/`.
+- [ ] Public data is in `data/`; hidden truth is in `scorer/data/`.
 - [ ] External data licensing is cleared and documented.
-- [ ] `data-generation/` deterministically reproduces the committed data.
+- [ ] `data_generation/` deterministically reproduces the committed data.
 - [ ] The domain claims match the equations, simulator, labels, and citations.
-- [ ] `test_file.py` keeps task-specific evaluation logic and uses sanctioned loaders.
+- [ ] `scorer/compute_score.py` keeps task-specific evaluation logic and uses sanctioned loaders.
 - [ ] Agent faults raise `AgentFault`; author/infra faults propagate.
 - [ ] The scorer is deterministic and returns a finite score in `[0, 1]`.
 - [ ] Exact versioned metric formulas are declared.
 - [ ] Every floor has a substantive `AnchorRationale` and is not copied from a baseline.
 - [ ] Reference and naive trained models, scripts, configs, seeds, and manifests are committed.
-- [ ] `reference_solution/solution.py` scores `0.5 +/- 0.05`.
+- [ ] `solution/solution.py` scores `0.5 +/- 0.05`.
 - [ ] The weak input-dependent naive model scores low but positive; null probes score zero.
 - [ ] `calibration.lock.json` is generated, canonical, and unedited.
 - [ ] Large data is mounted rather than baked into image layers.
@@ -907,7 +923,7 @@ Use this checklist before asking for review:
 Read these before authoring:
 
 - `docs/AUTHORING.md`: universal task layout and PR workflow.
-- `docs/MLENVS_TASKS.md`: concise metadata-mode ML authoring and calibration guide.
+- `docs/ML_TASKS.md`: concise native ML authoring and calibration guide.
 - `docs/GRADING.md`: scorer return shapes, calibration, and grader contract.
 - `docs/REWARD_HACKING.md`: AgentFault and loader discipline.
 - `docs/POLICY_ISOLATION.md`: safe policy/model execution.

@@ -1,23 +1,26 @@
 ---
 name: numerical-solver-tasks
-description: Author non-MuJoCo numerical-solver RL tasks (task_type cfd or structures) using the open-source solver stack baked into the base image. Use when creating tasks that need OpenFOAM, SU2, AeroSandbox/AVL, scikit-fem/PyNite/CalculiX/OpenSeesPy, or when setting [difficulty].domain.
+description: Authors non-MuJoCo numerical-solver RL tasks with task_type cfd or structures and the in-base solver stack. Use for OpenFOAM, SU2, AeroSandbox/AVL, scikit-fem, PyNite, CalculiX, OpenSeesPy, or solver-backed rubric oracles.
 ---
 
 # Numerical-Solver Tasks
 
 Non-MuJoCo engineering tasks reuse the same scoring contract as other tasks
-(`compute_score(workspace, trajectory, private)`, artifacts to `/tmp/output`,
-enum-backed metadata, and reward-type-specific oracle targets). A numerical
-solver is the deterministic referee.
+(artifacts to `/tmp/output`, enum-backed metadata, and reward-type-specific
+oracle targets). Rubric solver tasks declare `TASK = RubricTask(...)` (see
+`docs/RUBRIC_EVALUATION.md`); continuous tasks still use `compute_score`. A
+numerical solver is the deterministic referee.
 
 References:
 - `docs/NUMERICAL_SOLVERS.md` — full engine inventory + how to invoke each.
 - `project_guidelines/cfd/cfd_environments.md` — CFD task guide (AVL + OpenFOAM).
 - `project_guidelines/cfd/prometheus_cfd_environments.md` — non-eval Prometheus CFD guide.
 - `project_guidelines/cfd/prometheus_eval_cfd_environments.md` — eval Prometheus CFD guide.
+- `project_guidelines/strctural_engineering/STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md` — standard structures guide.
 - `project_guidelines/strctural_engineering/PROMETHEUS_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md` — non-eval Prometheus OpenSees guide.
 - `project_guidelines/strctural_engineering/PROMETHEUS_EVAL_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md` — eval Prometheus OpenSees guide.
 - `examples/openfoam-hydrofoil-flap` — canonical worked example.
+- `examples/opensees-base-isolation` — canonical structures example.
 
 ## task.toml
 
@@ -39,6 +42,10 @@ Import directly in `scorer/compute_score.py`:
 | electromagnetics | `skrf` |
 | reacting flow / thermo | `cantera`, `CoolProp` |
 | EDA | `klayout.db` |
+
+The installed stack may support these sub-disciplines, but authored task types
+remain only `cfd` or `structures`; select a scoped domain from
+`alignerr_plugin.task_metadata`.
 
 Heavy engines run via subprocess (they live only in the base image):
 - OpenFOAM: `source /etc/solver-envs.d/openfoam.sh` then `blockMesh`/`pimpleFoam`/etc.

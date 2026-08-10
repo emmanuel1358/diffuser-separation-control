@@ -6,8 +6,10 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from alignerr_plugin.capsule import export_task_capsule
 from alignerr_plugin.exporters.harbor import export_harbor as export_harbor_impl
 from alignerr_plugin.exporters.taiga import export_taiga as export_taiga_impl
+from alignerr_plugin.migrations.mujoco import migrate_legacy_mujoco_task
 from alignerr_plugin.validators.task.creator import TaskCreator
 from alignerr_plugin.validators.task.validator import TaskValidator, reward_hack_lint
 
@@ -22,6 +24,7 @@ STARTER_TEMPLATES = (
     "mujoco",
     "cfd",
     "structures",
+    "software-engineering",
     "prometheus",
     "prometheus-cfd",
     "prometheus-structures",
@@ -33,8 +36,8 @@ STARTER_TEMPLATES = (
 # by the validator stage name (see TaskValidator.validate).
 STAGE_HINTS: dict[str, str] = {
     "schema": (
-        "task.toml / metadata.json shape problem. Confirm required files exist; "
-        "ml tasks must set allow_internet = false (locked off for ml)."
+        "task.toml shape problem. Confirm required files exist; ml tasks must "
+        "set allow_internet = false (locked off for ml)."
     ),
     "prompt_runtime_references": (
         "instruction.md references runtime details it shouldn't pin (e.g. exact "
@@ -56,7 +59,7 @@ STAGE_HINTS: dict[str, str] = {
         "Continuous ML strategies must commit train.py + trained weights + "
         "model.manifest.json, and solution.py/solve.sh must be inference-only "
         "(load committed model; never train on the seal/ground-truth path). "
-        "See docs/MLENVS_TASKS.md §4 and examples/mle-tabular-classification/."
+        "See docs/ML_TASKS.md §4 and examples/mle-tabular-classification/."
     ),
     "continuous_calibration": (
         "Continuous calibration lock/evidence failed. Regenerate with "
@@ -109,7 +112,8 @@ def validate(
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command("create")
+@app.command("new")
 def new(
     name: str = typer.Option(
         None, "--name", help="Task name, e.g. labelbox/my-task (prompted if omitted)"
@@ -119,9 +123,9 @@ def new(
         "--template",
         "-t",
         help=(
-            "Starter: ml | mujoco | cfd | structures | prometheus | "
-            "prometheus-cfd | prometheus-structures | prometheus-eval-cfd | "
-            "prometheus-eval-structures"
+            "Starter: ml | mujoco | cfd | structures | software-engineering | "
+            "prometheus | prometheus-cfd | prometheus-structures | "
+            "prometheus-eval-cfd | prometheus-eval-structures"
         ),
     ),
     output_dir: Path = typer.Option(
@@ -152,6 +156,46 @@ def new(
         f"  2. Implement solution/solve.sh (the oracle) and tests/test.sh\n"
         f"  3. Run: [cyan]lbx-rl-template check --problem-dir {problem_dir}[/cyan]"
     )
+
+
+@app.command("migrate-legacy-mujoco")
+def migrate_legacy_mujoco(
+    source: Path = typer.Option(
+        ..., "--source", exists=True, file_okay=False, help="Legacy task directory"
+    ),
+    output_dir: Path | None = typer.Option(
+        None, "--out", "-o", help="New native ISO task directory (must not exist)"
+    ),
+    in_place: bool = typer.Option(
+        False,
+        "--in-place",
+        help="Migrate a native task directly in its current directory",
+    ),
+    domain: str | None = typer.Option(
+        None, "--domain", help="Override the inferred MuJoCo domain taxonomy value"
+    ),
+) -> None:
+    """Convert legacy native/Harbor paths and metadata without hiding scorer debt."""
+    if in_place == (output_dir is not None):
+        console.print("[red]choose exactly one of --out or --in-place[/red]")
+        raise typer.Exit(2)
+    destination = source if in_place else output_dir
+    assert destination is not None
+    result = migrate_legacy_mujoco_task(source, destination, domain=domain)
+    console.print(
+        f"[green]Materialized {result.source_layout} task:[/green] {result.destination}"
+    )
+    for change in result.changes:
+        console.print(f"  [green]\u2713[/green] {change}")
+    if result.blockers:
+        console.print("\n[yellow]Remaining semantic blockers:[/yellow]")
+        for blocker in result.blockers:
+            console.print(f"  - {blocker}")
+        console.print(
+            "\nRun the task-migration agent, regenerate the sealed plan, then run "
+            "`lbx-rl-template validate`."
+        )
+        raise typer.Exit(2)
 
 
 @app.command()
@@ -242,9 +286,23 @@ def export_taiga(
     ),
     output: Path = typer.Option(Path("problems-metadata.json"), "--out", "-o"),
     image: str = typer.Option("PLACEHOLDER", "--image"),
+    outer_capsule: bool = typer.Option(
+        False,
+        "--outer-capsule",
+        help=(
+            "Trusted assertion that --image is the built outer capsule. Required "
+            "for capability tasks; production images must be digest-pinned "
+            "(LOCAL_IMAGE is allowed for local validation)."
+        ),
+    ),
 ) -> None:
     """Export Boreal/Taiga metadata without the external Alignerr CLI."""
-    sidecar = export_taiga_impl(problem_dir, output, image_ref=image)
+    sidecar = export_taiga_impl(
+        problem_dir,
+        output,
+        image_ref=image,
+        image_is_outer_capsule=outer_capsule,
+    )
     console.print(f"[green]Wrote Boreal metadata:[/green] {output}")
     console.print(sidecar)
 
@@ -256,12 +314,22 @@ def export_harbor(
     ),
     output_dir: Path = typer.Option(Path("harbor-export"), "--out", "-o"),
     image: str | None = typer.Option(
-        None, "--image", help="Digest-pinned Docker image to write into task.toml"
+        None,
+        "--image",
+        help=(
+            "Digest-pinned image to stamp for capability/separate-service tasks; "
+            "ignored for legacy self-contained exports."
+        ),
     ),
     runtime_notices: bool = typer.Option(
         True,
         "--runtime-notices/--no-runtime-notices",
         help="Include generated non-prompt runtime notices such as GPU/TPU availability.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Atomically replace an existing export directory.",
     ),
 ) -> None:
     """Export Harbor task format without the external Alignerr CLI."""
@@ -270,8 +338,44 @@ def export_harbor(
         output_dir,
         image_ref=image,
         include_runtime_notices=runtime_notices,
+        force=force,
     )
     console.print(f"[green]Wrote Harbor export:[/green] {path}")
+
+
+@app.command("export-capsule")
+def export_capsule(
+    problem_dir: Path = typer.Option(
+        ..., "--problem-dir", "-d", exists=True, file_okay=False
+    ),
+    output_dir: Path = typer.Option(Path("taiga-capsule"), "--out", "-o"),
+    trusted_build: bool = typer.Option(
+        False,
+        "--trusted-build",
+        help=(
+            "Allow child image builds/pulls. Use only in trusted CI; packaging "
+            "fails closed without this flag."
+        ),
+    ),
+    docker_command: str = typer.Option("docker", "--docker-command"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Atomically replace an existing capsule context.",
+    ),
+) -> None:
+    """Bundle capability services into an outer Taiga capsule build context."""
+    result = export_task_capsule(
+        problem_dir,
+        output_dir,
+        trusted_build=trusted_build,
+        docker_command=docker_command,
+        force=force,
+    )
+    console.print(f"[green]Wrote Taiga capsule context:[/green] {result.context_dir}")
+    console.print(
+        f"[green]Child image manifest:[/green] {result.image_bundle.manifest_path}"
+    )
 
 
 if __name__ == "__main__":

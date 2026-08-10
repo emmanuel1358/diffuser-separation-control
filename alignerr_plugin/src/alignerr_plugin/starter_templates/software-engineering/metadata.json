@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "software-engineering-replace-me",
+    "description": "Repair a seeded source repository against deterministic hidden checks."
+  }
+}

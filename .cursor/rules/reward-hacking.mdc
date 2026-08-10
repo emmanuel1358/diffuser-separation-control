@@ -1,6 +1,6 @@
 ---
 description: Reward-hacking mitigations the grader enforces
-globs: "{problems,examples}/**/scorer/**/*.py,grader/src/grading/**/*.py"
+globs: "{problems,examples}/**/scorer/**/*.py,{problems,examples}/**/baselines/**,{problems,examples}/**/attacks/**,grader/src/grading/**/*.py"
 alwaysApply: false
 ---
 
@@ -12,9 +12,26 @@ reads. Full catalog: `docs/REWARD_HACKING.md`.
 
 - Never trust the agent's stdout or self-reported score; compute the score from the declared output artifacts.
 - Never `import` / `exec_module` / `exec` / `eval` an agent file, and never `pickle.load` / `joblib.load` / `torch.load` / `read_pickle` / `numpy.load(allow_pickle=True)` an agent artifact in the grader. Run submitted code via the sandboxed `helpers.run_policy` / `helpers.run_model_module` and read the score from the return value.
-- Read each submission type through its sanctioned loader (carries the attack closure): `load_submission_or_fault` (CSV), `run_submitted_executable` (strips `RUBRIC_SCORE=` stdout forging), `load_submission_h5_or_fault` (rejects external links / virtual datasets), `score_kfold_cv` (closes cross-fold leakage via fresh worker + `CLONE_NEWIPC` + per-fold pristine rebuild).
+- Submitted-code workers must keep privilege dropping enabled. NumPy loaders
+  reject `allow_pickle=True`; whole-object H5AD must remain inside a dropped
+  worker rather than being reparsed by the root grader.
+- Read each submission type through its sanctioned loader (carries the attack
+  closure): `load_submission_or_fault` (CSV),
+  `load_submission_npz_or_fault` (NumPy),
+  `open_submission_file_or_fault` (custom file-like parsers),
+  `run_submitted_executable` (strips `RUBRIC_SCORE=` stdout forging),
+  `load_submission_h5_or_fault` (immutable snapshot + dropped parser), and
+  `score_kfold_cv` (fresh worker + `CLONE_NEWIPC` + per-fold pristine rebuild).
+  Never substitute `lstat` or a leaf-only `O_NOFOLLOW`; mutable parent
+  directories must also be pinned.
 - AgentFault keep-vs-discard discipline: `raise grading.faults.AgentFault(...)` for agent-controlled failures (missing/malformed/oversized/wrong-shape submission, policy load/act failure) so the 0.0 is KEPT for training; let author/infra failures (missing truth, broken import, simulator crash, OOM) PROPAGATE so the rollout is discarded.
 - A broad `except Exception: return 0.0` (or `return _failure(...)`) is rejected by the blocking `agent_fault` validator stage: it converts author/infra bugs into a kept 0.0. Catch the specific agent exception and raise AgentFault; keep hidden-truth reads outside the agent `try`.
 - Continuous tasks: a no-op submission must not exceed `[ground_truth].max_trivial_score`, and committed `baselines/<name>/` must score clearly below the reference (learnability gate). Calibrate via `grading.calibration` so naive baselines map to ~0.
 - MuJoCo: gate the score on `helpers.world_integrity(model, ...)` to catch physics reward-hacks (gravity off, gravcomp abuse, welds, contacts off).
-- Runtime hardening (symlink/FIFO scrub, PID-namespace, non-finite trap, uid-1000/0700) is automatic; do not weaken it. See `docs/POLICY_ISOLATION.md`.
+- Every task needs no-op/unchanged-starter coverage; add deterministic attack
+  fixtures for relevant reward/report forgery, symlink, delegation,
+  introspection, background-process, and oversized-artifact shortcuts.
+- Runtime hardening (pre/post-grade process quiescence, symlink/FIFO scrub,
+  PID-namespace, non-finite trap, uid-1000/0700) is automatic. Confirmed
+  respawning agent processes earn a kept 0.0; runtime inspection failures are
+  infrastructure errors. Do not weaken this. See `docs/POLICY_ISOLATION.md`.

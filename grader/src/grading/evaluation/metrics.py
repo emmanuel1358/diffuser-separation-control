@@ -264,10 +264,11 @@ def registered_kernel_identity(target: MetricTarget) -> str:
     """Stable identity, rejecting descriptive-id/callable mismatches."""
     registered = _REGISTERED_KERNELS.get(target.metric_id)
     if registered is None:
-        return (
-            f"custom:{getattr(target.kernel, '__module__', '<unknown>')}."
-            f"{getattr(target.kernel, '__qualname__', '<callable>')}"
-        )
+        # Deliberately module-name free. The same scorer is imported under
+        # different module names on the host and inside the grader worker, so
+        # embedding __module__ hashed one kernel two ways and the sealed plan
+        # was rejected as a "stale TASK".
+        return f"custom:{getattr(target.kernel, '__qualname__', '<callable>')}"
     metric, kernel = registered
     if target.metric != metric or target.kernel is not kernel:
         raise ValueError(

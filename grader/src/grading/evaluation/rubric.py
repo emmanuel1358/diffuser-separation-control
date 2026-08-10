@@ -13,8 +13,14 @@ from typing import Any, Literal
 
 from grading.evaluation.artifacts import (
     ArtifactSpec,
+    SubmittedWorkspace,
     TrustedJson,
     trusted_fixture_specs,
+)
+from grading.evaluation.candidate_suite import (
+    CandidateCommandSpec,
+    CandidateSuiteResult,
+    run_candidate_suite,
 )
 from grading.evaluation.context import EvaluationContext, workspace_artifact_digest
 from grading.evaluation.plan import EvaluationPlan
@@ -125,7 +131,7 @@ class RubricContext:
             return operation(*args, **kwargs)
         except (GraderFault, InfrastructureFault):
             raise
-        except Exception as exc:  # noqa: BLE001 - candidate parser boundary
+        except Exception as exc:
             raise AgentFault(f"{label} failed: {type(exc).__name__}: {exc}") from exc
 
     def trusted_operation(
@@ -136,7 +142,7 @@ class RubricContext:
             return operation(*args, **kwargs)
         except (AgentFault, InfrastructureFault, GraderFault):
             raise
-        except Exception as exc:  # noqa: BLE001 - trusted callback boundary
+        except Exception as exc:
             raise GraderFault(f"{label} failed: {type(exc).__name__}: {exc}") from exc
 
     def number(
@@ -216,6 +222,45 @@ class RubricContext:
             max_output_bytes=max_output_bytes,
         )
 
+    def run_candidate(
+        self,
+        cmd: list[str],
+        *,
+        stdin_bytes: bytes | None = None,
+        cwd: str | Path | None = None,
+        env: dict[str, str] | None = None,
+        timeout_s: float = 120.0,
+        max_output_bytes: int = 16 * 1024 * 1024,
+    ):
+        """Run a workspace submission through the shared uid-dropped boundary."""
+        from grading.helpers import run_submitted_executable
+
+        if not isinstance(self.candidate, SubmittedWorkspace):
+            raise GraderFault(
+                "context.run_candidate() requires a WorkspaceArtifact declaration"
+            )
+        with self.candidate.execution_cwd(cwd) as cwd_fd:
+            try:
+                return run_submitted_executable(
+                    cmd,
+                    stdin_bytes=stdin_bytes,
+                    cwd_fd=cwd_fd,
+                    env=env,
+                    timeout_s=timeout_s,
+                    max_output_bytes=max_output_bytes,
+                )
+            except OSError as exc:
+                raise AgentFault(
+                    f"submitted process could not start: {type(exc).__name__}: {exc}"
+                ) from exc
+
+    def run_candidate_suite(
+        self,
+        spec: CandidateCommandSpec,
+    ) -> CandidateSuiteResult:
+        """Run a bounded deterministic command suite on the committed workspace."""
+        return run_candidate_suite(self, spec)
+
     def policy(
         self,
         *,
@@ -232,10 +277,11 @@ class RubricContext:
                 "context.policy() requires a RegularFileArtifact declaration"
             )
         return run_policy(
-            self.candidate.path,
+            self.candidate.original_path,
             timeout_s=timeout_s,
             first_call_timeout_s=first_call_timeout_s,
             cwd=cwd,
+            submitted_snapshot=self.candidate.path,
         )
 
 
@@ -331,12 +377,20 @@ class RubricTask:
     ) -> Grade:
         workspace = Path(workspace)
         private = Path(private)
+        # Artifact loaders own bounded normalization (for example, removing
+        # declared workspace build caches). Commit the resulting artifact tree
+        # so the replay digest matches the bytes that are actually evaluated.
+        candidate = self.artifact.load(workspace)
+        committed_workspace = (
+            candidate.path.parent
+            if isinstance(candidate, SubmittedWorkspace)
+            else workspace
+        )
         try:
-            candidate_digest = workspace_artifact_digest(workspace)
+            candidate_digest = workspace_artifact_digest(committed_workspace)
         except (OSError, ValueError) as exc:
             raise AgentFault(f"could not commit submitted artifact: {exc}") from exc
 
-        candidate = self.artifact.load(workspace)
         fixtures = {
             name: fixture.load(private) for name, fixture in self.fixtures.items()
         }
@@ -347,7 +401,7 @@ class RubricTask:
         context = RubricContext(
             candidate=candidate,
             fixtures=fixtures,
-            workspace=workspace,
+            workspace=committed_workspace,
             private=private,
             trajectory=trajectory,
             evaluation=evaluation_context,

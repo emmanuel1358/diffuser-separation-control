@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
-
 from grader_runner.run_grader import main
 
 
@@ -14,6 +14,7 @@ def _run_script(script: Path, workspace: Path) -> None:
     completed = subprocess.run(
         ["bash", "-c", source],
         cwd=workspace,
+        env={**os.environ, "LBX_SOLUTION_DIR": str(script.parent)},
         text=True,
         capture_output=True,
         check=False,

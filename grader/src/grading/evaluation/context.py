@@ -10,10 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from grading.secure_io import open_directory_fd
+
 EVALUATION_NONCE_ENV = "LBX_EVALUATION_NONCE"
 EVALUATION_PLAN_ATTESTED_ENV = "LBX_EVALUATION_PLAN_ATTESTED"
 MAX_COMMITTED_FILES = 10_000
-MAX_COMMITTED_BYTES = 4 * 1024 * 1024 * 1024
+MAX_COMMITTED_ENTRIES = 20_000
+MAX_COMMITTED_DEPTH = 128
+MAX_COMMITTED_BYTES = 1024 * 1024 * 1024
 
 
 def _framed(value: bytes) -> bytes:
@@ -41,38 +45,175 @@ def artifact_digest(raw_arrays: Mapping[str, tuple[Any, Any]]) -> str:
     return digest.hexdigest()
 
 
-def workspace_artifact_digest(root: Path) -> str:
-    """Commit every regular file in the submitted artifact tree."""
-    root = Path(root)
-    digest = hashlib.sha256()
-    if not root.is_dir():
-        raise ValueError(f"artifact workspace is not a directory: {root}")
-    files = [path for path in sorted(root.rglob("*")) if not path.is_dir()]
-    if len(files) > MAX_COMMITTED_FILES:
-        raise ValueError(
-            f"artifact workspace has {len(files)} files, over limit "
-            f"{MAX_COMMITTED_FILES}"
-        )
-    total_bytes = 0
-    for path in files:
-        relative = path.relative_to(root).as_posix()
-        info = os.lstat(path)
+def _stable_file_state(before: os.stat_result, after: os.stat_result) -> bool:
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    return all(getattr(before, field) == getattr(after, field) for field in fields)
+
+
+def _workspace_file_digests(
+    directory_fd: int,
+    *,
+    prefix: str = "",
+    totals: list[int] | None = None,
+    depth: int = 0,
+    visited: set[tuple[int, int]] | None = None,
+) -> list[tuple[str, int, bytes]]:
+    if totals is None:
+        totals = [0, 0, 0]  # file count, committed bytes, all entries
+    if visited is None:
+        info = os.fstat(directory_fd)
+        visited = {(info.st_dev, info.st_ino)}
+    before_directory = os.fstat(directory_fd)
+    records: list[tuple[str, int, bytes]] = []
+    names: list[str] = []
+    with os.scandir(directory_fd) as iterator:
+        for entry in iterator:
+            totals[2] += 1
+            if totals[2] > MAX_COMMITTED_ENTRIES:
+                raise ValueError(
+                    f"artifact workspace has more than "
+                    f"{MAX_COMMITTED_ENTRIES} entries"
+                )
+            names.append(entry.name)
+    names.sort()
+
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    )
+    for name in names:
+        if depth + 1 > MAX_COMMITTED_DEPTH:
+            raise ValueError(
+                f"artifact workspace exceeds maximum depth {MAX_COMMITTED_DEPTH}"
+            )
+        relative = f"{prefix}/{name}" if prefix else name
+        try:
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(
+                f"artifact workspace entry {relative!r} could not be inspected: {exc}"
+            ) from exc
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+            except OSError as exc:
+                raise ValueError(
+                    f"artifact workspace directory {relative!r} changed: {exc}"
+                ) from exc
+            try:
+                opened_directory = os.fstat(child_fd)
+                identity = (opened_directory.st_dev, opened_directory.st_ino)
+                if identity in visited:
+                    raise ValueError(
+                        f"artifact workspace directory cycle at {relative!r}"
+                    )
+                visited.add(identity)
+                records.extend(
+                    _workspace_file_digests(
+                        child_fd,
+                        prefix=relative,
+                        totals=totals,
+                        depth=depth + 1,
+                        visited=visited,
+                    )
+                )
+            finally:
+                os.close(child_fd)
+            continue
         if not stat.S_ISREG(info.st_mode):
             raise ValueError(
                 f"artifact workspace contains non-regular entry {relative!r}"
             )
-        total_bytes += int(info.st_size)
-        if total_bytes > MAX_COMMITTED_BYTES:
+
+        try:
+            fd = os.open(name, file_flags, dir_fd=directory_fd)
+        except OSError as exc:
             raise ValueError(
-                f"artifact workspace exceeds {MAX_COMMITTED_BYTES} committed bytes"
-            )
-        digest.update(_framed(relative.encode("utf-8")))
-        file_digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                f"artifact workspace file {relative!r} changed: {exc}"
+            ) from exc
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError(
+                    f"artifact workspace contains non-regular entry {relative!r}"
+                )
+            totals[0] += 1
+            if totals[0] > MAX_COMMITTED_FILES:
+                raise ValueError(
+                    f"artifact workspace has more than {MAX_COMMITTED_FILES} files"
+                )
+            if totals[1] + opened.st_size > MAX_COMMITTED_BYTES:
+                raise ValueError(
+                    f"artifact workspace exceeds {MAX_COMMITTED_BYTES} "
+                    "committed bytes"
+                )
+            file_digest = hashlib.sha256()
+            bytes_read = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > MAX_COMMITTED_BYTES:
+                    raise ValueError(
+                        f"artifact workspace exceeds {MAX_COMMITTED_BYTES} "
+                        "committed bytes"
+                    )
                 file_digest.update(chunk)
-        digest.update(int(info.st_size).to_bytes(8, byteorder="big"))
-        digest.update(file_digest.digest())
+            after = os.fstat(fd)
+            if not _stable_file_state(opened, after) or bytes_read != after.st_size:
+                raise ValueError(
+                    f"artifact workspace file {relative!r} changed while hashing"
+                )
+            totals[1] += bytes_read
+            records.append((relative, bytes_read, file_digest.digest()))
+        finally:
+            os.close(fd)
+    after_directory = os.fstat(directory_fd)
+    directory_fields = ("st_dev", "st_ino", "st_mtime_ns", "st_ctime_ns")
+    if any(
+        getattr(before_directory, field) != getattr(after_directory, field)
+        for field in directory_fields
+    ):
+        raise ValueError(
+            f"artifact workspace directory {prefix or '.'!r} changed while hashing"
+        )
+    return records
+
+
+def workspace_artifact_digest(root: Path) -> str:
+    """Commit every regular file through a pinned, symlink-free directory tree."""
+
+    root = Path(root)
+    try:
+        root_fd = open_directory_fd(root)
+    except OSError as exc:
+        raise ValueError(
+            f"artifact workspace is not a stable directory: {root}: {exc}"
+        ) from exc
+    try:
+        records = sorted(_workspace_file_digests(root_fd))
+    finally:
+        os.close(root_fd)
+
+    if len(records) > MAX_COMMITTED_FILES:
+        raise ValueError(
+            f"artifact workspace has {len(records)} files, over limit "
+            f"{MAX_COMMITTED_FILES}"
+        )
+    total_bytes = sum(size for _relative, size, _file_digest in records)
+    if total_bytes > MAX_COMMITTED_BYTES:
+        raise ValueError(
+            f"artifact workspace exceeds {MAX_COMMITTED_BYTES} committed bytes"
+        )
+
+    digest = hashlib.sha256()
+    for relative, size, file_digest in records:
+        digest.update(_framed(relative.encode("utf-8")))
+        digest.update(size.to_bytes(8, byteorder="big"))
+        digest.update(file_digest)
     return digest.hexdigest()
 
 

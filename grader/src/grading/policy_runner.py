@@ -31,7 +31,6 @@ import os
 import pwd
 import queue
 import select
-import stat
 import subprocess
 import sys
 import threading
@@ -40,7 +39,9 @@ from pathlib import Path
 from typing import Any
 
 from env_server.protocol import _FRAME_HEADER, _frame, _pack, _unpack
+
 from grading.faults import AgentFault
+from grading.secure_io import read_regular_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +65,9 @@ class PolicyTimeoutError(PolicyWorkerError, TimeoutError):
     """
 
 
-# CLONE_NEWIPC: a private SysV-IPC/POSIX-message namespace. Used by the k-fold
-# loader so a submitted model cannot stash cross-fold state (e.g. the held-out
-# labels it just saw) in a shared-memory segment that survives a fresh worker.
+# CLONE_NEWIPC: a private SysV-IPC/POSIX-message namespace. Used by every
+# submitted policy or executable worker so rollout state cannot survive in a
+# shared-memory segment, semaphore set, or message queue visible to a later run.
 _CLONE_NEWIPC = 0x08000000
 try:
     _LIBC: ctypes.CDLL | None = ctypes.CDLL(None, use_errno=True)
@@ -104,6 +105,18 @@ _SECRET_ENV_SUBSTRINGS = (
     "EVALUATION_PLAN_ATTESTED",
     "EVALUATION_TRACE_PATH",
 )
+
+
+_WORKER_OOM_SCORE_ADJ = 500
+
+
+def _bias_worker_toward_oom(pid: int, *, proc_root: str = "/proc") -> None:
+    """Prefer killing untrusted policy code before the root grader on OOM."""
+    try:
+        with open(f"{proc_root}/{pid}/oom_score_adj", "w") as handle:
+            handle.write(str(_WORKER_OOM_SCORE_ADJ))
+    except OSError:
+        pass
 
 
 def _scrubbed_environ() -> dict[str, str]:
@@ -175,13 +188,19 @@ def _agent_identity() -> tuple[int, int, str, str]:
 
 
 def _agent_preexec(
-    uid: int, gid: int, ipc_status_fd: int | None = None
+    uid: int,
+    gid: int,
+    ipc_status_fd: int | None = None,
+    *,
+    cwd_fd: int | None = None,
 ) -> Callable[[], None]:
-    """``preexec_fn`` that unshares the IPC namespace WHILE STILL ROOT, then
-    drops to the agent account. ``unshare(CLONE_NEWIPC)`` needs CAP_SYS_ADMIN so
-    it must run before ``setuid``; the unshare is best-effort -- a runtime
-    without CAP_SYS_ADMIN must still grade honest policies, so a failure is
-    never raised.
+    """``preexec_fn`` that isolates IPC, enters a pinned cwd, and drops uid.
+
+    ``unshare(CLONE_NEWIPC)`` needs CAP_SYS_ADMIN so it must run before
+    ``setuid``. The unshare is best-effort -- a runtime without CAP_SYS_ADMIN
+    must still grade honest submissions, so a failure is reported but never
+    raised. ``cwd_fd`` lets all submitted-process boundaries reuse this ordering
+    without resolving an agent-controlled pathname after ``fork``.
 
     The unshare result is surfaced (not silently dropped): when
     ``ipc_status_fd`` is given, a single status byte is written to it -- ``0``
@@ -194,9 +213,10 @@ def _agent_preexec(
 
     def _preexec() -> None:
         status = 0
-        if _LIBC is not None and _CLONE_NEWIPC_ARG is not None:
+        unshare = getattr(_LIBC, "unshare", None)
+        if unshare is not None and _CLONE_NEWIPC_ARG is not None:
             ctypes.set_errno(0)
-            if _LIBC.unshare(_CLONE_NEWIPC_ARG) != 0:  # best-effort; never raise
+            if unshare(_CLONE_NEWIPC_ARG) != 0:  # best-effort; never raise
                 status = ctypes.get_errno() or errno.EPERM
         else:
             status = errno.ENOSYS
@@ -205,11 +225,57 @@ def _agent_preexec(
                 os.write(ipc_status_fd, bytes([min(status, 255)]))
             except OSError:
                 pass
+            finally:
+                try:
+                    os.close(ipc_status_fd)
+                except OSError:
+                    pass
+        if cwd_fd is not None:
+            os.fchdir(cwd_fd)
+            os.close(cwd_fd)
         os.setgroups([])
         os.setgid(gid)
         os.setuid(uid)
 
     return _preexec
+
+
+def _warn_if_ipc_unisolated(
+    status_fd: int,
+    *,
+    boundary: str = "policy worker",
+) -> None:
+    """Report a failed best-effort IPC boundary without changing the grade."""
+    data = b""
+    try:
+        # The byte is written before exec, hence before Popen returned; a short
+        # select guards against a hang if the child died before writing it.
+        if select.select([status_fd], [], [], 5.0)[0]:
+            data = os.read(status_fd, 1)
+    except OSError:
+        data = b""
+    finally:
+        try:
+            os.close(status_fd)
+        except OSError:
+            pass
+    if not data:
+        logger.warning(
+            "[GRADING] could not determine %s IPC isolation status; "
+            "proceeding without verifying CLONE_NEWIPC",
+            boundary,
+        )
+        return
+    status = data[0]
+    if status != 0:
+        logger.warning(
+            "[GRADING] %s IPC namespace NOT isolated: "
+            "unshare(CLONE_NEWIPC) failed (errno=%d %s); proceeding without "
+            "per-process IPC isolation",
+            boundary,
+            status,
+            os.strerror(status),
+        )
 
 
 def _agent_drop_kwargs(
@@ -589,11 +655,27 @@ def _load_root(cfg):
     if mode == "source":
         filename = cfg.get("path") or "<policy-source>"
         code = compile(cfg.get("source"), filename, "exec")
-        module = types.ModuleType("submitted_policy")
+        class _CapturedSourceLoader:
+            def create_module(self, spec):
+                return None
+
+            def exec_module(self, target):
+                exec(code, target.__dict__)
+
+        loader = _CapturedSourceLoader()
+        spec = importlib.util.spec_from_loader(
+            "submitted_policy",
+            loader,
+            origin=filename,
+        )
+        if spec is None:
+            raise ImportError("cannot create captured policy spec for %s" % filename)
+        module = importlib.util.module_from_spec(spec)
         module.__file__ = filename
+        module.__submission_origin__ = cfg.get("origin_path") or filename
         sys.modules["submitted_policy"] = module
         with contextlib.redirect_stdout(sys.stderr):
-            exec(code, module.__dict__)
+            loader.exec_module(module)
     else:
         filename = cfg["path"]
         spec = importlib.util.spec_from_file_location("submitted_policy", filename)
@@ -745,6 +827,8 @@ class PolicyWorker:
         unshare_ipc: bool = True,
         factory_name: str | None = None,
         source: str | bytes | None = None,
+        source_origin_path: str | Path | None = None,
+        submitted_snapshot: str | Path | None = None,
         sys_path_dirs: list[str | Path] | None = None,
     ) -> None:
         self.policy_path = Path(policy_path)
@@ -752,11 +836,17 @@ class PolicyWorker:
         self.first_call_timeout_s = first_call_timeout_s
         self._first_call_done = False
         self.cwd = Path(cwd) if cwd is not None else None
+        if max_stderr_chars <= 0:
+            raise ValueError("max_stderr_chars must be positive")
         self.max_stderr_chars = max_stderr_chars
         if max_reply_bytes <= 0:
             raise ValueError("max_reply_bytes must be positive")
         self.max_reply_bytes = int(max_reply_bytes)
-        self.drop_privileges = drop_privileges
+        if not drop_privileges:
+            raise ValueError(
+                "drop_privileges=False is forbidden for submitted policy workers"
+            )
+        self.drop_privileges = True
         self.unshare_ipc = unshare_ipc
         # Named factory (e.g. "load_policy"); None keeps the legacy auto-detect
         # (module-level ``act`` or a ``Policy`` class).
@@ -764,11 +854,18 @@ class PolicyWorker:
         # Source mode: a grader-supplied literal wrapper (str/bytes) executed in
         # the worker instead of reading ``policy_path``.
         self.source = source
+        self.source_origin_path = (
+            Path(source_origin_path) if source_origin_path is not None else None
+        )
+        self.submitted_snapshot = (
+            Path(submitted_snapshot) if submitted_snapshot is not None else None
+        )
+        self._submitted_source: bytes | None = None
         self.sys_path_dirs = sys_path_dirs
         self._proc: subprocess.Popen[bytes] | None = None
         self._responses: queue.Queue[bytes | None] = queue.Queue()
         self._reader_error: str | None = None
-        self._stderr_parts: list[str] = []
+        self._stderr_text = ""
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._proto_stream: Any = None
@@ -788,43 +885,32 @@ class PolicyWorker:
         """Read the preexec IPC-unshare status byte and warn if isolation did
         not take. Best-effort: never raises, so an un-isolated runtime still
         grades honest policies (it just logs that the defense is off)."""
-        data = b""
-        try:
-            # The byte is written before exec, hence before Popen returned; a
-            # short select guards against a hang if the child died pre-write.
-            if select.select([status_fd], [], [], 5.0)[0]:
-                data = os.read(status_fd, 1)
-        except OSError:
-            data = b""
-        finally:
-            try:
-                os.close(status_fd)
-            except OSError:
-                pass
-        if not data:
-            logger.warning(
-                "[GRADING] could not determine policy worker IPC isolation "
-                "status; proceeding without verifying CLONE_NEWIPC"
-            )
-            return
-        status = data[0]
-        if status != 0:
-            logger.warning(
-                "[GRADING] policy worker IPC namespace NOT isolated: "
-                "unshare(CLONE_NEWIPC) failed (errno=%d %s); proceeding without "
-                "per-worker IPC isolation",
-                status,
-                os.strerror(status),
-            )
+        _warn_if_ipc_unisolated(status_fd)
 
     def start(self) -> None:
         if self._proc is not None:
             return
-        if self.source is None and not self.policy_path.exists():
-            raise FileNotFoundError(f"missing policy file: {self.policy_path}")
+        if self.source is None:
+            source_path = self.submitted_snapshot or self.policy_path
+            if not source_path.is_absolute() and self.cwd is not None:
+                source_path = self.cwd / source_path
+            try:
+                self._submitted_source = read_regular_bytes(
+                    source_path,
+                    max_bytes=_MAX_POLICY_BYTES,
+                    allow_empty=True,
+                )
+            except FileNotFoundError as exc:
+                raise AgentFault(
+                    f"missing submitted policy at {self.policy_path}"
+                ) from exc
+            except OSError as exc:
+                raise AgentFault(
+                    f"submitted policy at {self.policy_path} is not a regular file or changed while being read: {exc}"
+                ) from exc
         self._responses = queue.Queue()
         self._reader_error = None
-        self._stderr_parts = []
+        self._stderr_text = ""
         self._first_call_done = False
 
         # IPC-isolation status pipe: when the drop runs through the preexec hook
@@ -879,6 +965,8 @@ class PolicyWorker:
                 os.close(ipc_status_w)
             raise
 
+        _bias_worker_toward_oom(self._proc.pid)
+
         os.close(proto_write_fd)
         if ipc_status_w is not None:
             os.close(ipc_status_w)
@@ -911,19 +999,25 @@ class PolicyWorker:
     def _handshake(self) -> None:
         """Send the load config and wait for the worker's init reply within the
         first-call budget (module import / heavy deps load here)."""
+        effective_source = (
+            self.source if self.source is not None else self._submitted_source
+        )
         cfg: dict[str, Any] = {
-            "mode": "source" if self.source is not None else "path",
+            "mode": "source" if effective_source is not None else "path",
             "path": str(self.policy_path),
             "factory": self.factory_name,
             "sys_path_dirs": self._resolved_sys_path_dirs(),
         }
-        if self.source is not None:
+        if self.source_origin_path is not None:
+            cfg["origin_path"] = str(self.source_origin_path)
+        if effective_source is not None:
             cfg["source"] = (
-                self.source
-                if isinstance(self.source, (str, bytes))
-                else str(self.source)
+                effective_source
+                if isinstance(effective_source, (str, bytes))
+                else str(effective_source)
             )
         self._write_frame(cfg)
+        self._submitted_source = None
         # Phase 1: pre-agent ack. The worker sends this after trusted setup but
         # before it execs the submitted module, so its absence means the worker
         # died in trusted setup -> genuine infra failure (discarded rollout).
@@ -934,8 +1028,7 @@ class PolicyWorker:
         except (PolicyWorkerError, TimeoutError) as exc:
             raise PolicyWorkerError(
                 self._error_context(
-                    "policy worker died during setup, before running the "
-                    "submitted module"
+                    "policy worker died during setup, before running the submitted module"
                 )
             ) from exc
         if not isinstance(ack, dict) or ack.get("phase") != "ready":
@@ -1097,10 +1190,7 @@ class PolicyWorker:
         self._proto_stream = None
 
     def stderr(self) -> str:
-        text = "".join(self._stderr_parts)
-        if len(text) <= self.max_stderr_chars:
-            return text
-        return text[-self.max_stderr_chars :]
+        return self._stderr_text
 
     def _require_process(self) -> subprocess.Popen[bytes]:
         if self._proc is None:
@@ -1119,10 +1209,7 @@ class PolicyWorker:
                     break
                 (length,) = _FRAME_HEADER.unpack(header)
                 if length > self.max_reply_bytes:
-                    self._reader_error = (
-                        "policy worker reply exceeds "
-                        f"{self.max_reply_bytes}-byte serialized limit"
-                    )
+                    self._reader_error = f"policy worker reply exceeds {self.max_reply_bytes}-byte serialized limit"
                     break
                 body = b""
                 while len(body) < length:
@@ -1137,10 +1224,13 @@ class PolicyWorker:
             self._responses.put(None)
 
     def _drain_stderr(self, stream: Any) -> None:
-        for chunk in stream:
+        while True:
+            chunk = os.read(stream.fileno(), 4096)
+            if not chunk:
+                break
             if isinstance(chunk, bytes):
                 chunk = chunk.decode("utf-8", "replace")
-            self._stderr_parts.append(chunk)
+            self._stderr_text = (self._stderr_text + chunk)[-self.max_stderr_chars :]
 
 
 class PolicyHandle:
@@ -1153,7 +1243,7 @@ class PolicyHandle:
     multi-policy (dict / list) factories.
     """
 
-    __slots__ = ("_worker", "_path", "_attr_cache")
+    __slots__ = ("_attr_cache", "_path", "_worker")
 
     def __init__(self, worker: PolicyWorker, path: tuple = ()) -> None:
         self._worker = worker
@@ -1191,6 +1281,7 @@ def load_submitted_policy(
     factory_name: str = DEFAULT_FACTORY_NAME,
     *,
     source: str | bytes | None = None,
+    source_origin_path: str | Path | None = None,
     sys_path_dirs: list[str | Path] | None = None,
     timeout_s: float = 5.0,
     first_call_timeout_s: float | None = None,
@@ -1216,22 +1307,6 @@ def load_submitted_policy(
     missing / non-regular / oversized policy file, or the module raising at
     load); the runner records a kept 0.0.
     """
-    if source is None:
-        p = Path(path)
-        if not p.exists():
-            raise AgentFault(f"missing submitted policy at {p}")
-        st = os.lstat(p)
-        if not stat.S_ISREG(st.st_mode):
-            raise AgentFault(
-                f"submitted policy at {p} is not a regular file "
-                f"(mode={stat.filemode(st.st_mode)}); expected a plain file"
-            )
-        if st.st_size > _MAX_POLICY_BYTES:
-            raise AgentFault(
-                f"submitted policy at {p} is {st.st_size} bytes, over the "
-                f"{_MAX_POLICY_BYTES}-byte limit"
-            )
-
     worker = PolicyWorker(
         Path(path),
         timeout_s=timeout_s,
@@ -1241,6 +1316,7 @@ def load_submitted_policy(
         unshare_ipc=unshare_ipc,
         factory_name=factory_name,
         source=source,
+        source_origin_path=source_origin_path,
         sys_path_dirs=sys_path_dirs,
     )
     worker.start()  # raises AgentFault / PolicyWorkerError on load failure

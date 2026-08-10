@@ -61,7 +61,9 @@ After you finish authoring, the eval acceptance path is:
    instruction.
 4. The only acceptance gate is the Prometheus target average `<= 0.500`.
    Standard deviation and the trainability audit are diagnostic context, not
-   approval gates.
+   approval gates. The dual Prometheus/Achilles submit lanes in
+   [`docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](../../docs/CFD_STRUCTURES_DUAL_LANE_REVIEW.md)
+   apply to **non-eval** production CFD/structures only — not to eval rows.
 5. Boreal / LBx Validation QA may still appear for coaching. It is
    **non-blocking** for eval: Boreal findings, required-QA completeness, and
    the Boreal average score do **not** gate eval acceptance. Use them if
@@ -661,7 +663,18 @@ evidence for review.
 ## 12. AVL Per-Task Install Recipe
 
 AVL is a Fortran and X11 binary, not a base-image dependency. Build it in the
-task Dockerfile only for tasks that need it:
+task Dockerfile only for tasks that need it. The build toolchain is an ordinary
+declared dependency, so it goes in `environment/apt.txt` and only the
+fetch-and-build stays in a `RUN` -- validation rejects a raw `apt-get install`
+in a task Dockerfile (see `docs/AUTHORING.md`).
+
+```text
+# environment/apt.txt
+gfortran
+make
+libx11-dev
+curl
+```
 
 ```dockerfile
 ARG BASE_IMAGE=lbx-tasks-base
@@ -669,9 +682,11 @@ ARG BASE_TAG=runtime-ml-core-py313-local
 ARG PROBLEM_DIR=problems/<task-id>
 FROM ${BASE_IMAGE}:${BASE_TAG}
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      gfortran make libx11-dev curl && rm -rf /var/lib/apt/lists/* \
- && curl -fsSL https://web.mit.edu/drela/Public/web/avl/avl3.36.tgz | tar xz -C /opt \
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+# No channel routes a source build, so this part stays here.
+RUN curl -fsSL https://web.mit.edu/drela/Public/web/avl/avl3.36.tgz | tar xz -C /opt \
  && cd /opt/Avl \
  && make -C plotlib FC=gfortran CC=gcc \
  && make -C bin FC=gfortran FFLAGS="-O -fallow-argument-mismatch" avl \

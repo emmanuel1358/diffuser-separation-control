@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _fixture_guard import requires_examples
 
 from alignerr_plugin.utils import load_task_toml
 from alignerr_plugin.validators.task.validator import (
@@ -74,6 +75,7 @@ def test_all_shipped_rubrics_use_current_declarative_protocol(problem: Path) -> 
     assert protocol_stage.passed, protocol_stage.issues
 
 
+@requires_examples("opensees-base-isolation", "openfoam-hydrofoil-flap")
 def test_canonical_json_rubrics_reject_reported_crash_vectors(tmp_path: Path) -> None:
     vectors = {
         "opensees-base-isolation": (

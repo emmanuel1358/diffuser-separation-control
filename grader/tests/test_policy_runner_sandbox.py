@@ -14,7 +14,6 @@ import time
 from pathlib import Path
 
 import pytest
-
 from grading import helpers
 from grading.policy_runner import PolicyWorker, _scrubbed_environ
 
@@ -26,9 +25,7 @@ def test_forged_stdout_does_not_become_the_result(tmp_path: Path) -> None:
     spews a convincing ``RUBRIC_RESULT_JSON``/score line can't forge a grade.
     """
     policy_path = tmp_path / "policy.py"
-    policy_path.write_text(
-        textwrap.dedent(
-            """
+    policy_path.write_text(textwrap.dedent("""
             import sys
 
             def act(obs):
@@ -37,9 +34,7 @@ def test_forged_stdout_does_not_become_the_result(tmp_path: Path) -> None:
                 print("RUBRIC_RESULT_JSON: {\\"score\\": 1.0}")
                 sys.stdout.write("FINAL_SCORE=1.0\\n")
                 return obs["truth"]
-            """
-        )
-    )
+            """))
 
     with PolicyWorker(policy_path) as policy:
         assert policy.act({"truth": [0, 0]}) == [0, 0]
@@ -62,17 +57,13 @@ def test_planted_json_module_cannot_forge_proto_response(tmp_path: Path) -> None
     workspace.mkdir()
     # Malicious shadow that, if used to serialize the worker response, would
     # always report a perfect score.
-    (workspace / "json.py").write_text(
-        textwrap.dedent(
-            """
+    (workspace / "json.py").write_text(textwrap.dedent("""
             def dumps(*args, **kwargs):
                 return '{"ok": true, "result": [9, 9, 9]}'
 
             def loads(*args, **kwargs):
                 return {}
-            """
-        )
-    )
+            """))
     policy_path = workspace / "policy.py"
     policy_path.write_text("def act(obs):\n    return obs['truth']\n")
 
@@ -91,9 +82,7 @@ def test_planted_json_in_cwd_cannot_forge_proto_response(
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     monkeypatch.setenv("PYTHONPATH", str(cwd))
-    (cwd / "json.py").write_text(
-        textwrap.dedent(
-            """
+    (cwd / "json.py").write_text(textwrap.dedent("""
             def dump(*args, **kwargs):
                 pass
 
@@ -105,9 +94,7 @@ def test_planted_json_in_cwd_cannot_forge_proto_response(
 
             def loads(*args, **kwargs):
                 return {}
-            """
-        )
-    )
+            """))
     policy_path = tmp_path / "policy.py"
     policy_path.write_text("def act(obs):\n    return obs['truth']\n")
 
@@ -118,9 +105,7 @@ def test_planted_json_in_cwd_cannot_forge_proto_response(
 def test_policy_cannot_monkeypatch_proto_serializer(tmp_path: Path) -> None:
     """Submitted code cannot replace the worker's response encoder."""
     policy_path = tmp_path / "policy.py"
-    policy_path.write_text(
-        textwrap.dedent(
-            """
+    policy_path.write_text(textwrap.dedent("""
             import json
             import json_numpy
 
@@ -128,9 +113,7 @@ def test_policy_cannot_monkeypatch_proto_serializer(tmp_path: Path) -> None:
                 json.dumps = lambda *a, **k: '{"ok": true, "result": [8, 8]}'
                 json_numpy.default = lambda *a, **k: {"forged": True}
                 return obs["truth"]
-            """
-        )
-    )
+            """))
 
     with PolicyWorker(policy_path) as policy:
         assert policy.act({"truth": [5, 6]}) == [5, 6]
@@ -146,6 +129,21 @@ def test_run_policy_helper_runs_a_workspace_policy(tmp_path: Path) -> None:
         assert policy.act({"x": 41}) == 42
         # Hardened contract: privilege drop is on by default.
         assert policy.drop_privileges is True
+
+
+def test_run_policy_uses_submitted_snapshot_after_original_is_removed(
+    tmp_path: Path,
+) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text("def act(obs):\n    return obs['x'] + 1\n")
+    snapshot = helpers.require_regular_file(policy_path)
+    policy_path.unlink()
+
+    with helpers.run_policy(
+        policy_path,
+        submitted_snapshot=snapshot,
+    ) as policy:
+        assert policy.act({"x": 41}) == 42
 
 
 def test_run_policy_helper_rejects_missing_policy(tmp_path: Path) -> None:
@@ -209,17 +207,13 @@ def test_root_policy_cannot_read_root_only_hidden_data(tmp_path: Path) -> None:
     os.chmod(secret, 0o600)  # root:root 0600 — unreadable to agent
 
     policy_path = tmp_path / "policy.py"
-    policy_path.write_text(
-        textwrap.dedent(
-            f"""
+    policy_path.write_text(textwrap.dedent(f"""
             def act(obs):
                 try:
                     return open({str(secret)!r}).read()
                 except OSError as exc:
                     return f"denied:{{type(exc).__name__}}"
-            """
-        )
-    )
+            """))
 
     with PolicyWorker(policy_path) as policy:
         result = policy.act({})

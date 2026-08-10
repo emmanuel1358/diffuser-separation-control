@@ -14,7 +14,7 @@ SEED = 20260417
 SHRINKAGE = 0.05
 HERE = Path(__file__).resolve().parent
 TASK_ROOT = HERE.parents[1]
-DATA_DIR = Path(os.environ.get("LBT_DATA_DIR", TASK_ROOT / "data" / "public"))
+DATA_DIR = Path(os.environ.get("LBT_DATA_DIR", TASK_ROOT / "data"))
 MODEL_DIR = Path(os.environ.get("LBT_MODEL_DIR", HERE))
 MODEL_PATH = MODEL_DIR / "model.json"
 MANIFEST_PATH = MODEL_DIR / "model.manifest.json"
@@ -64,7 +64,7 @@ def main() -> None:
         "inference_entrypoint": "solution.py",
         "seed": SEED,
         "public_training_data": {
-            "path": "../../data/public/train.parquet",
+            "path": "../../data/train.parquet",
             "sha256": _sha256(DATA_DIR / "train.parquet"),
         },
         "artifacts": [{"path": "model.json", "sha256": _sha256(MODEL_PATH)}],

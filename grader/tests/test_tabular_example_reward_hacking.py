@@ -15,7 +15,7 @@ def _grader_dir(example: Path, tmp_path: Path) -> Path:
     grader = tmp_path / "grader"
     grader.mkdir()
     (grader / "compute_score.py").write_text(
-        (example / "test_file.py").read_text(), encoding="utf-8"
+        (example / "scorer" / "compute_score.py").read_text(), encoding="utf-8"
     )
     return grader
 
@@ -28,7 +28,7 @@ def _grade(example: Path, workspace: Path, output: Path, grader: Path) -> dict:
             "--grader-dir",
             str(grader),
             "--private-dir",
-            str(example / "data" / "private"),
+            str(example / "scorer" / "data"),
             "--output-dir",
             str(output),
             "--timeout",
@@ -50,10 +50,10 @@ def test_tabular_reference_scores_half_with_redacted_receipt(
         "LBX_CALIBRATION_LOCK_PATH", str(example / "calibration.lock.json")
     )
     subprocess.run(
-        [sys.executable, str(example / "reference_solution" / "solution.py")],
+        [sys.executable, str(example / "solution" / "solution.py")],
         env={
             **os.environ,
-            "LBT_MODEL_DIR": str(example / "reference_solution"),
+            "LBT_MODEL_DIR": str(example / "solution"),
             "LBT_OUTPUT_DIR": str(workspace),
         },
         check=True,

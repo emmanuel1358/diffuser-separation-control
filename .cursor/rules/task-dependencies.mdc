@@ -1,0 +1,27 @@
+---
+description: Task dependency channels and private package isolation
+globs: "{problems,examples}/**/environment/**,{problems,examples}/**/scorer/requirements.txt,{problems,examples}/**/scorer/env-requirements.txt"
+alwaysApply: false
+---
+
+# Task Dependencies
+
+- Never edit `base/` for one task's dependencies.
+- Agent/runtime OS packages: `environment/apt.txt`.
+- Agent/runtime Python packages: `environment/requirements.txt`.
+- Grader-only packages: `scorer/requirements.txt` under root-only
+  `/mcp_server/grading_deps`.
+- Hidden-env-only packages: `scorer/env-requirements.txt` under root-only
+  `/mcp_server/env_deps`.
+- Placement is a security boundary: a private reference/simulator package that
+  leaks the intended approach must not appear in an agent-visible channel.
+- Do not duplicate packages across public/private channels. Avoid mutable VCS,
+  local path, or unpinned network installs.
+- Install through the shared task dependency installer before copying/sealing
+  private scorer data. Recheck root ownership and modes afterward.
+- Use preloaded mounts for large datasets/models instead of baking or downloading
+  them during an episode.
+- Raw Dockerfile installs require an explicit reviewed allow marker only when no
+  channel can express the dependency.
+
+See `docs/AUTHORING.md` (Task Dependencies) and `ml-tasks`.

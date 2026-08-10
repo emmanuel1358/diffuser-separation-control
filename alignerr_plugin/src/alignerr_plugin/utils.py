@@ -21,55 +21,88 @@ IGNORED_HASH_PARTS = {".git", ".alignerr", "__pycache__", ".taiga_submit.json"}
 GRADING_INPUT_DIRS = (
     "solution",
     "scorer",
+    "data",
     "data_generation",
     "data-generation",
     "baselines",
     "environment",
 )
-GRADING_INPUT_FILES = ("task.toml",)
+# calibration.lock.json is generated, but it is baked into the image and its
+# anchors drive continuous scores, so a hand-edited lock has to stale the proof.
+# update_build_proof_result refreshes task_dir_sha256 after writing a new lock,
+# so including it here does not make a fresh ground-truth run look stale.
+GRADING_INPUT_FILES = ("task.toml", "calibration.lock.json")
 
-# ML_Envs-mode grading-/image-affecting inputs (no task.toml / scorer/).
-MLENVS_GRADING_INPUT_DIRS = (
-    "data",
-    "data-generation",
-    "reference_solution",
-    "baselines",
-)
-MLENVS_GRADING_INPUT_FILES = (
-    "metadata.json",
-    "test_file.py",
-    "calibration.lock.json",
-)
+
+class LegacyTaskLayoutError(RuntimeError):
+    """Raised for a legacy ML_Envs (metadata-mode) task directory.
+
+    The metadata-mode contract (``metadata.json`` with ``ml_task_type`` +
+    ``prompt.md`` + ``test_file.py``, no ``task.toml``) was removed. Failing
+    loudly here beats misclassifying the directory as a malformed native task.
+    """
+
+
+def _declares_ml_task_type(metadata_path: Path) -> bool:
+    """True for a metadata-mode ``metadata.json`` (i.e. one carrying ``ml_task_type``).
+
+    Native tasks ship a ``metadata.json`` too -- the Taiga envelope -- so the file
+    existing is not itself a legacy marker; only the removed ``ml_task_type`` key is.
+    """
+    try:
+        # utf-8-sig, not utf-8: a BOM would otherwise make json.loads raise and
+        # silently downgrade a legacy tree to a bare "no task.toml" failure,
+        # losing the migration guidance below. Plain UTF-8 decodes identically.
+        data = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and "ml_task_type" in data
+
+
+def reject_legacy_layout(problem_dir: Path) -> None:
+    """Fail with migration guidance when a task uses the removed ML_Envs layout."""
+    if (problem_dir / "task.toml").is_file():
+        return
+    markers = [
+        name
+        for name in ("test_file.py", "prompt.md", "reference_solution")
+        if (problem_dir / name).exists()
+    ]
+    # A partly-converted tree can have renamed prompt.md/test_file.py already and
+    # still carry the metadata-mode config, so this is often the only marker left.
+    metadata_path = problem_dir / "metadata.json"
+    if metadata_path.is_file() and _declares_ml_task_type(metadata_path):
+        markers.append("metadata.json with ml_task_type")
+    if not markers:
+        return
+    raise LegacyTaskLayoutError(
+        f"{problem_dir} uses the removed ML_Envs (metadata-mode) task layout "
+        f"(found {', '.join(sorted(markers))}, no task.toml). Every task must now "
+        "use the native layout: task.toml, instruction.md, scorer/compute_score.py, "
+        "environment/Dockerfile, solution/. See docs/LEGACY_ML_LAYOUT.md for the "
+        "conversion steps."
+    )
 
 
 def load_task_toml(problem_dir: Path) -> TaskToml:
-    """Load and validate task.toml (synthesized in memory for ML_Envs-mode tasks)."""
-    from alignerr_plugin import mlenvs
-
-    if mlenvs.is_mlenvs_task(problem_dir):
-        return mlenvs.synthesize_task_toml(problem_dir)
+    """Load and validate a native task.toml."""
+    reject_legacy_layout(problem_dir)
     with (problem_dir / "task.toml").open("rb") as handle:
         return TaskToml.model_validate(tomllib.load(handle))
 
 
 def load_metadata(problem_dir: Path) -> ProblemMetadata:
-    """Load the Alignerr metadata.json envelope (synthesized for ML_Envs-mode tasks)."""
-    from alignerr_plugin import mlenvs
-
-    if mlenvs.is_mlenvs_task(problem_dir):
-        return mlenvs.synthesize_problem_metadata(problem_dir)
+    """Load the Alignerr metadata.json envelope."""
+    reject_legacy_layout(problem_dir)
     return ProblemMetadata.model_validate(
-        json.loads((problem_dir / "metadata.json").read_text())
+        json.loads((problem_dir / "metadata.json").read_text(encoding="utf-8-sig"))
     )
 
 
 def read_prompt(problem_dir: Path) -> str:
-    """Read the task prompt: ``prompt.md`` for ML_Envs-mode tasks, else
-    ``instruction.md`` for native tasks."""
-    from alignerr_plugin import mlenvs
-
-    name = "prompt.md" if mlenvs.is_mlenvs_task(problem_dir) else "instruction.md"
-    return (problem_dir / name).read_text()
+    """Read the task prompt (``instruction.md``)."""
+    reject_legacy_layout(problem_dir)
+    return (problem_dir / "instruction.md").read_text()
 
 
 def task_id(problem_dir: Path) -> str:
@@ -116,20 +149,15 @@ def _is_grading_input(
 def grading_inputs_sha256(problem_dir: Path) -> str:
     """Deterministic hash over only grading-/image-affecting task files.
 
-    Scope (native): ``task.toml`` + ``solution/`` / ``scorer/`` /
-    ``data_generation/`` / ``environment/``; docs and local state are excluded.
-    ``environment/`` is in scope because ``verify_build_proof`` does not separately
-    check ``image_digest``, so a Dockerfile edit must stale the proof. ML_Envs-mode
-    tasks scope to ``metadata.json`` + ``test_file.py`` +
-    ``calibration.lock.json`` + ``data/`` + ``data-generation/`` +
-    ``reference_solution/`` + ``baselines/`` (see ``MLENVS_GRADING_INPUT_*``).
+    Scope: ``task.toml`` + ``solution/`` / ``scorer/`` / ``data/`` /
+    ``data_generation/`` / ``baselines/`` / ``environment/``; docs and local
+    state are excluded. ``environment/`` is in scope because
+    ``verify_build_proof`` does not separately check ``image_digest``, so a
+    Dockerfile edit must stale the proof. ``data/`` is in scope because the
+    public tree is baked into the image and trains the reference solution, so
+    swapping it changes the oracle score.
     """
-    from alignerr_plugin import mlenvs
-
-    if mlenvs.is_mlenvs_task(problem_dir):
-        dirs, files = MLENVS_GRADING_INPUT_DIRS, MLENVS_GRADING_INPUT_FILES
-    else:
-        dirs, files = GRADING_INPUT_DIRS, GRADING_INPUT_FILES
+    dirs, files = GRADING_INPUT_DIRS, GRADING_INPUT_FILES
     digest = hashlib.sha256()
     for path in sorted(problem_dir.rglob("*")):
         if path.is_dir():

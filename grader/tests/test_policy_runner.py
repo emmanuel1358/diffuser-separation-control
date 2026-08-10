@@ -7,7 +7,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from grading import policy_runner
 from grading.policy_runner import PolicyTimeoutError, PolicyWorker, PolicyWorkerError
 
@@ -15,12 +14,47 @@ from grading.policy_runner import PolicyTimeoutError, PolicyWorker, PolicyWorker
 def test_policy_worker_accepts_module_act(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
     policy_path.write_text(
-        "def act(obs):\n" "    return [obs['x'] + 1, obs['items'][1]]\n"
+        "def act(obs):\n    return [obs['x'] + 1, obs['items'][1]]\n"
     )
 
     with PolicyWorker(policy_path) as policy:
         assert policy.act({"x": 2, "items": [4, 5]}) == [3, 5]
         assert policy({"x": 3, "items": [6, 7]}) == [4, 7]
+
+
+def test_policy_worker_rejects_privilege_drop_opt_out(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text("def act(obs):\n    return 0\n")
+
+    with pytest.raises(ValueError, match="drop_privileges=False"):
+        PolicyWorker(policy_path, drop_privileges=False)
+
+
+def test_policy_worker_resolves_relative_path_from_cwd(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "policy.py").write_text("def act(obs):\n    return obs['x']\n")
+
+    with PolicyWorker(Path("policy.py"), cwd=workspace) as policy:
+        assert policy.act({"x": 7}) == 7
+
+
+def test_policy_worker_preserves_module_metadata(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text(
+        "def act(obs):\n"
+        "    return {\n"
+        "        'spec': __spec__ is not None,\n"
+        "        'loader': __loader__ is not None,\n"
+        "        'file': __file__,\n"
+        "    }\n"
+    )
+
+    with PolicyWorker(policy_path) as policy:
+        metadata = policy.act({})
+    assert metadata["spec"] is True
+    assert metadata["loader"] is True
+    assert metadata["file"] == str(policy_path)
 
 
 def test_policy_worker_rejects_oversized_reply_before_body_allocation(
@@ -77,9 +111,7 @@ def test_policy_worker_bootstrap_does_not_need_env_server_on_sys_path(
 def test_policy_worker_accepts_policy_class(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
     policy_path.write_text(
-        "class Policy:\n"
-        "    def act(self, obs):\n"
-        "        return {'u': obs['x'] * 2}\n"
+        "class Policy:\n    def act(self, obs):\n        return {'u': obs['x'] * 2}\n"
     )
 
     with PolicyWorker(policy_path) as policy:
@@ -110,7 +142,7 @@ def test_policy_worker_inherits_grader_cwd_by_default(
     policy_dir.mkdir()
     policy_path = policy_dir / "policy.py"
     policy_path.write_text(
-        "from pathlib import Path\n" "def act(obs):\n" "    return Path.cwd().name\n"
+        "from pathlib import Path\ndef act(obs):\n    return Path.cwd().name\n"
     )
     grader_cwd = tmp_path / "grader-cwd"
     grader_cwd.mkdir()
@@ -140,15 +172,23 @@ def test_policy_worker_can_provide_output_model_xml(tmp_path: Path) -> None:
 def test_policy_worker_times_out(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
     policy_path.write_text(
-        "import time\n" "def act(obs):\n" "    time.sleep(10)\n" "    return 0\n"
+        "import time\ndef act(obs):\n    time.sleep(10)\n    return 0\n"
     )
 
-    # Pin the first-call budget too, otherwise the generous startup floor would
-    # mask the per-step timeout being exercised here.
-    with pytest.raises(TimeoutError) as excinfo:
-        with PolicyWorker(
-            policy_path, timeout_s=0.05, first_call_timeout_s=0.05
-        ) as policy:
+    # Only the per-step budget is pinned. `first_call_timeout_s` used to be pinned
+    # to 0.05s as well, on the theory that the generous startup floor would
+    # otherwise mask the per-step timeout -- it does not: `_handshake` sets
+    # `_first_call_done` before `act` is ever called, so `act` already runs on
+    # `timeout_s`. All the pin did was starve the worker's own start-up, which is
+    # fast enough on a laptop and never fast enough on a two-core CI runner: there
+    # the worker died in trusted setup and raised PolicyWorkerError, so the timeout
+    # under test never fired at all.
+    #
+    # Entering the worker outside `pytest.raises` keeps that distinction visible. A
+    # start-up failure is now an error at the `with`, not a caught exception that
+    # could be mistaken for the per-call hang this is about.
+    with PolicyWorker(policy_path, timeout_s=0.05) as policy:
+        with pytest.raises(TimeoutError) as excinfo:
             policy.act({})
     # A per-call hang must be a PolicyTimeoutError so it is ALSO catchable by a
     # migrated grader's `except RuntimeError: return 0.0` (kept 0.0) and the
@@ -189,7 +229,7 @@ def test_policy_worker_can_restart_after_kill(tmp_path: Path) -> None:
 
 def test_policy_worker_surfaces_policy_error(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
-    policy_path.write_text("def act(obs):\n" "    raise RuntimeError('boom')\n")
+    policy_path.write_text("def act(obs):\n    raise RuntimeError('boom')\n")
 
     with pytest.raises(PolicyWorkerError, match="boom"):
         with PolicyWorker(policy_path) as policy:
@@ -199,10 +239,7 @@ def test_policy_worker_surfaces_policy_error(tmp_path: Path) -> None:
 def test_policy_worker_tolerates_policy_prints(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
     policy_path.write_text(
-        "print('import noise')\n"
-        "def act(obs):\n"
-        "    print('act noise')\n"
-        "    return [1, 2]\n"
+        "print('import noise')\ndef act(obs):\n    print('act noise')\n    return [1, 2]\n"
     )
 
     with PolicyWorker(policy_path) as policy:
@@ -211,9 +248,21 @@ def test_policy_worker_tolerates_policy_prints(tmp_path: Path) -> None:
         assert "act noise" in policy.stderr()
 
 
+def test_policy_worker_bounds_no_newline_stderr(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text(
+        "import sys\nsys.stderr.write('x' * 100_000)\nsys.stderr.flush()\ndef act(obs):\n    return 1\n"
+    )
+
+    with PolicyWorker(policy_path, max_stderr_chars=1024) as policy:
+        assert policy.act({}) == 1
+        assert policy.stderr() == "x" * 1024
+
+
 def test_policy_worker_cannot_inspect_grader_locals(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
-    policy_path.write_text(textwrap.dedent("""
+    policy_path.write_text(
+        textwrap.dedent("""
             import inspect
 
             def act(obs):
@@ -221,7 +270,8 @@ def test_policy_worker_cannot_inspect_grader_locals(tmp_path: Path) -> None:
                     if "hidden_case" in frame.frame.f_locals:
                         return frame.frame.f_locals["hidden_case"]
                 return "not_visible"
-            """))
+            """)
+    )
 
     hidden_case = "secret schedule"
     with PolicyWorker(policy_path) as policy:
@@ -242,7 +292,7 @@ def test_policy_worker_drops_privileges_when_root(tmp_path: Path) -> None:
 
     policy_path = tmp_path / "policy.py"
     policy_path.write_text(
-        "import os\n" "def act(obs):\n" "    return [os.geteuid(), os.getegid()]\n"
+        "import os\ndef act(obs):\n    return [os.geteuid(), os.getegid()]\n"
     )
     # tmp_path is created as root with restrictive perms; loosen so the
     # dropped child can actually read the policy file it was handed.
@@ -368,14 +418,16 @@ def test_policy_worker_round_trips_numpy_arrays(tmp_path: Path) -> None:
     import numpy as np
 
     policy_path = tmp_path / "policy.py"
-    policy_path.write_text(textwrap.dedent("""
+    policy_path.write_text(
+        textwrap.dedent("""
             import numpy as np
 
             def act(obs):
                 assert isinstance(obs["ctrl"], np.ndarray), type(obs["ctrl"])
                 assert obs["ctrl"].dtype == np.float64
                 return {"action": obs["ctrl"] * 2, "shape": list(obs["ctrl"].shape)}
-            """))
+            """)
+    )
 
     ctrl = np.array([[1.0, 2.0], [3.0, 4.0]])
     with PolicyWorker(policy_path) as policy:
@@ -385,6 +437,23 @@ def test_policy_worker_round_trips_numpy_arrays(tmp_path: Path) -> None:
     assert result["action"].dtype == np.float64
     np.testing.assert_array_equal(result["action"], ctrl * 2)
     assert result["shape"] == [2, 2]
+
+
+def test_bias_worker_toward_oom_writes_positive(tmp_path: Path) -> None:
+    proc_dir = tmp_path / "5150"
+    proc_dir.mkdir()
+    (proc_dir / "oom_score_adj").write_text("-1000")
+
+    policy_runner._bias_worker_toward_oom(5150, proc_root=str(tmp_path))
+
+    assert (proc_dir / "oom_score_adj").read_text() == str(
+        policy_runner._WORKER_OOM_SCORE_ADJ
+    )
+    assert policy_runner._WORKER_OOM_SCORE_ADJ > 0
+
+
+def test_bias_worker_toward_oom_is_best_effort(tmp_path: Path) -> None:
+    policy_runner._bias_worker_toward_oom(999999, proc_root=str(tmp_path))
 
 
 # --- M28: default private IPC namespace for submitted-policy workers ----------
@@ -480,7 +549,6 @@ def _run_preexec_capturing_status(
     r, w = os.pipe()
     try:
         policy_runner._agent_preexec(1234, 1235, ipc_status_fd=w)()
-        os.close(w)
         w = -1
         data = os.read(r, 1)
     finally:

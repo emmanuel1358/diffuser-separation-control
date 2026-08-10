@@ -5,7 +5,13 @@ from pathlib import Path
 from typing import Any
 
 from lbx_rl_tasks_harness.formats.problem_dir import load_problem_dir
-from lbx_rl_tasks_harness.models import HarnessProblem, OutputSpec
+from lbx_rl_tasks_harness.models import (
+    GroundTruthSpec,
+    HarnessProblem,
+    OutputSpec,
+    ReferenceSpec,
+)
+from lbx_rl_tasks_harness.models_config import DEFAULT_MODEL
 
 
 def _problem_set(payload: dict[str, Any]) -> dict[str, Any]:
@@ -52,10 +58,51 @@ def load_taiga_metadata(
     source_problem = (
         load_problem_dir(source_problem_dir) if source_problem_dir else None
     )
+    problem_metadata = problem.get("metadata")
+    if not isinstance(problem_metadata, dict):
+        problem_metadata = {}
+    required_resources = problem.get("required_resources") or problem_set.get(
+        "required_resources"
+    )
+    runtime_metadata = dict(source_problem.metadata) if source_problem else {
+        "task": {
+            "name": f"labelbox/{problem['id']}",
+            "description": str(problem_metadata.get("description") or ""),
+        },
+        "agent": {"timeout_sec": payload.get("max_timeout_seconds")},
+        "verifier": {"timeout_sec": problem.get("grading_timeout_seconds")},
+        "environment": {"required_resources": required_resources},
+        "runner": {
+            "api_model_name": str(payload.get("api_model_name") or DEFAULT_MODEL)
+        },
+        "difficulty": {
+            key: problem_metadata.get(key, "")
+            for key in (
+                "task_type",
+                "domain",
+                "reward_type",
+                "license",
+                "license_source",
+                "is_impossible",
+            )
+        },
+    }
+    runtime_metadata.update(
+        {
+            "metadata_path": str(metadata_path),
+            "startup_command": problem.get("startup_command"),
+            "grading_strategy": problem.get("grading_strategy"),
+            "job_fields": {
+                key: value
+                for key, value in payload.items()
+                if key not in {"problems_metadata", "problem_set"}
+            },
+        }
+    )
     return HarnessProblem(
         id=str(problem["id"]),
         source_format="taiga",
-        prompt=str(problem.get("task_prompt", "")),
+        prompt=str(problem.get("task_prompt") or problem.get("prompt") or ""),
         outputs=(
             source_problem.outputs if source_problem else _outputs_from_problem(problem)
         ),
@@ -67,17 +114,9 @@ def load_taiga_metadata(
         private_dir=source_problem.private_dir if source_problem else None,
         image=problem.get("image"),
         required_tools=list(problem.get("required_tools") or []),
-        required_resources=problem.get("required_resources")
-        or problem_set.get("required_resources"),
-        metadata={
-            "metadata_path": str(metadata_path),
-            "startup_command": problem.get("startup_command"),
-            "grading_strategy": problem.get("grading_strategy"),
-            "job_fields": {
-                key: value
-                for key, value in payload.items()
-                if key not in {"problems_metadata", "problem_set"}
-            },
-        },
+        required_resources=required_resources,
+        ground_truth=source_problem.ground_truth if source_problem else GroundTruthSpec(),
+        reference=source_problem.reference if source_problem else ReferenceSpec(),
+        metadata=runtime_metadata,
         taiga_problem=problem,
     )

@@ -1,0 +1,25 @@
+---
+description: MuJoCo task metadata, rollout, policy, and reviewer-video requirements
+globs: "{problems,examples}/**/task.toml,{problems,examples}/**/solution/render*.*,{problems,examples}/**/solution/render_config.py,{problems,examples}/**/scorer/**"
+alwaysApply: false
+---
+
+# MuJoCo Tasks
+
+- Use `task_type = "mujoco"`, a scoped domain from `task_metadata`, and
+  deterministic rubric scoring.
+- Policy submissions expose `act(obs)` or `class Policy.act(obs)`; execute them
+  through shared policy isolation, never import them in the root grader.
+- Pin timestep, integrator, initial state, controls, perturbations, and RNG seeds.
+- Grade behavior across deterministic states; XML/shape checks alone do not
+  establish task success.
+- Oracle score is `1.0`; invalid physics, NaN, instability, policy timeout, or
+  unsafe behavior is candidate fault.
+- Declare and generate required `rendering.mp4`: H.264, exactly `1280x720`.
+  Prefer `python -m lbx_rl_tasks_harness.render_mujoco` and keep task-specific
+  hooks in `solution/render_config.py`.
+- Run no-op policy, world-integrity, malformed policy, and determinism checks.
+
+Read `mujoco-tasks`, `ground-truth-oracle`,
+`project_guidelines/mujoco/mujoco_environments.md`, and
+`examples/mujoco-pendulum/`.

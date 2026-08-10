@@ -1,0 +1,48 @@
+[
+  {
+    "protocol": "transform/v1",
+    "case_id": "public-geometry-0012",
+    "suite": "geometry",
+    "operation": "naca_geometry",
+    "designation": 12,
+    "nside": 123
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "public-inviscid-2412-a4",
+    "suite": "inviscid",
+    "operation": "analyze_inviscid",
+    "designation": 2412,
+    "alpha": 4.0,
+    "panels": 140,
+    "mach": 0.0
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "public-viscous-0012-a4",
+    "suite": "viscous",
+    "operation": "analyze_viscous",
+    "designation": 12,
+    "alpha": 4.0,
+    "panels": 140,
+    "reynolds": 1000000.0,
+    "mach": 0.0,
+    "ncrit": 9.0,
+    "iterations": 100
+  },
+  {
+    "protocol": "transform/v1",
+    "case_id": "public-polar-2412",
+    "suite": "polar_state",
+    "operation": "polar",
+    "designation": 2412,
+    "alpha_start": -2.0,
+    "alpha_end": 6.0,
+    "alpha_step": 2.0,
+    "panels": 140,
+    "reynolds": 1000000.0,
+    "mach": 0.1,
+    "ncrit": 9.0,
+    "iterations": 100
+  }
+]

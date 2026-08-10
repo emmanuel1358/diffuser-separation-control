@@ -22,15 +22,21 @@ curve.
 ## Authored layout
 
 ```text
-metadata.json
-prompt.md
-test_file.py
+task.toml
+instruction.md
 calibration.lock.json
-data-generation/generate.py
-data/public/
-data/private/
-  challenge.parquet
-reference_solution/
+environment/
+  Dockerfile
+  requirements.txt
+data_generation/generate.py
+data/                       public data, mounted read-only at /data
+scorer/
+  compute_score.py
+  data/
+    challenge.parquet
+    test_target.parquet
+solution/
+  solve.sh
   train.py
   solution.py
   model.json
@@ -52,7 +58,7 @@ committed.
 
 ## One-command finalization
 
-For a v2 task with `difficulty.task_type = "ml"`, ground-truth validation owns
+For a task with `difficulty.task_type = "ml"`, ground-truth validation owns
 calibration:
 
 ```bash
@@ -62,7 +68,7 @@ uv run lbx-rl-harness run \
 ```
 
 The workflow validates model manifests, runs reference and naive inference in
-isolated containers, measures raw metrics against private truth, generates the
+isolated containers, measures raw metrics against held-out truth, generates the
 three-anchor curve, runs qualification checks, atomically replaces
 `calibration.lock.json`, replays reference/no-op/oracle contracts, and updates
 the build proof.
@@ -75,13 +81,13 @@ positive band. The mean/majority strategy is a null probe and maps to zero.
 
 ```bash
 uv run python \
-  examples/mle-tabular-classification/data-generation/generate.py
+  examples/mle-tabular-classification/data_generation/generate.py
 
 LBX_PRIVATE_CHALLENGE_SEED='<trusted secret>' uv run python \
-  examples/mle-tabular-classification/data-generation/generate_private_challenge.py
+  examples/mle-tabular-classification/data_generation/generate_private_challenge.py
 
 uv run python \
-  examples/mle-tabular-classification/reference_solution/train.py
+  examples/mle-tabular-classification/solution/train.py
 
 uv run python \
   examples/mle-tabular-classification/baselines/naive/train.py

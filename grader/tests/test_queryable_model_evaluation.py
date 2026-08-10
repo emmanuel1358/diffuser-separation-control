@@ -15,6 +15,7 @@ from grading.evaluation import (
     PythonPredictor,
     write_calibration_lock_atomic,
 )
+from grading.faults import AgentFault
 
 
 def _task() -> ContinuousTask:
@@ -105,6 +106,50 @@ def test_queryable_constant_model_is_zero(tmp_path, monkeypatch) -> None:
         "accepted": False,
         "reason": "exact_constant",
     }
+
+
+def test_last_bit_float_jitter_is_not_an_agent_fault(tmp_path, monkeypatch) -> None:
+    """Thread-parallel ensembles reorder float sums between identical calls.
+
+    Bit-exact repeatability failed those predictors with AgentFault, which the
+    runner maps to a hard 0.0.
+    """
+    task, workspace, private = _prepare(tmp_path, monkeypatch)
+    (workspace / "predictor.py").write_text(
+        "def load_predictor():\n"
+        "    class Predictor:\n"
+        "        def __init__(self):\n"
+        "            self.calls = 0\n"
+        "        def predict(self, rows):\n"
+        "            self.calls += 1\n"
+        "            jitter = 0.0 if self.calls == 1 else 1e-16\n"
+        "            return {'target': [2.0*r['x'] + 0.3 + jitter for r in rows]}\n"
+        "    return Predictor()\n",
+        encoding="utf-8",
+    )
+
+    result = task.compute_score(workspace=workspace, private=private)
+
+    assert result["score"] > 0.5
+
+
+def test_a_genuinely_unstable_predictor_still_faults(tmp_path, monkeypatch) -> None:
+    task, workspace, private = _prepare(tmp_path, monkeypatch)
+    (workspace / "predictor.py").write_text(
+        "def load_predictor():\n"
+        "    class Predictor:\n"
+        "        def __init__(self):\n"
+        "            self.calls = 0\n"
+        "        def predict(self, rows):\n"
+        "            self.calls += 1\n"
+        "            shift = 0.0 if self.calls == 1 else 0.5\n"
+        "            return {'target': [2.0*r['x'] + 0.3 + shift for r in rows]}\n"
+        "    return Predictor()\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentFault, match="not deterministic"):
+        task.compute_score(workspace=workspace, private=private)
 
 
 def test_extreme_finite_predictions_are_kept_zero_not_internal_failure(

@@ -149,7 +149,15 @@ def test_doc_only_edit_does_not_stale_build_proof(tmp_path: Path) -> None:
         ("task.toml", "[task]\nname = 'demo2'\n"),
         ("solution/solve.sh", "echo changed\n"),
         ("scorer/compute_score.py", "score = 0.5\n"),
+        # The public tree is baked into the image and trains the reference, so
+        # swapping it must stale the proof rather than keep the prior oracle score.
+        ("data/train.csv", "a,b\n1,2\n"),
+        ("scorer/data/test_target.csv", "y\n1\n"),
         ("data_generation/gen.py", "x = 1\n"),
+        ("baselines/naive/train.py", "y = 2\n"),
+        # Generated, but baked into the image and its anchors drive the score, so
+        # a hand-edited lock must not keep a prior result valid.
+        ("calibration.lock.json", '{"anchors": {"reference": 0.99}}\n'),
         ("environment/Dockerfile", "FROM other\n"),
     ],
 )

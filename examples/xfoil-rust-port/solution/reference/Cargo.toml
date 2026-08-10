@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustfoil-core",
+    "crates/rustfoil-bl",
+    "crates/rustfoil-inviscid",
+    "crates/rustfoil-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Flexcompute, Inc.", "Harry Smith"]
+
+[workspace.dependencies]
+nalgebra = "=0.33.2"
+thiserror = "=2.0.18"

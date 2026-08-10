@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
 import os
 import sys
 from pathlib import Path
 
 import pytest
-
-from grading import AgentFault, GraderFault
-from grading import helpers
+from grading import AgentFault, GraderFault, helpers
 
 
 def test_file_exists(tmp_path: Path) -> None:
@@ -121,6 +120,59 @@ def test_load_submission_or_fault_accepts_valid_csv(tmp_path: Path) -> None:
     assert list(df["y"]) == [0.5, 0.8]
 
 
+def test_load_submission_or_fault_preserves_gzip_inference(tmp_path: Path) -> None:
+    path = tmp_path / "submission.csv.gz"
+    path.write_bytes(gzip.compress(b"id,y\n1,0.5\n"))
+
+    frame = helpers.load_submission_or_fault(
+        path,
+        required_columns=["id", "y"],
+    )
+    assert frame.to_dict(orient="records") == [{"id": 1, "y": 0.5}]
+
+
+def test_load_submission_or_fault_supports_memory_map(tmp_path: Path) -> None:
+    path = tmp_path / "submission.csv"
+    path.write_text("id,y\n1,0.5\n")
+
+    frame = helpers.load_submission_or_fault(
+        path,
+        required_columns=["id", "y"],
+        read_csv_kwargs={"memory_map": True},
+    )
+    assert frame.to_dict(orient="records") == [{"id": 1, "y": 0.5}]
+
+
+def test_load_submission_or_fault_bounds_gzip_expansion(tmp_path: Path) -> None:
+    path = tmp_path / "submission.csv.gz"
+    path.write_bytes(gzip.compress(b"id,y\n" + (b"1,0.5\n" * 10_000)))
+
+    with pytest.raises(AgentFault, match="expands beyond"):
+        helpers.load_submission_or_fault(
+            path,
+            max_uncompressed_bytes=1024,
+        )
+
+
+def test_load_submission_or_fault_rejects_high_memory_compression(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "submission.csv.xz"
+    path.write_bytes(b"not parsed")
+
+    with pytest.raises(AgentFault, match="unsupported"):
+        helpers.load_submission_or_fault(path)
+
+
+def test_open_submission_file_or_fault_yields_immutable_bytes(tmp_path: Path) -> None:
+    artifact = tmp_path / "submission.bin"
+    artifact.write_bytes(b"candidate")
+
+    with helpers.open_submission_file_or_fault(artifact) as handle:
+        artifact.write_bytes(b"replacement")
+        assert handle.read() == b"candidate"
+
+
 def test_load_submission_or_fault_rejects_symlink(tmp_path: Path) -> None:
     target = tmp_path / "truth.csv"
     target.write_text("id,y\n1,1.0\n")
@@ -129,6 +181,21 @@ def test_load_submission_or_fault_rejects_symlink(tmp_path: Path) -> None:
 
     with pytest.raises(AgentFault, match="not a regular file"):
         helpers.load_submission_or_fault(link, required_columns=["id", "y"])
+
+
+def test_load_submission_or_fault_rejects_parent_symlink(tmp_path: Path) -> None:
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "submission.csv").write_text("id,y\n1,1.0\n")
+    workspace = tmp_path / "output"
+    workspace.mkdir()
+    os.symlink(private, workspace / "nested")
+
+    with pytest.raises(AgentFault, match="not a regular file"):
+        helpers.load_submission_or_fault(
+            workspace / "nested" / "submission.csv",
+            required_columns=["id", "y"],
+        )
 
 
 def test_load_submission_or_fault_rejects_extra_columns(tmp_path: Path) -> None:

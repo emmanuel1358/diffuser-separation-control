@@ -32,7 +32,7 @@ task** on three patterns:
 | --- | --- | --- |
 | A broad `except` that returns a score (`except Exception: return 0.0` / `return _failure(...)`) | Over-keep: silently converts author/infra bugs into a kept `0.0` and teaches the agent that crashing the grader yields a defined score | Catch the specific agent-controlled exception and `raise grading.faults.AgentFault(...)`; let author/infra faults propagate |
 | Pickle deserialization of an agent artifact (`pickle.load`, `joblib.load`, `torch.load`, `read_pickle`, `numpy.load(allow_pickle=True)`) | RCE-as-root via `__reduce__` on a submission the agent controls | Load through the sandboxed `helpers.run_model_module(...)` / `run_policy(...)`, or ship a non-pickle format |
-| Read of an agent-writable path via a raw reader (`open`/`read_csv`/`np.load`/`h5py.File`, or the `Path` methods `.read_text()`/`.read_bytes()`, on `workspace` or `/tmp/output`) | **Symlink exfiltration**: an agent script (e.g. `predict.py`, which the grader runs) re-plants a symlink to the held-out truth AFTER the runner's pre-grade scrub, so a raw read as root follows it and scores the truth as the agent's own submission. A bare `except OSError` does **not** close this — a symlink read succeeds with no error. Also over-discard: a planted directory/FIFO raises `OSError` out of `compute_score`, discarding the earned `0.0` | Use the sanctioned loader for the type (below), which `lstat`s + rejects non-regular files at load time; for a hand-rolled read, call `helpers.require_regular_file(path)` (or `os.lstat` + `stat.S_ISREG`) BEFORE the read |
+| Read of an agent-writable path via a raw reader (`open`/`read_csv`/`np.load`/`h5py.File`, or the `Path` methods `.read_text()`/`.read_bytes()`, on `workspace` or `/tmp/output`) | **Symlink exfiltration**: an agent script re-plants a leaf or parent-directory symlink to held-out truth after the pre-grade scrub, so a raw root read scores truth as the submission. `except OSError`, `lstat`, and leaf-only `O_NOFOLLOW` do not close the full race. A planted directory/FIFO can also over-discard the earned `0.0`. | Use the sanctioned loader for the type. For a custom parser, parse the immutable file object from `helpers.open_submission_file_or_fault`. Task scorers may not use raw pathname-only readers. |
 
 The lint is scoped to the live path (reachable from `compute_score`) and spares
 intermediate sentinels (e.g. a helper returning a zeroed action on bad input).
@@ -61,19 +61,22 @@ rejected on sight. Move author/infra reads (hidden truth) outside the agent
 ## 3. Submission loaders (per-type attack closures)
 
 Use the sanctioned loader for each submission type instead of reading the
-artifact by hand. Each runs the read/execution as the unprivileged `agent`
-account and raises `AgentFault` for malformed input.
+artifact by hand. Root-side data loaders walk every path component through
+pinned directory descriptors, reject symlinks/FIFOs/devices, and parse immutable
+bytes from the same opened file. Executable/model parsers run as the unprivileged
+`agent` account. Malformed submissions raise `AgentFault`.
 
 | Submission | Loader | Closes |
 | --- | --- | --- |
-| Rubric JSON | `JsonArtifact` in `RubricTask` | `O_NOFOLLOW`, FIFO/device, byte/depth/node caps, strict UTF-8, schema, huge-number overflow, NaN/Inf |
-| Rubric text/XML | `TextArtifact` in `RubricTask` | `O_NOFOLLOW`, FIFO/device, byte cap, strict UTF-8 |
-| CSV / dataframe | `helpers.load_submission_or_fault` | symlink/FIFO, oversize, schema, non-finite |
-| NumPy `.npz` / `.npy` | `helpers.load_submission_npz_or_fault` | symlink-to-truth (`O_NOFOLLOW`), FIFO-hang (`O_NONBLOCK`), oversize, and pickle-RCE (`allow_pickle=False`) |
-| Any format read by hand | `helpers.require_regular_file(path)` before the read | symlink/FIFO/dir/device + oversize (an `os.lstat` + `stat.S_ISREG` guard as a callable; a bare `except OSError` does not stop a symlink) |
+| Rubric JSON | `JsonArtifact` in `RubricTask` | component-safe descriptor walk, FIFO/device, byte/depth/node caps, strict UTF-8, schema, huge-number overflow, NaN/Inf |
+| Rubric text/XML | `TextArtifact` in `RubricTask` | component-safe descriptor walk, FIFO/device, byte cap, strict UTF-8 |
+| CSV / dataframe | `helpers.load_submission_or_fault` | component-safe immutable read, FIFO, oversize, schema, non-finite |
+| NumPy `.npz` / `.npy` | `helpers.load_submission_npz_or_fault` | component-safe immutable read, FIFO-hang, compressed/logical-size caps, and mandatory `allow_pickle=False` |
+| Custom file-like parser | `helpers.open_submission_file_or_fault(path)` | immutable bounded `BytesIO` captured through a component-safe descriptor walk |
+| Legacy pathname-only parser | `helpers.require_regular_file(path)` | framework compatibility only; task scorers remain validator-blocked and must add a shared format loader instead |
 | Python policy / model module | `helpers.run_policy` / `helpers.run_model_module` | RCE-as-root: runs in a non-root subprocess; **score comes from the return value, never stdout** |
-| Executable | `helpers.run_submitted_executable` | uid-drop + caps stdout and discards stderr so it cannot exhaust grader memory + converts an agent timeout / stdout-flood into an `AgentFault` (kept 0.0, not a discarded rollout). In `streaming=True` it also strips any `RUBRIC_SCORE=` line so the binary cannot forge a score on stdout; **capture mode returns raw stdout for you to parse — never relay it to the score parser** |
-| HDF5 | `helpers.load_submission_h5_or_fault` | rejects external links, soft links, virtual datasets, and cross-file datasets that map `/mcp_server` truth into a "dataset" |
+| Executable | `helpers.run_submitted_executable` | fresh best-effort IPC namespace + uid-drop + caps stdout and discards stderr so it cannot exhaust grader memory + converts an agent timeout / stdout-flood into an `AgentFault` (kept 0.0, not a discarded rollout). In `streaming=True` it also strips any `RUBRIC_SCORE=` line so the binary cannot forge a score on stdout; **capture mode returns raw stdout for you to parse — never relay it to the score parser** |
+| HDF5 | `helpers.load_submission_h5_or_fault` | immutable input snapshot plus dropped parser; rejects links/virtual datasets and caps dataset count, per-dataset bytes, and aggregate logical bytes. Whole-object H5AD handoff back to the root grader is disabled. |
 | K-fold CV of a model module | `score_kfold_cv` | cross-fold label leakage via memory (fresh worker per fold), IPC (`CLONE_NEWIPC`), and disk (per-fold pristine-snapshot rebuild) |
 | Submitted policy (hidden-env tasks) | `grading.load_submitted_policy` | uid-drop sandbox; result over a dedicated pipe (never stdout); `AgentFault` on missing / non-regular / oversized / load-crash |
 
@@ -111,7 +114,13 @@ every grade) closes the classic exploits with no author action:
   PID-hopper that leaks the answer key via `/proc/<pid>/root|fd`);
 - quiesces uid >= 1000 processes before grading (freezes the filesystem so a
   `while true; ln -sf <truth> submission.csv` cannot re-plant in the read
-  window);
+  window); confirmed respawning agent processes earn a kept `0.0`, while an
+  inability to inspect or terminate processes aborts as infrastructure failure;
+- repeats quiescence after grading before publishing traces/results, so
+  descendants spawned by submitted code cannot race post-grade root I/O;
+- gives every submitted policy or executable worker a fresh best-effort IPC
+  namespace, preventing persistent SysV shared memory, semaphore, and message
+  queue state from relaying rollout data into grading or between candidate runs;
 - scrubs escaping symlinks and non-regular files (FIFOs/sockets/devices) under
   the output dir (symlink-to-truth and FIFO-hang-to-discard defenses);
 - traps non-finite scores (`NaN`/`inf` cannot clamp up to `1.0`);
@@ -124,9 +133,10 @@ every grade) closes the classic exploits with no author action:
 > `/tmp/output/predictions.npz` — reopens the re-plant window: that uid-1000
 > process can re-create a symlink to the held-out truth AFTER the scrub. Only a
 > **load-time** guard closes it. Read the artifact with the sanctioned loader for
-> its type (which `lstat`s at the moment of load), or call
-> `helpers.require_regular_file(path)` first — never a raw `np.load` / `open`
-> behind a bare `try/except`.
+> its type, or parse the immutable file object yielded by
+> `helpers.open_submission_file_or_fault(path)`. Never rely on raw `np.load`,
+> `open`, `lstat`, or `O_NOFOLLOW`: `O_NOFOLLOW` protects only the leaf and still
+> follows a swapped `/tmp/output` or nested parent directory.
 
 See [`POLICY_ISOLATION.md`](POLICY_ISOLATION.md) for the sandbox details.
 
@@ -156,7 +166,7 @@ See [`POLICY_ISOLATION.md`](POLICY_ISOLATION.md) for the sandbox details.
   map "no attempt" to **0**: an empty submission may not exceed
   `[ground_truth].zero_anchor_epsilon` (default `0.01`; the tolerance only
   absorbs float/curve noise). Host-probed tasks are checked by the validator's
-  no-op probe; in-container / ML_Envs tasks are checked by the ground-truth
+  no-op probe; in-container tasks are checked by the ground-truth
   harness run, which grades an empty workspace in the task image and records
   the result as `ground_truth_result.trivial_baseline_score` in the build
   proof (required — the validator fails a continuous in-container task whose

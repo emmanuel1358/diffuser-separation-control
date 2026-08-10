@@ -1,0 +1,48 @@
+schema_version = "1.1"
+
+[task]
+name = "labelbox/ml-replace-me"
+description = "Replace with a one-line ML task description (continuous scoring)."
+
+[environment]
+# Pick exactly one Taiga-supported resource enum (copy it verbatim). The suffix
+# is the accelerator share, e.g. "+h100/2" = HALF an H100, "+h100/1" = a whole
+# one, "+tpuv5e1x1" = one v5e TPU chip. vCPU/GiB are the CPU+RAM share.
+#   TPU:  13vcpu+32gib+tpuv5e1x1 | 16vcpu+64gib+tpuv5e2x2 | 50vcpu+128gib+tpuv5e2x2
+#   H100: 24vcpu+200gib+h100/1 | 12vcpu+100gib+h100/2 | 6vcpu+50gib+h100/4 | 3vcpu+25gib+h100/8
+required_resources = "12vcpu+100gib+h100/2"
+storage_mb = 50000
+# LOCKED OFF: the sandbox runs offline and this is not author-controllable.
+# Validation hard-fails allow_internet = true. Fetch deps/data at build time
+# (environment/requirements.txt, environment/apt.txt, or the Dockerfile).
+allow_internet = false
+
+[agent]
+timeout_sec = 21600
+
+[verifier]
+# Taiga pins ml grading to its maximum (10800s) regardless of this value; this
+# knob only bounds the local in-image verifier subprocess.
+timeout_sec = 10800
+user = "root"
+env = []
+
+[difficulty]
+task_type = "ml"
+# domain enum scoped by task_type. Replace with a value from DOMAINS_BY_TASK_TYPE.
+domain = "scientific_discovery_computational_science"
+reward_type = "continuous_scoring_function"
+# license: permissive SPDX id, REQUIRED for ml tasks. Trace the dataset license
+# upstream. Use "self_generated" only when the task produces its own data.
+license = "MIT"
+# license_source: REQUIRED for ml tasks. The upstream-most http(s) URL where you
+# confirmed the license (not a HF/Kaggle mirror, which often misstate it).
+license_source = "https://REPLACE_ME-upstream-source-where-license-was-confirmed"
+
+[ground_truth]
+continuous_score_epsilon = 0.05
+
+[[outputs]]
+path = "/tmp/output/predictor.py"
+required = true
+description = "Queryable predictor module defining load_predictor()"

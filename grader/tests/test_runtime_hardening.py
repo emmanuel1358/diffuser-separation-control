@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import signal
 import stat
 from pathlib import Path
 
+import pytest
 from grading import runtime_hardening
 from grading.runtime_hardening import (
     _holds_nvidia_fd,
     classify_failure,
+    ensure_agent_output_directory,
     kill_nvproxy_fd_holders,
-    prepare_grader_cache,
     lock_down_grader_private,
     lock_down_public_readonly,
     pre_grade_cleanup,
+    prepare_grader_cache,
     scrub_escaping_symlinks,
     scrub_nonregular_files,
 )
@@ -67,6 +71,20 @@ def test_scrub_nonregular_files_removes_fifo(tmp_path: Path) -> None:
     assert not fifo.exists()
 
 
+def test_ensure_agent_output_directory_replaces_symlink(tmp_path: Path) -> None:
+    private = tmp_path / "private"
+    private.mkdir()
+    secret = private / "truth.csv"
+    secret.write_text("answer")
+    output = tmp_path / "output"
+    os.symlink(private, output)
+
+    assert ensure_agent_output_directory(output) is True
+    assert output.is_dir()
+    assert not output.is_symlink()
+    assert secret.read_text() == "answer"
+
+
 def test_pre_grade_cleanup_runs_scrubs(tmp_path: Path) -> None:
     output = tmp_path / "output"
     private = tmp_path / "private"
@@ -83,6 +101,155 @@ def test_pre_grade_cleanup_runs_scrubs(tmp_path: Path) -> None:
     assert result["killed_processes"] >= 0
 
 
+def test_filesystem_exhaustion_checks_blocks_and_inodes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    def statvfs(*, free_bytes: int, files: int, free_files: int):
+        size = 4096
+        return type(
+            "Fs",
+            (),
+            {
+                "f_bfree": free_bytes // size,
+                "f_frsize": size,
+                "f_files": files,
+                "f_ffree": free_files,
+            },
+        )()
+
+    monkeypatch.setattr(
+        runtime_hardening.os,
+        "statvfs",
+        lambda _path: statvfs(free_bytes=0, files=1000, free_files=1000),
+    )
+    assert runtime_hardening.filesystem_exhausted(tmp_path) is True
+
+    monkeypatch.setattr(
+        runtime_hardening.os,
+        "statvfs",
+        lambda _path: statvfs(free_bytes=10**9, files=1000, free_files=0),
+    )
+    assert runtime_hardening.filesystem_exhausted(tmp_path) is True
+
+
+def test_shared_memory_exhaustion_requires_pressure_and_high_shmem() -> None:
+    assert runtime_hardening.shared_memory_exhausted(
+        {"MemTotal": 16_000_000, "MemAvailable": 100_000, "Shmem": 15_000_000}
+    )
+    assert not runtime_hardening.shared_memory_exhausted(
+        {"MemTotal": 16_000_000, "MemAvailable": 2_000_000, "Shmem": 15_000_000}
+    )
+
+
+def test_exhaustion_without_an_exit_status_trusts_meminfo_alone() -> None:
+    """A timeout has no exit code to corroborate, so meminfo has to stand alone.
+
+    Boreal used to check only shared memory here and let a disk-full hang void
+    the episode as infrastructure, handing the agent a free retry for filling
+    the box. Both resources are charged now.
+    """
+    exhaustion = runtime_hardening.ResourceExhaustion(
+        disk=False, shmem=True, meminfo_kib={}
+    )
+    assert exhaustion.agent_fault_kind() == "shared_memory_exhausted"
+
+    disk = runtime_hardening.ResourceExhaustion(disk=True, shmem=False, meminfo_kib={})
+    assert disk.agent_fault_kind() == "disk_exhausted"
+
+
+def test_shmem_with_an_exit_status_needs_a_kill_or_a_pressure_marker() -> None:
+    """A grader may exit non-zero for reasons unrelated to a full box."""
+    exhaustion = runtime_hardening.ResourceExhaustion(
+        disk=False, shmem=True, meminfo_kib={}
+    )
+    assert exhaustion.agent_fault_kind(returncode=1, stderr="assertion failed") is None
+    assert (
+        exhaustion.agent_fault_kind(returncode=-signal.SIGKILL)
+        == "shared_memory_exhausted"
+    )
+    assert (
+        exhaustion.agent_fault_kind(returncode=1, stderr="Out of memory")
+        == "shared_memory_exhausted"
+    )
+
+
+def test_sampling_reads_the_box_before_cleanup_can_free_it(monkeypatch) -> None:
+    """The snapshot must capture state at call time, not at decision time.
+
+    pre_grade_cleanup reaps the agent's /dev/shm entries, so a verdict computed
+    after cleanup sees a healthy box and voids the episode instead of charging
+    the agent. Sampling into a value is what keeps the two apart.
+    """
+    live = {"Shmem": 15_000_000, "MemTotal": 16_000_000, "MemAvailable": 100_000}
+    monkeypatch.setattr(runtime_hardening, "meminfo_kib", lambda *a, **k: dict(live))
+    monkeypatch.setattr(
+        runtime_hardening, "filesystem_exhausted", lambda *a, **k: False
+    )
+
+    exhaustion = runtime_hardening.sample_resource_exhaustion()
+    live.update({"Shmem": 0, "MemAvailable": 15_000_000})  # cleanup frees it
+
+    assert exhaustion.shmem is True
+    assert exhaustion.agent_fault_kind() == "shared_memory_exhausted"
+
+
+def test_cleanup_agent_tmpfs_is_owner_scoped_and_bounded(tmp_path: Path) -> None:
+    root = tmp_path / "shm"
+    root.mkdir()
+    for index in range(10):
+        (root / f"entry-{index}").write_text("")
+
+    removed, flooded = runtime_hardening.cleanup_agent_tmpfs(
+        os.getuid(), roots=(root,), max_entries=3, max_seconds=0
+    )
+
+    assert flooded is True
+    assert removed < 10
+
+
+def test_protect_current_process_from_oom_is_best_effort(tmp_path: Path) -> None:
+    target = tmp_path / "oom_score_adj"
+    target.write_text("0")
+    runtime_hardening.protect_current_process_from_oom(str(target))
+    assert target.read_text() == "-1000"
+    runtime_hardening.protect_current_process_from_oom(
+        str(tmp_path / "missing" / "oom_score_adj")
+    )
+
+
+def test_quiesce_nonconvergence_fails_closed() -> None:
+    with pytest.raises(
+        runtime_hardening.AgentProcessQuiesceError,
+        match="did not converge",
+    ):
+        runtime_hardening.kill_pre_grade_agent_processes(max_passes=0)
+
+
+def test_quiesce_proc_enumeration_failure_fails_closed(monkeypatch) -> None:
+    def fail_listdir(_path: str):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(runtime_hardening.os, "listdir", fail_listdir)
+    with pytest.raises(
+        runtime_hardening.ProcessQuiesceError,
+        match="could not enumerate",
+    ):
+        runtime_hardening.kill_pre_grade_agent_processes(max_passes=1)
+
+
+def test_root_cleanup_without_proc_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    class MissingProc:
+        @staticmethod
+        def is_dir() -> bool:
+            return False
+
+    monkeypatch.setattr(runtime_hardening.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(runtime_hardening, "Path", lambda _path: MissingProc())
+
+    with pytest.raises(runtime_hardening.ProcessQuiesceError, match="unavailable"):
+        runtime_hardening.pre_grade_cleanup(tmp_path)
+
+
 def test_lock_down_grader_private_removes_group_other_bits(tmp_path: Path) -> None:
     private = tmp_path / "grader"
     private.mkdir()
@@ -95,6 +262,106 @@ def test_lock_down_grader_private_removes_group_other_bits(tmp_path: Path) -> No
 
     assert stat.S_IMODE(private.stat().st_mode) & 0o077 == 0
     assert stat.S_IMODE(secret.stat().st_mode) & 0o077 == 0
+
+
+def test_lock_down_grader_private_rejects_symlink(tmp_path: Path) -> None:
+    private = tmp_path / "grader"
+    private.mkdir()
+    secret = tmp_path / "secret"
+    secret.write_text("truth")
+    os.symlink(secret, private / "redirect")
+
+    with pytest.raises(
+        runtime_hardening.InfrastructureFault,
+        match="contains symlink",
+    ):
+        lock_down_grader_private((private,))
+
+
+def test_lock_down_grader_private_allows_optional_missing_path(
+    tmp_path: Path,
+) -> None:
+    lock_down_grader_private(
+        (tmp_path / "optional",),
+        missing_ok=True,
+    )
+
+
+def _simulate_readonly_mount(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Make `root` look and behave like a read-only bind mount."""
+
+    def readonly(path, *_args, **_kwargs):  # noqa: ANN001 - os shim
+        raise OSError(errno.EROFS, "Read-only file system", str(path))
+
+    class _Statvfs:
+        f_flag = os.ST_RDONLY
+
+    monkeypatch.setattr(runtime_hardening.os, "chmod", readonly)
+    monkeypatch.setattr(runtime_hardening.os, "chown", readonly)
+    monkeypatch.setattr(
+        runtime_hardening.os,
+        "statvfs",
+        lambda path: _Statvfs() if str(path) == str(root) else os.statvfs(path),
+    )
+
+
+def test_lock_down_grader_private_tolerates_readonly_code_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    grader = tmp_path / "grader"
+    grader.mkdir()
+    (grader / "compute_score.py").write_text("x = 1\n")
+    os.chmod(grader / "compute_score.py", 0o644)
+    _simulate_readonly_mount(monkeypatch, grader)
+
+    lock_down_grader_private((grader,), readonly_mount_ok=(grader,))
+
+
+def test_lock_down_grader_private_tolerates_readonly_held_out_data_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Held-out truth delivered as a Taiga is_read_only squashfs mount is
+    # genuinely read-only on firecracker (the CPU-QA lane), so the ownership
+    # reset fails with EROFS. When the caller whitelists the path AND the
+    # filesystem really is read-only, that degrades to a warning rather than a
+    # fatal fault -- the read-only mount is tamper-proof by construction.
+    private = tmp_path / "data"
+    private.mkdir()
+    (private / "truth.json").write_text("{}\n")
+    os.chmod(private / "truth.json", 0o644)
+    _simulate_readonly_mount(monkeypatch, private)
+
+    lock_down_grader_private((private,), readonly_mount_ok=(private,))
+
+
+def test_lock_down_grader_private_still_fails_on_writable_held_out_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The relaxation is gated on the filesystem really being read-only. A
+    # whitelisted path whose chmod/chown fails on a WRITABLE filesystem is the
+    # real tamper case and must still fail hard, even when whitelisted.
+    private = tmp_path / "data"
+    private.mkdir()
+    (private / "truth.json").write_text("{}\n")
+    os.chmod(private / "truth.json", 0o644)
+
+    def readonly(path, *_args, **_kwargs):  # noqa: ANN001 - os shim
+        raise OSError(errno.EROFS, "Read-only file system", str(path))
+
+    class _WritableStatvfs:
+        f_flag = 0
+
+    monkeypatch.setattr(runtime_hardening.os, "chmod", readonly)
+    monkeypatch.setattr(runtime_hardening.os, "chown", readonly)
+    monkeypatch.setattr(
+        runtime_hardening.os, "statvfs", lambda _path: _WritableStatvfs()
+    )
+
+    with pytest.raises(runtime_hardening.InfrastructureFault):
+        lock_down_grader_private((private,), readonly_mount_ok=(private,))
 
 
 def test_lock_down_public_readonly_preserves_agent_reads(tmp_path: Path) -> None:

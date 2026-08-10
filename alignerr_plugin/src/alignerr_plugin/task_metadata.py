@@ -11,7 +11,13 @@ from typing import Any
 # verify provenance rather than trust a self-declared SPDX id.
 _LICENSE_SOURCE_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
-TASK_TYPES: tuple[str, ...] = ("ml", "mujoco", "cfd", "structures")
+TASK_TYPES: tuple[str, ...] = (
+    "ml",
+    "mujoco",
+    "cfd",
+    "structures",
+    "software_engineering",
+)
 REWARD_TYPES: tuple[str, ...] = (
     "continuous_scoring_function",
     "multi_deterministic_rubrics",
@@ -20,9 +26,9 @@ REWARD_TYPES: tuple[str, ...] = (
 # works. Copyleft / share-alike / non-commercial / research-only licenses are
 # intentionally excluded: a task built on such data cannot ship in a commercial
 # delivery, and a frontier LLM cannot reliably adjudicate that. Required for
-# `ml` tasks, which routinely ship external datasets; mujoco/cfd/structures use
-# solver-generated or self-authored data. SPDX identifiers; matched
-# case-insensitively (see ``validate_license``).
+# `ml` tasks, which routinely ship external datasets. Other task types either
+# use generated data or document source licensing outside this dataset-specific
+# gate. SPDX identifiers; matched case-insensitively (see ``validate_license``).
 LICENSES: tuple[str, ...] = (
     "MIT",
     "Apache-2.0",
@@ -189,6 +195,23 @@ DOMAINS_BY_TASK_TYPE: dict[str, tuple[str, ...]] = {
         "support_member_repair",
         "mass_compliance_optimization",
     ),
+    "software_engineering": (
+        "legacy_modernization",
+        "behavioral_compatibility",
+        "runtime_migration",
+        "schema_evolution",
+        "build_system_migration",
+        "framework_migration",
+        "compiler_toolchain_migration",
+        "concurrency_reliability",
+        "distributed_protocol_evolution",
+        "repo_debugging",
+        "feature_implementation",
+        "performance_optimization",
+        "frontend_ui",
+        "data_database_systems",
+        "security_hardening",
+    ),
 }
 
 CONTINUOUS_GROUND_TRUTH_TARGET = 0.5
@@ -224,8 +247,10 @@ def validate_task_type(value: object) -> list[str]:
         return ["task.toml [difficulty].task_type is required"]
     if task_type not in TASK_TYPES:
         return [
-            "task.toml [difficulty].task_type must be one of "
-            f"{list(TASK_TYPES)}; got {task_type!r}"
+            (
+                "task.toml [difficulty].task_type must be one of "
+                f"{list(TASK_TYPES)}; got {task_type!r}"
+            )
         ]
     return []
 
@@ -236,8 +261,10 @@ def validate_reward_type(value: object) -> list[str]:
         return ["task.toml [difficulty].reward_type is required"]
     if reward_type not in REWARD_TYPES:
         return [
-            "task.toml [difficulty].reward_type must be one of "
-            f"{list(REWARD_TYPES)}; got {reward_type!r}"
+            (
+                "task.toml [difficulty].reward_type must be one of "
+                f"{list(REWARD_TYPES)}; got {reward_type!r}"
+            )
         ]
     return []
 
@@ -252,8 +279,10 @@ def validate_domain(task_type_value: object, domain_value: object) -> list[str]:
     valid = DOMAINS_BY_TASK_TYPE[task_type]
     if domain not in valid:
         return [
-            "task.toml [difficulty].domain must be one of "
-            f"{list(valid)} for task_type {task_type!r}; got {domain!r}"
+            (
+                "task.toml [difficulty].domain must be one of "
+                f"{list(valid)} for task_type {task_type!r}; got {domain!r}"
+            )
         ]
     return []
 
@@ -291,18 +320,22 @@ def validate_license(
     if not license_id:
         if task_type in LICENSE_REQUIRED_TASK_TYPES:
             return [
-                "task.toml [difficulty].license is required when task_type is "
-                f"{task_type!r}; must be one of {list(LICENSES)} (or "
-                f"{LICENSE_SELF_GENERATED!r} for data the task generates itself)"
+                (
+                    "task.toml [difficulty].license is required when task_type is "
+                    f"{task_type!r}; must be one of {list(LICENSES)} (or "
+                    f"{LICENSE_SELF_GENERATED!r} for data the task generates itself)"
+                )
             ]
         return []
     allowed = {normalize_enum_value(value) for value in LICENSES}
     allowed |= _SELF_GENERATED_VALUES
     if license_id not in allowed:
         return [
-            "task.toml [difficulty].license must be a permissive license, one of "
-            f"{list(LICENSES)} (or {LICENSE_SELF_GENERATED!r} for self-generated "
-            f"data); got {license_value!r}"
+            (
+                "task.toml [difficulty].license must be a permissive license, one of "
+                f"{list(LICENSES)} (or {LICENSE_SELF_GENERATED!r} for self-generated "
+                f"data); got {license_value!r}"
+            )
         ]
 
     # Provenance pointer: only required for license-bearing task types (ml). This
@@ -315,20 +348,28 @@ def validate_license(
     if not source:
         if is_self_generated:
             return [
-                "task.toml [difficulty].license_source is required when license is "
-                f"{LICENSE_SELF_GENERATED!r}: briefly state how the task generates "
-                "its own data (e.g. synthetic data produced by solution/generate.py)."
+                (
+                    "task.toml [difficulty].license_source is required when license is "
+                    f"{LICENSE_SELF_GENERATED!r}: briefly state how the task generates "
+                    "its own data (e.g. synthetic data produced by "
+                    "solution/generate.py)."
+                )
             ]
         return [
-            "task.toml [difficulty].license_source is required for ml tasks: the "
-            "upstream http(s) URL where the dataset license was confirmed, so a "
-            "reviewer can verify provenance (the self-declared license is not "
-            "sufficient on its own)."
+            (
+                "task.toml [difficulty].license_source is required for ml tasks: the "
+                "upstream http(s) URL where the dataset license was confirmed, so a "
+                "reviewer can verify provenance (the self-declared license is not "
+                "sufficient on its own)."
+            )
         ]
     if not is_self_generated and not _LICENSE_SOURCE_URL_RE.match(source):
         return [
-            "task.toml [difficulty].license_source must be the upstream http(s) URL "
-            f"where the license was confirmed; got {license_source_value!r}"
+            (
+                "task.toml [difficulty].license_source must be the upstream http(s) "
+                "URL where the license was confirmed; got "
+                f"{license_source_value!r}"
+            )
         ]
     return []
 

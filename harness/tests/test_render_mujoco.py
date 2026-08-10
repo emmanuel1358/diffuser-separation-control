@@ -5,12 +5,20 @@ from pathlib import Path
 import mujoco
 import numpy as np
 import pytest
-
+from lbx_rl_tasks_harness import render_mujoco
 from lbx_rl_tasks_harness.render_mujoco import (
     apply_action,
     build_observation,
     load_policy,
 )
+
+
+def test_resolve_ffmpeg_falls_back_to_bundled_binary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(render_mujoco.shutil, "which", lambda _name: None)
+
+    assert Path(render_mujoco._resolve_ffmpeg()).is_file()
 
 
 def _model() -> mujoco.MjModel:

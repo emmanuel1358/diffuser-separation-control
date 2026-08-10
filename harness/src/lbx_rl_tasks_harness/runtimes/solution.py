@@ -102,7 +102,11 @@ def run_solution_in_container(
     reward.json back to the host. Returns the oracle score.
     """
     # Imported here to avoid a hard docker dependency for host-only runtimes.
-    from lbx_rl_tasks_harness.docker import build_task_image
+    from lbx_rl_tasks_harness.docker import (
+        build_task_image,
+        docker_capability_args,
+        verifier_container_capabilities,
+    )
 
     if problem.source_problem_dir is None:
         raise ValueError(
@@ -151,6 +155,7 @@ cp -a /tmp/verifier/. /host_out/verifier/
             "--rm",
             "--platform",
             TAIGA_PLATFORM,
+            *docker_capability_args(verifier_container_capabilities(problem)),
             "-v",
             f"{src}:/host_task:ro",
             "-v",

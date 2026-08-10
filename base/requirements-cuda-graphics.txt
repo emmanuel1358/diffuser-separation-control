@@ -13,8 +13,32 @@
 # CUDA -devel image and ninja). fvcore + iopath are pytorch3d build/runtime deps
 # and DO live on PyPI.
 trimesh
-pyrender
+# pyrender is intentionally NOT installed. Every pyrender release hard-pins
+# pyopengl==3.1.0, but mujoco==3.8.0 (requirements-common.txt) hard-pins
+# pyopengl==3.1.7 -- a mutually exclusive exact-pin conflict. uv then walks to
+# ancient pyrender (0.1.4-0.1.34), which pin an exact PRE-RELEASE pyglet
+# (==1.4.0a1/b1) that uv refuses without --prerelease=allow, so the whole
+# cuda-graphics resolve dead-ends. pyrender is also a GL rasterizer, and the
+# header above documents that hardware GL/EGL is not deployable on Taiga's
+# gVisor+nvproxy nodes; nvdiffrast/pytorch3d (CUDA-native) is the only working
+# render path here, so pyrender was dead weight regardless.
 imageio
 imageio-ffmpeg
 fvcore
 iopath
+# 3D / neural-rendering stack for graphics ML tasks. The PyG binaries are NOT
+# here: they resolve from their own per-(torch, CUDA) wheel index and are
+# installed with -f in base/cuda-graphics/Dockerfile.
+#
+# open3d and kaolin are intentionally absent. open3d's latest release (0.19.0)
+# ships cp38-cp312 only, and kaolin publishes neither a cu130 index (newest is
+# torch-2.8.0_cu128) nor any cp313 wheel -- both are unsatisfiable on this
+# base's CUDA 13 / Python 3.13 matrix, and neither is imported by any task in
+# this repo. Re-add only once upstream ships cp313 for this CUDA.
+point-cloud-utils
+kornia
+warp-lang
+gsplat
+nerfacc
+av
+mujoco

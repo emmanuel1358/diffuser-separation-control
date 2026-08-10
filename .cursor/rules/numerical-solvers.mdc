@@ -1,5 +1,5 @@
 ---
-description: Authoring numerical-solver (CFD/structures/circuits/EM/reacting/EDA) RL tasks
+description: Authoring deterministic CFD and structures numerical-solver RL tasks
 globs: "{problems,examples}/**/*"
 alwaysApply: false
 ---
@@ -11,11 +11,11 @@ the deterministic-scoring contract. See `docs/NUMERICAL_SOLVERS.md` (full
 inventory) and `project_guidelines/cfd/cfd_environments.md` (CFD/AVL+OpenFOAM guide).
 Worked reference: `examples/openfoam-hydrofoil-flap`.
 
-- Set `[difficulty].task_type` to the solver domain: `cfd`, `structures`,
-  `circuits`, `electromagnetics`, `reacting-flow`, or `eda` (NOT `ml` — these are
-  usually deterministic `RubricTask` rubrics, not continuous ML metrics).
-  Optionally set `[difficulty].domain` to a finer free-form field
-  (e.g. `aerodynamics`, `topology-optimization`, `analog-filter`).
+- Set `[difficulty].task_type` only to `cfd` or `structures`; installed circuit,
+  EM, reacting-flow, or EDA libraries do not create additional task types.
+- Set `[difficulty].domain` to a scoped enum from
+  `alignerr_plugin.task_metadata` (for example `aerodynamics`,
+  `topology_optimization`, or `finite_element_model_repair`).
 - In-base, import directly in `scorer/compute_score.py`: `aerosandbox`, `PySpice`
   (ngspice), `skfem`, `Pynite`, `anastruct`, `skrf`, `cantera`, `CoolProp`,
   `klayout`, `openseespy`.

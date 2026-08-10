@@ -81,7 +81,7 @@ def test_derive_names_full_repo_clean_sha_name():
     res = phr.normalize_resource("org/name")
     sha = "a" * 40
     n = phr.derive_names(res, sha)
-    assert n["mount_local_path"] == "/tmp/.cache/huggingface/hub/models--org--name"
+    assert n["mount_local_path"] == "/tmp/hf-cache/hub/models--org--name"
     assert n["remote_dir"] == "cache/huggingface/models--org--name"
     assert n["remote_basename"] == f"{sha}.squashfs"
     assert n["remote_name"].endswith(f"models--org--name/{sha}.squashfs")
@@ -134,29 +134,44 @@ def test_resolve_sha_pinned_is_offline():
     assert out["remote_name"].endswith("/" + "c" * 40 + ".squashfs")
 
 
+def _write_task_toml(task_dir: Path, preloaded: str) -> None:
+    (task_dir / "task.toml").write_text(
+        "[task]\nname = 'labelbox/hf-fixture'\n\n"
+        "[environment]\nrequired_resources = '4vcpu+16gib'\n\n" + preloaded
+    )
+
+
 def test_load_resources_rejects_duplicate_repo():
     with tempfile.TemporaryDirectory() as d:
-        mp = Path(d) / "metadata.json"
-        mp.write_text(
-            json.dumps(
-                {"hf_resources": ["org/name", {"repo_id": "org/name", "allow_patterns": ["*.json"]}]}
-            )
+        task_dir = Path(d)
+        _write_task_toml(
+            task_dir,
+            "[[preloaded_files]]\nhf_repo = 'org/name'\n\n"
+            "[[preloaded_files]]\nhf_repo = 'org/name'\n"
+            "allow_patterns = ['*.json']\n",
         )
         with pytest.raises(SystemExit):
-            phr._load_resources_from_metadata(mp)
+            phr._load_resources_from_task_dir(task_dir)
 
 
 def test_load_resources_allows_same_name_different_type():
     with tempfile.TemporaryDirectory() as d:
-        mp = Path(d) / "metadata.json"
-        mp.write_text(
-            json.dumps(
-                {
-                    "hf_resources": [
-                        {"repo_id": "org/name", "repo_type": "model"},
-                        {"repo_id": "org/name", "repo_type": "dataset"},
-                    ]
-                }
-            )
+        task_dir = Path(d)
+        _write_task_toml(
+            task_dir,
+            "[[preloaded_files]]\nhf_repo = 'org/name'\nrepo_type = 'model'\n\n"
+            "[[preloaded_files]]\nhf_repo = 'org/name'\nrepo_type = 'dataset'\n",
         )
-        assert len(phr._load_resources_from_metadata(mp)) == 2
+        assert len(phr._load_resources_from_task_dir(task_dir)) == 2
+
+
+def test_load_resources_skips_non_hf_mounts():
+    with tempfile.TemporaryDirectory() as d:
+        task_dir = Path(d)
+        _write_task_toml(
+            task_dir,
+            "[[preloaded_files]]\nsource = 'data'\nmount_path = '/data'\n\n"
+            "[[preloaded_files]]\nhf_repo = 'org/name'\n",
+        )
+        resources = phr._load_resources_from_task_dir(task_dir)
+        assert [r["repo_id"] for r in resources] == ["org/name"]

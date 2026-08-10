@@ -17,7 +17,6 @@ from grading.evaluation.result import (
     write_private_trace,
 )
 from grading.faults import AgentFault
-from grading.helpers import require_regular_file
 from grading.policy_runner import PolicyWorkerError, load_submitted_policy
 
 POLICY_CHALLENGE_PROTOCOL = "paired-policy-challenge.v1"
@@ -133,7 +132,7 @@ class PolicyEvaluationTask:
     ) -> dict[str, Any]:
         if not controls:
             raise RuntimeError("policy challenge requires at least one trusted control")
-        artifact = require_regular_file(workspace / self.policy_path)
+        artifact = workspace / self.policy_path
         try:
             committed_digest = workspace_artifact_digest(workspace)
         except (OSError, ValueError) as exc:

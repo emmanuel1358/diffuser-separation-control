@@ -1,0 +1,32 @@
+# Code owners for shared infrastructure.
+#
+# Everything listed here is a `shared_paths` entry in the mothership's
+# sync-shared-from-template.yml: a change made in this repo is copied verbatim
+# into lbx-rl-tasks-iso-mothership and from there into the production images and
+# the trusted-CI gate. A task author changing one of these paths changes every
+# other task's environment or grading, which is exactly what the declared
+# dependency-channel contract exists to prevent -- so these need a review from
+# someone who owns that blast radius.
+#
+# Deliberately NOT owned: task starters, examples, docs, and problems/. Those
+# are the authoring surface and must stay fast to iterate on.
+#
+# @Alignerr-Code-Labeling/fde holds `admin` on both this repo and the
+# mothership, so it can review a template change and the mothership sync that
+# carries it into production.
+
+# Shared base images. Task dependencies belong in the task's own dependency
+# channels (docs/AUTHORING.md#task-dependencies), never here.
+/base/                                              @Alignerr-Code-Labeling/fde
+
+# The authoring gate itself, and what gets exported to Taiga / Boreal / Harbor.
+/alignerr_plugin/src/alignerr_plugin/validators/    @Alignerr-Code-Labeling/fde
+/alignerr_plugin/src/alignerr_plugin/exporters/     @Alignerr-Code-Labeling/fde
+
+# The grading library every scorer imports, plus the in-image rubric/env server.
+/grader/src/                                        @Alignerr-Code-Labeling/fde
+/taiga_runtime/rubric/                              @Alignerr-Code-Labeling/fde
+
+# Dispatch into trusted CI in the mothership.
+/.github/workflows/                                 @Alignerr-Code-Labeling/fde
+/.github/CODEOWNERS                                 @Alignerr-Code-Labeling/fde

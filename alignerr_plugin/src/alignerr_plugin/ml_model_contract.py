@@ -1,11 +1,12 @@
-"""Hard contract for continuous ML committed models + training provenance.
+"""Hard contract for continuous ML committed calibration strategies.
 
-Trusted CI / ground-truth / validate must never train. Authors commit:
+Trusted CI / ground-truth / validate must never train. Existing trained models
+keep the v1 model manifest. Procedural training and hand-authored policies use
+an explicit strategy manifest so they do not invent tabular training data.
 
-* a training entrypoint (provenance / reproducibility only)
-* trained model artifact(s)
-* ``model.manifest.json`` with digests
-* an inference-only ``solution.py`` / ``solve.sh``
+Every strategy commits digest-bound artifacts and an inference-only
+``solution.py`` / ``solve.sh``. Trained strategies additionally bind training
+inputs, code, and seed.
 
 This module is the shared source of truth for both ``lbx-rl-template validate``
 and harness ground-truth / calibration.
@@ -17,11 +18,14 @@ import ast
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 MODEL_MANIFEST_FILENAME = "model.manifest.json"
+STRATEGY_MANIFEST_FILENAME = "strategy.manifest.json"
+STRATEGY_KINDS = frozenset({"trained_model", "committed_artifact"})
 FORBIDDEN_GENERATED_SCORE_FILES = frozenset({"results.txt"})
 # Allowed as an additive Tier-B static artifact alongside the model contract;
 # never a substitute for train.py / model weights / manifest.
@@ -121,14 +125,6 @@ _SHELL_TRAIN_RE = re.compile(r"""(?ix)
     )
     (?:\s|["']|$)
     """)
-_SHELL_MODEL_REF_RE = re.compile(r"""(?ix)
-    (?:model\.manifest\.json|
-       \bmodel\.(?:json|pt|pth|pkl|joblib|bin|safetensors|onnx|h5|hdf5|ckpt|weights)\b|
-       \bweights?\b|
-       \bcheckpoint\b|
-       \bshutil\.copy|
-       \bcp\s+)
-    """)
 
 
 @dataclass(frozen=True)
@@ -138,9 +134,12 @@ class StrategyContract:
     role: str
     strategy_dir: Path
     manifest: dict[str, Any]
-    training_entrypoint: str
+    kind: str
+    manifest_filename: str
+    training_entrypoint: str | None
     inference_entrypoint: str
     artifact_paths: tuple[str, ...]
+    training_input_paths: tuple[str, ...]
 
 
 def file_sha256(path: Path) -> str:
@@ -156,6 +155,58 @@ def _strategy_relative(path_raw: str, *, field: str, role: str) -> Path:
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError(f"{role} model manifest {field} must be strategy-relative")
     return relative
+
+
+def _task_root(strategy_dir: Path, *, role: str) -> Path:
+    task_root = next(
+        (
+            parent
+            for parent in (strategy_dir, *strategy_dir.parents)
+            if (parent / "metadata.json").is_file() or (parent / "task.toml").is_file()
+        ),
+        None,
+    )
+    if task_root is None:
+        raise ValueError(f"could not resolve task root for {role} strategy manifest")
+    return task_root
+
+
+def _validate_digest_bound_file(
+    strategy_dir: Path,
+    task_root: Path,
+    entry: Any,
+    *,
+    role: str,
+    label: str,
+    allow_task_relative: bool = False,
+) -> str:
+    if not isinstance(entry, dict):
+        raise ValueError(f"{role} strategy manifest {label} entries must be objects")
+    raw_path = entry.get("path")
+    expected = entry.get("sha256")
+    if not isinstance(raw_path, str) or not isinstance(expected, str):
+        raise ValueError(f"{role} strategy manifest {label} needs path and sha256")
+    relative = Path(raw_path)
+    if relative.is_absolute() or (not allow_task_relative and ".." in relative.parts):
+        scope = "task-confined" if allow_task_relative else "strategy-relative"
+        raise ValueError(f"{role} strategy manifest {label} path must be {scope}")
+    base = task_root if allow_task_relative else strategy_dir
+    resolved = (base / relative).resolve()
+    try:
+        resolved.relative_to(task_root.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"{role} strategy {label} escapes the task root: {raw_path}"
+        ) from exc
+    if not resolved.is_file():
+        raise ValueError(f"{role} strategy {label} is missing: {raw_path}")
+    actual = file_sha256(resolved)
+    if actual != expected:
+        raise ValueError(
+            f"{role} strategy {label} digest mismatch for {raw_path}: "
+            f"expected {expected}, got {actual}"
+        )
+    return raw_path
 
 
 def validate_committed_model_manifest(
@@ -250,6 +301,134 @@ def validate_committed_model_manifest(
     return manifest
 
 
+def validate_committed_strategy_manifest(
+    strategy_dir: Path, *, role: str
+) -> dict[str, Any]:
+    """Validate a committed non-tabular or procedural calibration strategy.
+
+    Unlike ``model.manifest.json``, this contract does not pretend every policy
+    or static baseline was trained from one tabular file. The explicit ``kind``
+    controls whether training provenance is required.
+    """
+
+    manifest_path = strategy_dir / STRATEGY_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise ValueError(
+            f"{role} strategy is missing {STRATEGY_MANIFEST_FILENAME}: "
+            f"{strategy_dir}"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {role} strategy manifest: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != "1.0":
+        raise ValueError(f"{role} strategy manifest must use schema_version '1.0'")
+    if manifest.get("role") != role:
+        raise ValueError(
+            f"{role} strategy manifest role must be {role!r}, "
+            f"got {manifest.get('role')!r}"
+        )
+    kind = manifest.get("kind")
+    if kind not in STRATEGY_KINDS:
+        raise ValueError(
+            f"{role} strategy manifest kind must be one of "
+            f"{sorted(STRATEGY_KINDS)}, got {kind!r}"
+        )
+
+    inference_raw = manifest.get("inference_entrypoint")
+    if not isinstance(inference_raw, str) or not inference_raw:
+        raise ValueError(f"{role} strategy manifest is missing inference_entrypoint")
+    inference_rel = _strategy_relative(
+        inference_raw, field="inference_entrypoint", role=role
+    )
+    if not (strategy_dir / inference_rel).is_file():
+        raise ValueError(
+            f"{role} strategy manifest inference_entrypoint does not exist: "
+            f"{inference_raw}"
+        )
+
+    task_root = _task_root(strategy_dir, role=role)
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValueError(f"{role} strategy manifest must declare artifacts")
+    artifact_paths = [
+        _validate_digest_bound_file(
+            strategy_dir,
+            task_root,
+            entry,
+            role=role,
+            label="artifact",
+        )
+        for entry in artifacts
+    ]
+    if len(artifact_paths) != len(set(artifact_paths)):
+        raise ValueError(f"{role} strategy manifest artifact paths must be unique")
+
+    if kind == "trained_model":
+        training_raw = manifest.get("training_entrypoint")
+        if not isinstance(training_raw, str) or not training_raw:
+            raise ValueError(f"{role} trained strategy is missing training_entrypoint")
+        training_rel = _strategy_relative(
+            training_raw, field="training_entrypoint", role=role
+        )
+        if not (strategy_dir / training_rel).is_file():
+            raise ValueError(
+                f"{role} strategy manifest training_entrypoint does not exist: "
+                f"{training_raw}"
+            )
+        if training_rel == inference_rel:
+            raise ValueError(
+                f"{role} training_entrypoint and inference_entrypoint must be "
+                "distinct; Trusted CI / ground-truth must never train"
+            )
+        if not isinstance(manifest.get("seed"), int):
+            raise ValueError(f"{role} trained strategy seed must be an integer")
+        training_inputs = manifest.get("training_inputs")
+        if not isinstance(training_inputs, list) or not training_inputs:
+            raise ValueError(
+                f"{role} trained strategy must declare digest-bound training_inputs"
+            )
+        input_paths = [
+            _validate_digest_bound_file(
+                strategy_dir,
+                task_root,
+                entry,
+                role=role,
+                label="training input",
+                allow_task_relative=True,
+            )
+            for entry in training_inputs
+        ]
+        if len(input_paths) != len(set(input_paths)):
+            raise ValueError(
+                f"{role} strategy manifest training input paths must be unique"
+            )
+    else:
+        forbidden = sorted(
+            key
+            for key in ("training_entrypoint", "training_inputs", "seed")
+            if key in manifest
+        )
+        if forbidden:
+            raise ValueError(
+                f"{role} committed_artifact strategy must not declare training "
+                f"fields: {forbidden}"
+            )
+
+    return manifest
+
+
+def _normalized_model_strategy_manifest(
+    strategy_dir: Path, *, role: str
+) -> dict[str, Any]:
+    manifest = validate_committed_model_manifest(strategy_dir, role=role)
+    return {
+        **manifest,
+        "kind": "trained_model",
+        "training_inputs": [dict(manifest["public_training_data"])],
+    }
+
+
 def _call_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -337,8 +516,9 @@ def _python_inference_only_issues(
     *,
     role: str,
     inference_rel: str,
-    training_rel: str,
+    training_rel: str | None,
     artifact_paths: tuple[str, ...],
+    manifest_filename: str,
 ) -> list[str]:
     issues: list[str] = []
     try:
@@ -346,8 +526,8 @@ def _python_inference_only_issues(
     except SyntaxError as exc:
         return [f"{role} inference entrypoint {inference_rel} has syntax error: {exc}"]
 
-    training_stem = Path(training_rel).stem
-    training_name = Path(training_rel).name
+    training_stem = Path(training_rel).stem if training_rel else ""
+    training_name = Path(training_rel).name if training_rel else ""
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
             modules: list[str] = []
@@ -357,8 +537,9 @@ def _python_inference_only_issues(
                 modules = [node.module]
             for module in modules:
                 leaf = module.rsplit(".", 1)[-1]
-                if leaf in {training_stem, training_name} or module.endswith(
-                    f".{training_stem}"
+                if training_rel and (
+                    leaf in {training_stem, training_name}
+                    or module.endswith(f".{training_stem}")
                 ):
                     issues.append(
                         f"{role} inference entrypoint {inference_rel} must not import "
@@ -384,12 +565,16 @@ def _python_inference_only_issues(
                 "committed weights and run inference"
             )
         literals = _string_literals(node)
-        if any(
-            _literal_names_training_entrypoint(
-                lit, training_rel=training_rel, training_name=training_name
+        if (
+            training_rel
+            and any(
+                _literal_names_training_entrypoint(
+                    lit, training_rel=training_rel, training_name=training_name
+                )
+                for lit in literals
             )
-            for lit in literals
-        ) and attr in {"system", "run", "Popen", "check_call", "check_output", "call"}:
+            and attr in {"system", "run", "Popen", "check_call", "check_output", "call"}
+        ):
             issues.append(
                 f"{role} inference entrypoint {inference_rel} must not shell out to "
                 f"training entrypoint {training_rel}"
@@ -405,15 +590,15 @@ def _python_inference_only_issues(
                             continue
                         issues.append(
                             f"{role} inference entrypoint {inference_rel} must not "
-                            f"overwrite committed model artifact {artifact}; train "
-                            f"via {training_rel} and commit weights"
+                            f"overwrite committed strategy artifact {artifact}; "
+                            "package committed bytes without modifying them"
                         )
 
-    required_names = (MODEL_MANIFEST_FILENAME, *artifact_paths)
+    required_names = (manifest_filename, *artifact_paths)
     if not _path_mentions(required_names, text=source, tree=tree):
         issues.append(
             f"{role} inference entrypoint {inference_rel} must load "
-            f"{MODEL_MANIFEST_FILENAME} or a declared model artifact "
+            f"{manifest_filename} or a declared strategy artifact "
             f"({', '.join(artifact_paths)}); inference-only packaging required"
         )
     else:
@@ -451,7 +636,7 @@ def _python_inference_only_issues(
         ):
             issues.append(
                 f"{role} inference entrypoint {inference_rel} must copy/load committed "
-                "model bytes (e.g. shutil.copy2 / torch.load / json.loads); "
+                "strategy bytes (e.g. shutil.copy2 / torch.load / json.loads); "
                 "unrecognized inference packaging fails closed"
             )
     return issues
@@ -462,30 +647,32 @@ def _shell_inference_only_issues(
     *,
     role: str,
     inference_rel: str,
-    training_rel: str,
+    training_rel: str | None,
     artifact_paths: tuple[str, ...],
+    manifest_filename: str,
 ) -> list[str]:
     issues: list[str] = []
-    training_name = Path(training_rel).name
+    training_name = Path(training_rel).name if training_rel else ""
     # Strip shell comments so prose about train.py cannot false-positive.
     code_only = "\n".join(line.split("#", 1)[0] for line in source.splitlines())
     for match in _SHELL_TRAIN_RE.finditer(code_only):
         name = match.group("name") or match.group("name2") or ""
-        if Path(name).name == training_name:
-            issues.append(
-                f"{role} inference entrypoint {inference_rel} must not invoke "
-                f"training entrypoint {training_rel}"
-            )
-            break
-    required = (MODEL_MANIFEST_FILENAME, *artifact_paths)
-    if not (
-        _SHELL_MODEL_REF_RE.search(source)
-        or any(name in source for name in required)
-        or any(Path(name).name in source for name in artifact_paths)
+        described = (
+            f"training entrypoint {training_rel}"
+            if training_rel and Path(name).name == training_name
+            else f"training script {name}"
+        )
+        issues.append(
+            f"{role} inference entrypoint {inference_rel} must not invoke {described}"
+        )
+        break
+    required = (manifest_filename, *artifact_paths)
+    if not any(name in source for name in required) and not any(
+        Path(name).name in source for name in artifact_paths
     ):
         issues.append(
             f"{role} inference entrypoint {inference_rel} must reference "
-            f"{MODEL_MANIFEST_FILENAME} or a declared model artifact "
+            f"{manifest_filename} or a declared strategy artifact "
             f"({', '.join(artifact_paths)})"
         )
     return issues
@@ -496,9 +683,11 @@ def inference_only_issues(
     *,
     role: str,
     manifest: dict[str, Any],
+    manifest_filename: str = MODEL_MANIFEST_FILENAME,
 ) -> list[str]:
     """Static checks that the inference entrypoint does not train."""
-    training_rel = str(manifest["training_entrypoint"])
+    training_value = manifest.get("training_entrypoint")
+    training_rel = str(training_value) if isinstance(training_value, str) else None
     inference_rel = str(manifest["inference_entrypoint"])
     artifacts = tuple(
         str(entry["path"])
@@ -518,6 +707,7 @@ def inference_only_issues(
             inference_rel=inference_rel,
             training_rel=training_rel,
             artifact_paths=artifacts,
+            manifest_filename=manifest_filename,
         )
     if inference_path.suffix in {".sh", ".bash"}:
         return _shell_inference_only_issues(
@@ -526,12 +716,13 @@ def inference_only_issues(
             inference_rel=inference_rel,
             training_rel=training_rel,
             artifact_paths=artifacts,
+            manifest_filename=manifest_filename,
         )
     # Unknown extension: require that it is not the training entrypoint and that
     # a sibling Python/shell inference helper is not expected — fail closed.
     return [
         f"{role} inference entrypoint {inference_rel} must be a .py or .sh script "
-        "that loads committed model artifacts"
+        "that loads committed strategy artifacts"
     ]
 
 
@@ -549,12 +740,29 @@ def generated_score_artifact_issues(strategy_dir: Path, *, role: str) -> list[st
 
 
 def validate_ml_strategy_contract(strategy_dir: Path, *, role: str) -> StrategyContract:
-    """Full fail-closed contract for one reference/baseline strategy."""
+    """Full fail-closed contract for one committed calibration strategy."""
     issues = generated_score_artifact_issues(strategy_dir, role=role)
     if issues:
         raise ValueError("; ".join(issues))
-    manifest = validate_committed_model_manifest(strategy_dir, role=role)
-    inference_issues = inference_only_issues(strategy_dir, role=role, manifest=manifest)
+    strategy_manifest_path = strategy_dir / STRATEGY_MANIFEST_FILENAME
+    model_manifest_path = strategy_dir / MODEL_MANIFEST_FILENAME
+    if strategy_manifest_path.is_file() and model_manifest_path.is_file():
+        raise ValueError(
+            f"{role} strategy must declare exactly one of "
+            f"{STRATEGY_MANIFEST_FILENAME} or {MODEL_MANIFEST_FILENAME}"
+        )
+    if strategy_manifest_path.is_file():
+        manifest = validate_committed_strategy_manifest(strategy_dir, role=role)
+        manifest_filename = STRATEGY_MANIFEST_FILENAME
+    else:
+        manifest = _normalized_model_strategy_manifest(strategy_dir, role=role)
+        manifest_filename = MODEL_MANIFEST_FILENAME
+    inference_issues = inference_only_issues(
+        strategy_dir,
+        role=role,
+        manifest=manifest,
+        manifest_filename=manifest_filename,
+    )
     if inference_issues:
         raise ValueError("; ".join(inference_issues))
     artifacts = tuple(
@@ -566,20 +774,32 @@ def validate_ml_strategy_contract(strategy_dir: Path, *, role: str) -> StrategyC
         role=role,
         strategy_dir=strategy_dir,
         manifest=manifest,
-        training_entrypoint=str(manifest["training_entrypoint"]),
+        kind=str(manifest["kind"]),
+        manifest_filename=manifest_filename,
+        training_entrypoint=(
+            str(manifest["training_entrypoint"])
+            if isinstance(manifest.get("training_entrypoint"), str)
+            else None
+        ),
         inference_entrypoint=str(manifest["inference_entrypoint"]),
         artifact_paths=artifacts,
+        training_input_paths=tuple(
+            str(entry["path"])
+            for entry in manifest.get("training_inputs") or []
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        ),
     )
 
 
 def resolve_reference_strategy_dir(problem_dir: Path) -> Path:
-    if (problem_dir / "reference_solution").is_dir():
-        return problem_dir / "reference_solution"
     return problem_dir / "solution"
 
 
 def resolve_declared_ml_strategies(
-    problem_dir: Path, *, naive_rel: str | None = None
+    problem_dir: Path,
+    *,
+    naive_rel: str | None = None,
+    include_naive: bool = True,
 ) -> list[tuple[str, Path]]:
     """Return (role, path) for reference + every calibration-declared baseline.
 
@@ -589,34 +809,56 @@ def resolve_declared_ml_strategies(
     """
     reference = resolve_reference_strategy_dir(problem_dir)
     strategies = [("reference", reference)]
-    naive = (naive_rel or "baselines/naive").strip().strip("/")
-    strategies.append(("naive", problem_dir / naive))
+    if include_naive:
+        naive = (naive_rel or "baselines/naive").strip().strip("/")
+        strategies.append(("naive", problem_dir / naive))
     return strategies
 
 
-def validate_problem_ml_model_contracts(
-    problem_dir: Path, *, naive_rel: str | None = None
+def validate_problem_ml_strategy_contracts(
+    problem_dir: Path,
+    *,
+    naive_rel: str | None = None,
+    include_naive: bool = True,
 ) -> list[StrategyContract]:
-    """Validate every declared continuous-ML strategy for a problem."""
+    """Validate each reference/baseline strategy required by a registration."""
     contracts: list[StrategyContract] = []
     for role, strategy_dir in resolve_declared_ml_strategies(
-        problem_dir, naive_rel=naive_rel
+        problem_dir,
+        naive_rel=naive_rel,
+        include_naive=include_naive,
     ):
         contracts.append(validate_ml_strategy_contract(strategy_dir, role=role))
     return contracts
 
 
+def validate_problem_ml_model_contracts(
+    problem_dir: Path, *, naive_rel: str | None = None
+) -> list[StrategyContract]:
+    """Backward-compatible alias for reference + naive strategy validation."""
+
+    return validate_problem_ml_strategy_contracts(
+        problem_dir,
+        naive_rel=naive_rel,
+        include_naive=True,
+    )
+
+
 __all__ = [
     "FORBIDDEN_GENERATED_SCORE_FILES",
     "MODEL_MANIFEST_FILENAME",
-    "StrategyContract",
+    "STRATEGY_KINDS",
+    "STRATEGY_MANIFEST_FILENAME",
     "TIER_B_STATIC_ARTIFACTS",
+    "StrategyContract",
     "file_sha256",
     "generated_score_artifact_issues",
     "inference_only_issues",
     "resolve_declared_ml_strategies",
     "resolve_reference_strategy_dir",
     "validate_committed_model_manifest",
+    "validate_committed_strategy_manifest",
     "validate_ml_strategy_contract",
     "validate_problem_ml_model_contracts",
+    "validate_problem_ml_strategy_contracts",
 ]

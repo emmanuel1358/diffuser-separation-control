@@ -1,0 +1,5 @@
+# Agent-visible task dependencies, installed into /opt/lbx-runtime/.venv.
+# openseespy and numpy already ship in the base image; they are declared here
+# so the task states what it needs instead of relying on the base contents.
+openseespy
+numpy

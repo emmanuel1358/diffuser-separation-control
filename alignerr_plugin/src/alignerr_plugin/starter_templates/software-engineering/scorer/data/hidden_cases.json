@@ -1,0 +1,29 @@
+{
+  "schema_version": "slug-normalizer-cases.v1",
+  "cases": [
+    {
+      "input": " API / V2 ",
+      "expected": "api-v2"
+    },
+    {
+      "input": "release___candidate",
+      "expected": "release-candidate"
+    },
+    {
+      "input": "many   gaps",
+      "expected": "many-gaps"
+    },
+    {
+      "input": "---",
+      "expected": "untitled"
+    },
+    {
+      "input": "alpha.beta+gamma",
+      "expected": "alpha-beta-gamma"
+    },
+    {
+      "input": "\tBuild 42!\n",
+      "expected": "build-42"
+    }
+  ]
+}

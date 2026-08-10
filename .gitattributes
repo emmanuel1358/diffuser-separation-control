@@ -1,0 +1,4 @@
+# Preserve the pinned upstream archive and reference tree byte-for-byte.
+examples/xfoil-rust-port/data/xfoil-source.tar.gz binary
+examples/xfoil-rust-port/data/xfoil-source.tar.gz.sha256 text eol=lf
+examples/xfoil-rust-port/solution/reference/** -whitespace

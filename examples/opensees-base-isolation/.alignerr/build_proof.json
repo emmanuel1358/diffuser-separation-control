@@ -1,11 +1,11 @@
 {
   "alignerr_cli_version": "0.1.0",
   "base_image_ref": "lbx-tasks-base:runtime-ml-core-py313-local",
-  "built_at": "2026-07-22T03:46:05.722695+00:00",
-  "duration_seconds": 0.8024744591675699,
+  "built_at": "2026-07-27T06:52:22.750376+00:00",
+  "duration_seconds": 4.799449167214334,
   "ground_truth_result": {
-    "details_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1784691961/verifier/reward-details.json",
-    "graded_at": "2026-07-22T03:46:30.973204+00:00",
+    "details_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1785135137/verifier/reward-details.json",
+    "graded_at": "2026-07-27T06:52:50.056259+00:00",
     "metadata": {
       "evaluation": {
         "attested": false,
@@ -129,10 +129,19 @@
           "total_steps": 3000
         }
       ],
+      "post_grade_cleanup": {
+        "killed_processes": 0,
+        "removed_nonregular": 0,
+        "removed_symlinks": 0,
+        "removed_tmpfs_entries": 0,
+        "restored_output_directory": 0
+      },
       "pre_grade_cleanup": {
         "killed_processes": 0,
         "removed_nonregular": 0,
-        "removed_symlinks": 0
+        "removed_symlinks": 0,
+        "removed_tmpfs_entries": 0,
+        "restored_output_directory": 0
       },
       "recentering_capacity_in": 9.0,
       "recentering_gate": 1.0,
@@ -326,8 +335,8 @@
         "residual_isolator_disp_in": 8.036593194113948
       }
     },
-    "reward_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1784691961/verifier/reward.json",
-    "run_dir": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1784691961",
+    "reward_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1785135137/verifier/reward.json",
+    "run_dir": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template/.harness-runs/opensees-base-isolation-problem-dir-1785135137",
     "runtime": "solution",
     "score": 1.0,
     "structured_subscores": [
@@ -408,8 +417,8 @@
       "residual displacement control": 0.16
     }
   },
-  "image_digest": "sha256:f046952df1033ae7d0a514bb5022ba525f57d8cca2307203b578787f2a7efcb1",
+  "image_digest": "sha256:40980d894b8b766ed58a8f4025f124f9a07ac7ed0d869427c5e14bfe8c5583a3",
   "platform": "linux/amd64",
   "schema_version": "1.0",
-  "task_dir_sha256": "6e1cb3d32260bc1646f5a2bda7312d42937935c69d479f80fb2aee253e10edcc"
+  "task_dir_sha256": "3e81de8391d351fd8cd5f135e9c6a6ca2b927591338bfe292b3285cf221e13d5"
 }

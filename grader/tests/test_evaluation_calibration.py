@@ -4,15 +4,17 @@ import json
 from types import SimpleNamespace
 
 import pytest
-
 from grading.evaluation import (
     AnchorRationale,
     BinaryF1Target,
+    CalibrationMeasureContext,
     ContinuousTask,
     CsvRows,
     FloorAnchor,
     GeneratedCalibration,
     SRETarget,
+    WorkspaceDegenerateProbes,
+    WorkspaceProbe,
     load_calibration_lock,
     measure_task_module,
     write_calibration_lock_atomic,
@@ -120,6 +122,118 @@ def test_generated_lock_rejects_noninformative_naive() -> None:
         )
 
 
+def test_reviewed_floor_tied_naive_can_qualify_at_zero() -> None:
+    task = ContinuousTask.static(
+        artifact=CsvRows("submission.csv", columns=["value", "label"]),
+        targets=_task().targets,
+        naive_score_min=0.0,
+        naive_at_floor=AnchorRationale(
+            kind="reviewed_exception",
+            summary=(
+                "The sanctioned no-op baseline exactly ties every measured "
+                "no-information floor and no weak-positive baseline exists."
+            ),
+        ),
+    )
+    lock = task.build_lock(
+        reference_metrics={"value": 0.2, "label": 0.9},
+        naive_metrics={"value": 1.0, "label": 0.0},
+        degenerate_metrics=_NOOP_DEGENERATE,
+        input_digests={},
+    )
+
+    score_range = lock.payload["qualification"]["naive_score_range"]
+    assert score_range["inclusive_min"] == 0.0
+    assert "exclusive_min" not in score_range
+    assert score_range["rationale"]["kind"] == "reviewed_exception"
+    assert lock.payload["qualification"]["naive_score"] == 0.0
+
+
+def test_reviewed_floor_naive_must_tie_effective_no_info_floor() -> None:
+    task = ContinuousTask.static(
+        artifact=CsvRows("submission.csv", columns=["value", "label"]),
+        targets=_task().targets,
+        naive_score_min=0.0,
+        naive_at_floor=AnchorRationale(
+            kind="reviewed_exception",
+            summary=(
+                "The sanctioned no-op baseline must tie rather than underperform "
+                "the measured no-information family."
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="weak but informative"):
+        task.build_lock(
+            reference_metrics={"value": 0.2, "label": 0.9},
+            naive_metrics={"value": 1.1, "label": 0.0},
+            degenerate_metrics=_NOOP_DEGENERATE,
+            input_digests={},
+        )
+
+
+def test_naive_floor_exception_requires_zero_min_and_reviewed_rationale() -> None:
+    with pytest.raises(ValueError, match="naive_score_min=0"):
+        ContinuousTask.static(
+            artifact=CsvRows("submission.csv", columns=["value", "label"]),
+            targets=_task().targets,
+            naive_at_floor=AnchorRationale(
+                kind="reviewed_exception",
+                summary="This reviewed exception has a sufficient explanation.",
+            ),
+        )
+    with pytest.raises(ValueError, match="kind='reviewed_exception'"):
+        ContinuousTask.static(
+            artifact=CsvRows("submission.csv", columns=["value", "label"]),
+            targets=_task().targets,
+            naive_score_min=0.0,
+            naive_at_floor=AnchorRationale(
+                kind="domain_review",
+                summary="This rationale uses the wrong semantic review category.",
+            ),
+        )
+
+
+def test_default_calibration_and_naive_range_serialization_is_unchanged() -> None:
+    task = _task()
+    assert GeneratedCalibration().spec_dict() == {
+        "type": "generated_lock.v1",
+        "filename": "calibration.lock.json",
+    }
+    assert task.spec_dict()["naive_score_range"] == {
+        "exclusive_min": 1e-6,
+        "inclusive_max": 0.1,
+    }
+
+
+def test_workspace_probe_spec_is_bounded_and_canonical() -> None:
+    provider = WorkspaceDegenerateProbes(
+        probes=[
+            WorkspaceProbe(
+                name="seeded-random",
+                path="baselines/degenerate/seeded-random",
+                rationale="A seeded no-information policy over the public action API.",
+            ),
+            WorkspaceProbe(
+                name="no-op",
+                path="baselines/degenerate/no-op",
+                rationale="A policy that always emits the documented neutral action.",
+            ),
+        ]
+    )
+    spec = GeneratedCalibration(degenerate_probes=provider).spec_dict()
+    assert [probe["name"] for probe in spec["degenerate_probes"]["probes"]] == [
+        "no-op",
+        "seeded-random",
+    ]
+    with pytest.raises(ValueError, match="baselines/degenerate"):
+        WorkspaceProbe(
+            name="bad",
+            path="../outside",
+            rationale="This invalid path still has a sufficiently long rationale.",
+        )
+
+
 def test_lock_exposes_exact_metric_formula_and_floor_rationale() -> None:
     task = _task()
     lock = task.build_lock(
@@ -181,6 +295,82 @@ def test_evaluation_paths_reject_traversal_and_custom_lock_names() -> None:
         GeneratedCalibration("../alternate.lock.json")
 
 
+def test_lock_is_found_when_the_runner_nests_the_bundle(tmp_path, monkeypatch) -> None:
+    """The accelerator lane exports one absolute path; the runner picks the root.
+
+    The lane assumed the bundle extracts at /workspace and the runner extracted
+    it at /workspace/workspace, so every continuous task died on a missing lock
+    and scored 0.0. Resolution now accepts either layout.
+    """
+    from grading.evaluation.lock import (
+        CALIBRATION_LOCK_PATH_ENV,
+        resolve_calibration_lock_path,
+    )
+
+    exported = tmp_path / "workspace" / "calibration" / "calibration.lock.json"
+    actual = (
+        tmp_path / "workspace" / "workspace" / "calibration" / "calibration.lock.json"
+    )
+    actual.parent.mkdir(parents=True)
+    actual.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv(CALIBRATION_LOCK_PATH_ENV, str(exported))
+
+    assert resolve_calibration_lock_path() == actual
+
+    # With the lock where the lane said it would be, that path still wins.
+    exported.parent.mkdir(parents=True)
+    exported.write_text("{}", encoding="utf-8")
+    assert resolve_calibration_lock_path() == exported
+
+    # And the mirror image: the lane now exports the nested path, so a runner
+    # that stops nesting must not put us back where we started.
+    monkeypatch.setenv(CALIBRATION_LOCK_PATH_ENV, str(actual))
+    actual.unlink()
+    assert resolve_calibration_lock_path() == exported
+
+
+def test_missing_lock_names_every_path_it_looked_in(tmp_path, monkeypatch) -> None:
+    from grading.evaluation.lock import CALIBRATION_LOCK_PATH_ENV, load_calibration_lock
+
+    exported = tmp_path / "workspace" / "calibration" / "calibration.lock.json"
+    monkeypatch.setenv(CALIBRATION_LOCK_PATH_ENV, str(exported))
+    with pytest.raises(
+        RuntimeError, match="searched .*workspace/workspace/calibration"
+    ):
+        load_calibration_lock()
+
+
+def test_a_named_bundle_lock_never_falls_back_to_the_author_image_lock(
+    tmp_path, monkeypatch
+) -> None:
+    """A missing sealed lock must fail, not grade against author calibration.
+
+    RUNTIME_LOCK_ROOT on a task image is the author's own lock, shipped beside
+    an .author-source marker. Searching it after an explicitly-named bundle lock
+    missed would turn a loud failure into a silently wrong score.
+    """
+    from grading.evaluation import lock as lock_module
+
+    baked = tmp_path / "image-calibration"
+    baked.mkdir()
+    (baked / "calibration.lock.json").write_text("{}", encoding="utf-8")
+    (baked / ".author-source").write_text("author-image-fallback\n", encoding="utf-8")
+    monkeypatch.setattr(lock_module, "RUNTIME_LOCK_ROOT", baked)
+
+    exported = tmp_path / "workspace" / "calibration" / "calibration.lock.json"
+    monkeypatch.setenv(lock_module.CALIBRATION_LOCK_PATH_ENV, str(exported))
+
+    assert baked not in [p.parent for p in lock_module.calibration_lock_candidates()]
+    with pytest.raises(RuntimeError, match="calibration lock is missing"):
+        lock_module.load_calibration_lock()
+
+    # With no lane naming a path, the in-image location is still the answer.
+    monkeypatch.delenv(lock_module.CALIBRATION_LOCK_PATH_ENV)
+    assert (
+        lock_module.resolve_calibration_lock_path() == baked / "calibration.lock.json"
+    )
+
+
 def test_evaluation_plan_digest_binds_security_tier() -> None:
     plan = _task().evaluation_plan
     payload = {**plan.to_dict(), "plan_sha256": plan.sha256}
@@ -196,18 +386,26 @@ def test_hand_authored_measurement_can_be_non_dataframe(tmp_path) -> None:
         targets=_task().targets,
         calibration=GeneratedCalibration(),
     )
-    module = SimpleNamespace(
-        TASK=task,
-        measure_submission=lambda workspace, private: {
+
+    def measure_submission(workspace, private, context):
+        assert context.derive_seed("cases") == CalibrationMeasureContext(7).derive_seed(
+            "cases"
+        )
+        return {
             "value": 0.4 if workspace.name == "policy-rollout" else 0.5,
             "label": 0.75 if private.name == "hidden-env" else 0.5,
-        },
+        }
+
+    module = SimpleNamespace(
+        TASK=task,
+        measure_submission=measure_submission,
     )
 
     measured = measure_task_module(
         module,
         workspace=tmp_path / "policy-rollout",
         private=tmp_path / "hidden-env",
+        context=CalibrationMeasureContext(7),
     )
 
     assert measured == {"value": 0.4, "label": 0.75}
@@ -236,6 +434,23 @@ def test_lock_serialization_is_canonical_and_atomic(tmp_path) -> None:
     )
 
 
+def test_lock_loader_rejects_ambiguous_naive_range(tmp_path) -> None:
+    task = _task()
+    lock = task.build_lock(
+        reference_metrics={"value": 0.2, "label": 0.9},
+        naive_metrics={"value": 0.98, "label": 0.0},
+        degenerate_metrics=_NOOP_DEGENERATE,
+        input_digests={},
+    )
+    payload = json.loads(json.dumps(lock.payload))
+    payload["qualification"]["naive_score_range"]["inclusive_min"] = 0.0
+    path = tmp_path / "ambiguous.lock.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="exactly one"):
+        load_calibration_lock(path, task_spec_sha256=task.spec_sha256)
+
+
 def test_lock_rejects_stale_task_registration(tmp_path) -> None:
     task = _task()
     lock = task.build_lock(
@@ -249,6 +464,46 @@ def test_lock_rejects_stale_task_registration(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="stale"):
         load_calibration_lock(path, task_spec_sha256="not-the-task")
+
+
+def test_custom_kernel_identity_survives_a_different_import_path() -> None:
+    """The host and the grader worker import the same scorer under different
+    module names. Embedding __module__ hashed one kernel two ways, so the sealed
+    plan came back as a stale TASK."""
+    from grading.evaluation.metrics import (
+        MetricTarget,
+        RegisteredMetric,
+        registered_kernel_identity,
+    )
+
+    def custom_kernel(prediction, truth) -> float:
+        return 0.0
+
+    def _target() -> MetricTarget:
+        return MetricTarget(
+            name="value",
+            metric=RegisteredMetric(
+                id="custom.value.v1",
+                formula="task-specific",
+                input_contract="finite numeric arrays of identical shape",
+            ),
+            direction="lower",
+            weight=1.0,
+            floor=_floor(1.0, "A no-skill predictor scores one on this metric."),
+            perfect=0.0,
+            prediction_column="value",
+            truth_column="value",
+            kernel=custom_kernel,
+        )
+
+    baseline = registered_kernel_identity(_target())
+    custom_kernel.__module__ = "compute_score"
+    host_view = registered_kernel_identity(_target())
+    custom_kernel.__module__ = "grader.compute_score"
+    worker_view = registered_kernel_identity(_target())
+
+    assert baseline == host_view == worker_view
+    assert "compute_score" not in host_view
 
 
 def test_compute_score_reads_generated_lock(monkeypatch, tmp_path) -> None:

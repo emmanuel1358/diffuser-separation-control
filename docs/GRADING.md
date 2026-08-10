@@ -98,7 +98,7 @@ model XML.
 ## Agent Faults vs Grader Failures
 
 The grader runs as root so it can read `/mcp_server/data`. The runtime now
-performs ML_Envs-style hardening before grading: it kills lingering agent
+performs hardening before grading: it kills lingering agent
 processes when running as root, removes symlinks under the output directory
 that point outside it, removes FIFOs/sockets/devices that could hang grading,
 uses a private grader cache, and runs Harbor scoring in a child process rather
@@ -136,25 +136,27 @@ agent artifact (RCE-as-root), and an unguarded read of an agent-writable path
 
 ### Submission loaders (per-type attack closures)
 
-Each submission type has a sanctioned loader that runs the read/execution under
-the unprivileged `agent` account and raises `AgentFault` for malformed input.
-Use them instead of reading the artifact by hand:
+Each submission type has a sanctioned loader. Root-side data reads use a
+component-safe descriptor walk and immutable bytes; executable/model parsers
+run under the unprivileged `agent` account. Malformed input raises
+`AgentFault`. Use these instead of reading artifacts by hand:
 
 | Submission | Loader | Closes |
 | --- | --- | --- |
-| CSV / dataframe | `helpers.load_submission_or_fault` | symlink/FIFO, oversize, schema |
-| NumPy `.npz` / `.npy` | `helpers.load_submission_npz_or_fault` | symlink-to-truth (`O_NOFOLLOW`), FIFO-hang (`O_NONBLOCK`), oversize, pickle-RCE (`allow_pickle=False`) |
+| CSV / dataframe | `helpers.load_submission_or_fault` | leaf/parent symlink swaps, FIFO, oversize, schema |
+| NumPy `.npz` / `.npy` | `helpers.load_submission_npz_or_fault` | leaf/parent symlink swaps, FIFO-hang, compressed/logical-size caps, mandatory `allow_pickle=False` |
 | Python policy / model module | `helpers.run_policy` / `helpers.run_model_module` | RCE-as-root (sandboxed subprocess; score from return value, never stdout) |
-| Executable | `helpers.run_submitted_executable` | uid-drop + caps stdout (kills the child past the cap) + discards stderr (memory) + AgentFault on timeout/over-cap; `streaming=True` also strips `RUBRIC_SCORE=` lines (capture mode returns raw stdout for you to parse — never relay it to the score parser) |
-| HDF5 | `helpers.load_submission_h5_or_fault` | external links / virtual datasets that map `/mcp_server` truth into a "dataset" |
+| Executable | `helpers.run_submitted_executable` | fresh best-effort IPC namespace + uid-drop + caps stdout (kills the child past the cap) + discards stderr (memory) + AgentFault on timeout/over-cap; `streaming=True` also strips `RUBRIC_SCORE=` lines (capture mode returns raw stdout for you to parse — never relay it to the score parser) |
+| HDF5 | `helpers.load_submission_h5_or_fault` | immutable input snapshot plus dropped parser; links/virtual datasets and dataset-count/per-dataset/aggregate logical-size caps. Whole-object H5AD root handoff is disabled. |
 | K-fold CV of a model module | `score_kfold_cv` | cross-fold label leakage via memory (fresh worker), IPC (`CLONE_NEWIPC`), and disk (per-fold pristine-snapshot rebuild) |
-| Any format read by hand | `helpers.require_regular_file(path)` before the read | symlink/FIFO/dir/device + oversize (`lstat` + `S_ISREG`; a bare `except OSError` does not stop a symlink) |
+| Custom file-like parser | `helpers.open_submission_file_or_fault(path)` | bounded immutable `BytesIO`; rejects symlinks in every path component |
+| Legacy pathname-only parser | `helpers.require_regular_file(path)` | framework compatibility API only. Task scorers must use a sanctioned format loader or `open_submission_file_or_fault`; raw pathname parsers remain validator-blocked. |
 
 ## Pick your return shape
 
 | Shape | When to use | Where the headline comes from |
 | --- | --- | --- |
-| `float` | ML_Envs migration. The headline is a single anchor-mapped numeric metric (RMSE/F1/return). No per-criterion decomposition. | The float you returned, clamped to `[0, 1]`. |
+| `float` | The headline is a single anchor-mapped numeric metric (RMSE/F1/return). No per-criterion decomposition. | The float you returned, clamped to `[0, 1]`. |
 | `dict {score, subscores, weights, metadata}` | You have an existing scorer that returns its own headline plus per-target diagnostics (e.g. `{score: exp_curve(x_agg), subscores: {rmse: x1, f1: x2}}`). Per-criterion rows show up in Boreal UI; the headline stays your custom number. | `dict["score"]` verbatim. **NOT** recomputed from `subscores * weights`. |
 | `TASK = RubricTask(...)` | Mandatory for `multi_deterministic_rubrics`; evaluator returns criterion values, not a score payload. | Framework-owned weighted/binary aggregation with required gates. |
 
@@ -164,7 +166,7 @@ score should be.
 
 ### Why `dict["score"]` is authoritative
 
-ML_Envs-style continuous scorers compute their headline as a
+Continuous scorers compute their headline as a
 piecewise-linear-anchored aggregate of per-target progress.
 The headline is NOT `mean(subscores)` — it's a calibrated curve through
 floor / reference / perfect anchors. If we silently recomputed the
@@ -173,12 +175,12 @@ headline from `weighted_avg(subscores)` the math would drift.
 So the contract is: when you ship an explicit `score`, that's the score
 the user sees. Subscores are diagnostic.
 
-## Continuous reward functions from ML_Envs
+## Continuous reward functions
 
 Use a continuous reward function when task quality is naturally measured by
 numeric performance rather than a checklist: prediction error, F1, rollout
 return, success rate, regret, trajectory tracking error, final objective value,
-or a simulator-derived performance metric. This is the ML_Envs scoring pattern
+or a simulator-derived performance metric. This is the continuous scoring pattern
 adapted to `scorer/compute_score.py`.
 
 In this style, the grader is still deterministic. It computes raw metrics from
@@ -211,7 +213,7 @@ uv run lbx-rl-harness run \
 
 The author still owns loading, rollouts, k-fold, and raw metrics. `TASK` owns
 reviewed anchor schema, generated-lock verification, and final PWL mapping.
-See the composable example in `docs/MLENVS_TASKS.md`.
+See the composable example in `docs/ML_TASKS.md`.
 
 ### Calibration anchors
 
@@ -338,7 +340,7 @@ Use calibration to measure agent difficulty:
   is enforced (not just recommended): an empty submission graded through the
   real scorer may not exceed `[ground_truth].zero_anchor_epsilon` (default
   `0.01`). The validator's no-op probe checks host-probed tasks; for
-  in-container / ML_Envs tasks the ground-truth harness grades an empty
+  in-container tasks the ground-truth harness grades an empty
   workspace in the task image and records the score as
   `ground_truth_result.trivial_baseline_score` in the build proof, which the
   validator then requires and re-checks in CI.
@@ -360,7 +362,7 @@ workflow.
 
 ## The three shapes — minimal examples
 
-### 1. Bare float (ML_Envs migration target)
+### 1. Bare float
 
 ```python
 # scorer/compute_score.py
@@ -371,7 +373,7 @@ def compute_score(workspace: Path, trajectory, private: Path) -> float:
     return anchor_map(f1, floor=0.0, perfect=1.0)
 ```
 
-This shape is intended for future ML_Envs migrations. Headline only — no
+Headline only — no
 per-criterion breakdown in either UI.
 
 ### 2. Score dict (preserve a custom anchor map AND surface diagnostics)
@@ -467,7 +469,12 @@ New or updated rubric tasks fail validation unless they use `RubricTask`.
 - `json_path(data, path) -> Any` — JSONPath subset (`$.a[0]`, `$.x[?k=v].y`)
 - `transcript_contains(transcript, needle, *, case_sensitive=False) -> bool`
 - `load_json(path) -> Any | None`
-- `require_regular_file(path, *, max_bytes=...) -> Path` — raise `AgentFault` if the agent path is a symlink / FIFO / dir / device or oversized; call it before a hand-rolled read (the submission loaders in the table above do this internally)
+- `open_submission_file_or_fault(path, *, max_bytes=...)` — context manager
+  yielding immutable submission bytes for custom parsers
+- `require_regular_file(path, *, max_bytes=...) -> Path` — framework
+  compatibility API returning a grader-owned immutable snapshot. Task-owned
+  scorers must not pass even this path to raw pathname readers because static
+  validation cannot safely distinguish shadowed helper imports.
 
 These remain useful for continuous/legacy graders. Declarative rubrics should
 use `RubricContext` operations whenever one exists, so error attribution stays
@@ -504,7 +511,19 @@ What DOES come from `task.toml`:
 - `[runner]` block → job-level fields (`api_model_name`,
   `n_attempts_per_problem`, `max_ctx`, `turn_limit`, `priority`,
   `iteration_order`, `serialize_restore_test_interval`,
-  `checkpoint_ttl`).
+  `checkpoint_ttl`, plus `enable_autocompact` / `enable_memory` from
+  `context_mode`).
+
+`context_mode` values:
+
+| Mode | API flags | Guidance |
+| --- | --- | --- |
+| `none` | neither | Stop when context fills. |
+| `memory` | `enable_memory=true` | Memory tool + context resets (~500k total across resets). **Do not enable without consulting Labelbox first.** |
+| `autocompact` (default) | `enable_autocompact=true` | Silent summarize/compress near the limit. |
+
+When `[runner]` omits `max_ctx` / `turn_limit`, trusted CI submit uses
+`max_ctx=1_000_000` and `turn_limit=1430`.
 - `[runner.timeouts]` → `setup_timeout_seconds`, `grading_timeout_seconds`,
   `tool_timeout_seconds`, `max_timeout_seconds` (see the timeout mapping below).
 - `[runner.required_tools]` → `required_tools` (default
@@ -540,7 +559,7 @@ Notes:
   ML runs, and a human building a reference solution needs the same headroom.
   `grading_sec` in particular is pinned to Taiga's maximum (`10800`). These live
   as `schemas.ML_*_TIMEOUT_SEC` (a single source of truth also reused by
-  ML_Envs' `PINNED_TIMEOUTS`).
+  the pinned ml timeouts).
 - **All other task types use the RunnerTimeouts defaults and stay
   author-overridable.** Non-ml tasks default to `setup 600 / grading 600 /
   tool 120 / max_episode 3600` and can override `[runner.timeouts]` freely.
@@ -649,9 +668,9 @@ description = "Final answer file the agent writes."
 
 [runner]
 attempts = 3                  # n_attempts_per_problem
-turn_limit = 1000             # null/0 = unlimited
+turn_limit = 1430             # null/0 = unlimited; default matches Taiga scaled cap
 max_ctx = 1_000_000
-context_mode = "none"         # none / autocompact / memory
+context_mode = "autocompact"  # none / autocompact / memory
 api_model_name = "claude-fable-5"
 priority = "high"
 iteration_order = "problems_first"
@@ -667,7 +686,7 @@ tool_sec = 120
 max_episode_sec = 3600
 
 [difficulty]
-task_type = "ml"              # ml | mujoco | cfd | structures
+task_type = "ml"              # ml | mujoco | cfd | structures | software_engineering
 domain = "scientific_discovery_computational_science"
 reward_type = "continuous_scoring_function"
 
@@ -710,7 +729,7 @@ Return a zero (or low) score for a dedicated criterion, or fold the
 misbehavior into a required gate. Prefer explicit criterion IDs over
 ad-hoc score mutation so Boreal/Harbor surfaces the failure reason.
 
-### "I want to migrate an ML_Envs task verbatim"
+### "I want a headline-only continuous scorer"
 
 Keep the existing anchor / progress math and set
 `[difficulty].reward_type = "continuous_scoring_function"` so validation expects
@@ -724,7 +743,7 @@ diagnostic continuous target progress values:
 
 ```python
 def compute_score(workspace, trajectory, private) -> dict:
-    # Same ML_Envs metric math as before.
+    # Your own metric math.
     final = calibration.PiecewiseLinearCurve.from_reference(x_ref).score(weighted_progress)
     return {
         "score": final,
@@ -740,7 +759,7 @@ def compute_score(workspace, trajectory, private) -> dict:
 This is not a rubric. The returned subscores are diagnostic continuous
 signals; `score` remains authoritative and is not recomputed from them.
 See [`examples/mle-tabular-classification`](../examples/mle-tabular-classification/)
-for a complete adapted ML_Envs task with parquet data and hidden targets.
+for a complete continuous ml task with parquet data and hidden targets.
 
 ### "My grader runs slow because each criterion makes an HTTP call"
 
@@ -777,7 +796,7 @@ Template PR validation in mothership runs presence-driven checks:
 | `conditional` | `docker compose config`, custom env smoke checks |
 
 The `sample_score` MUST land in `[0, 1]` — this catches the most common
-ML_Envs migration bug (forgotten clip on a custom anchor mapping).
+bug: a forgotten clip on a custom anchor mapping.
 
 ## See also
 
@@ -786,4 +805,4 @@ ML_Envs migration bug (forgotten clip on a custom anchor mapping).
 - [`docs/TASK_MIGRATION.md`](TASK_MIGRATION.md) — migrate older tasks onto
   sealed continuous calibration, `RubricTask`, and sealed evaluation plans
 - [`grader/src/grading/`](../grader/src/grading/) — shared library source you can read locally
-- The mothership repo's `docs/MUJOCO_TASKS.md` and `docs/ML_ENVS_MIGRATION.md` (visible to FDEs only) cover task-family-specific patterns.
+- The mothership repo's `docs/MUJOCO_TASKS.md` and `docs/LEGACY_ML_LAYOUT.md` (visible to FDEs only) cover task-family-specific patterns.

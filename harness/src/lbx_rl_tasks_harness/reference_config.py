@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from alignerr_plugin.runtime_notices import accelerator_from_required_resources
 
-from lbx_rl_tasks_harness.models import HarnessProblem, ReferenceSpec
+from lbx_rl_tasks_harness.models import HarnessProblem
 
 EXECUTION_MODES = frozenset({"auto", "host", "container"})
 PROOF_MODES = frozenset({"auto", "artifact", "execute"})
@@ -22,7 +21,7 @@ def _resolve_reference_execution_auto(problem: HarnessProblem) -> str:
     ):
         return "container"
 
-    difficulty = problem.metadata.get("difficulty") or {}
+    difficulty = getattr(problem, "metadata", {}).get("difficulty") or {}
     task_type = str(difficulty.get("task_type") or "").strip().lower()
     if task_type == "ml":
         return "container"
@@ -131,70 +130,50 @@ def reference_cache_path(problem: HarnessProblem) -> str:
     return problem.reference.cache_dir.strip() or ".alignerr/reference_cache/output"
 
 
-def _is_mlenvs_problem(problem: HarnessProblem) -> bool:
-    from alignerr_plugin import mlenvs
-
-    src = problem.source_problem_dir
-    return src is not None and mlenvs.is_mlenvs_task(src)
-
-
 def _manifest_inference_rel(strategy: Path, *, role: str) -> str | None:
     """Return strategy-relative inference entrypoint from a valid manifest."""
-    manifest_path = strategy / "model.manifest.json"
-    if not manifest_path.is_file():
+    if not any(
+        (strategy / filename).is_file()
+        for filename in ("strategy.manifest.json", "model.manifest.json")
+    ):
         return None
-    try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        payload = {}
-    resolved_role = role
-    if isinstance(payload, dict) and payload.get("role") in {"reference", "naive"}:
-        resolved_role = str(payload["role"])
-    try:
-        from alignerr_plugin.ml_model_contract import validate_committed_model_manifest
+    from alignerr_plugin.ml_model_contract import validate_ml_strategy_contract
 
-        manifest = validate_committed_model_manifest(strategy, role=resolved_role)
-        inference = str(manifest["inference_entrypoint"])
-        training = str(manifest["training_entrypoint"])
-        if Path(inference).name == Path(training).name:
-            raise ValueError(
-                f"{strategy}: inference_entrypoint must not equal training_entrypoint"
-            )
-        return inference
-    except ValueError:
-        # Fall through; calibration preflight / validator report the real error.
-        return None
+    contract = validate_ml_strategy_contract(strategy, role=role)
+    return contract.inference_entrypoint
+
+
+def _continuous_ml_strategy_required(problem: HarnessProblem) -> bool:
+    difficulty = getattr(problem, "metadata", {}).get("difficulty") or {}
+    return (
+        str(difficulty.get("task_type") or "").strip().lower() == "ml"
+        and str(difficulty.get("reward_type") or "").strip().lower()
+        == "continuous_scoring_function"
+    )
+
+
+def _strategy_role(base: str) -> str:
+    return "reference" if base == "solution" else "naive"
 
 
 def solution_script_rel(problem: HarnessProblem, *, solution_dir: str) -> str:
     base = solution_dir.strip().strip("/")
-    if _is_mlenvs_problem(problem):
-        # ML_Envs runs <solution_dir>/<inference_entrypoint> with python — authors
-        # never write a solve.sh. --solution-dir selects the directory (default
-        # reference_solution; e.g. --solution-dir baselines/naive to run that
-        # baseline). Prefer the committed model.manifest.json inference entrypoint
-        # so ground-truth never falls through to train.py.
-        if not base or base == "solution":
-            base = "reference_solution"
-        if problem.source_problem_dir is not None:
-            strategy = problem.source_problem_dir / base
-            role = "naive" if base.startswith("baselines/") else "reference"
-            inference = _manifest_inference_rel(strategy, role=role)
-            if inference is not None:
-                return f"{base}/{inference}"
-        return f"{base}/solution.py"
-
-    difficulty = problem.metadata.get("difficulty") or {}
+    difficulty = getattr(problem, "metadata", {}).get("difficulty") or {}
     task_type = str(difficulty.get("task_type") or "").strip().lower()
     entrypoint = problem.reference.entrypoint.strip() or "solve.sh"
     # Continuous ML native tasks: prefer the validated manifest inference
     # entrypoint so [reference].entrypoint cannot bypass the contract.
     if task_type == "ml" and problem.source_problem_dir is not None:
         strategy = problem.source_problem_dir / (base or "solution")
-        role = "naive" if (base or "").startswith("baselines/") else "reference"
+        role = _strategy_role(base or "solution")
         inference = _manifest_inference_rel(strategy, role=role)
         if inference is not None:
             return f"{base or 'solution'}/{inference}"
+        if _continuous_ml_strategy_required(problem):
+            raise ValueError(
+                f"{role} strategy {base or 'solution'!r} must declare "
+                "strategy.manifest.json or model.manifest.json"
+            )
         if Path(entrypoint).name.lower().startswith("train"):
             raise ValueError(
                 f"reference entrypoint {entrypoint!r} looks like a training script; "
@@ -204,6 +183,6 @@ def solution_script_rel(problem: HarnessProblem, *, solution_dir: str) -> str:
 
 
 def reference_interpreter(sol_rel: str) -> str:
-    """Interpreter for a reference entrypoint: ``python`` for a ``.py`` file
-    (ML_Envs solution.py), ``bash`` for a ``.sh`` script (native solve.sh)."""
+    """Interpreter for a reference entrypoint: ``python`` for a ``.py`` inference
+    entrypoint, ``bash`` for a ``.sh`` script (solve.sh)."""
     return "python" if sol_rel.endswith(".py") else "bash"

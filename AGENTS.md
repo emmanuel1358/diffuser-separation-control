@@ -3,6 +3,34 @@
 These instructions are for OpenAI Codex and other repository-aware agents. They
 mirror the Cursor and Claude ground-truth/oracle skill content.
 
+## Shared code ownership (template vs mothership)
+
+`lbx-rl-tasks-iso-template` owns shared tooling (`grader/`, `harness/`,
+`alignerr_plugin/`, `base/`, `taiga_runtime/rubric/`, agent rules, shared docs
+and scripts). Those paths sync into `lbx-rl-tasks-iso-mothership` and overwrite
+any mothership-side edits.
+
+- If you are working in **mothership**: do not edit template-owned paths. Change
+  them here in the template, merge, then run/wait for **Sync shared code from
+  template**. Mothership CI check `template-owned-paths` will reject direct edits.
+- If you are working in **this template**: shared-tooling PRs belong here.
+- Mothership-only files under `docs/` / `scripts/` (e.g. `docs/INFRA.md`,
+  `scripts/poll_taiga_runs.py`) are not in this repo and stay editable in mothership.
+
+## Task Authoring Skills
+
+Start with `.cursor/skills/alignerr-task-authoring/SKILL.md` (mirrored under
+`.claude/skills/`) and load every applicable specialized skill:
+
+- `ml-tasks`, `mujoco-tasks`, `numerical-solver-tasks`
+- `software-engineering-tasks`, `service-capsule-tasks`
+- `hidden-env-tasks`, `prometheus-delivery`
+- `deterministic-grading`, `rubric-design`, `reward-hacking-security`
+- `ground-truth-oracle`, `task-migration`
+
+New software problems require all trusted CI checks green and Boreal aggregate
+`<= 0.4` across valid configured attempts.
+
 ## Ground Truth Oracle
 
 Use these rules when creating or reviewing `solution/` artifacts,
@@ -11,20 +39,22 @@ Use these rules when creating or reviewing `solution/` artifacts,
 
 ## Contract
 
-- Every task needs `solution/solve.sh`; it is the oracle submission.
+- Every task needs a trusted reference under `solution/`: `solve.sh` for
+  script-driven tasks or an inference-only strategy entrypoint for continuous ML.
 - Every task must declare `[difficulty].task_type`, `[difficulty].domain`, and `[difficulty].reward_type`; enum values live in `alignerr_plugin.task_metadata`.
-- `task_type` is one of `ml`, `mujoco`, `cfd`, `structures`. `domain` is an enum scoped by `task_type` and is used by the dashboard/Supabase index for diversity tracking.
-- Declare `[environment].required_resources` as one of the Taiga enum values in `alignerr_plugin.taiga_resources`. **`ml` tasks deploy on TPU by default** (`13vcpu+32gib+tpuv5e1x1`; the `ml` starter ships this) because TPU is faster on Taiga, while the reference still runs on GPU; an `ml` task should request an `h100/*` enum only when it genuinely cannot run on a TPU. Other task types that can use acceleration should request an H100 enum; pick a CPU enum only when the task genuinely cannot use one. `base_flavor = "auto"` infers CPU/GPU/graphics/TPU from the enum; use `gpu-openroad` only for EDA/OpenROAD tasks with a non-graphics H100 enum. Keep Dockerfiles generic (`ARG BASE_IMAGE`/`ARG BASE_TAG`) so the harness/mothership inject the right base.
+- `task_type` is one of `ml`, `mujoco`, `cfd`, `structures`, `software_engineering`. `domain` is an enum scoped by `task_type` and is used by the dashboard/Supabase index for diversity tracking.
+- `software_engineering` may use the simple single-image `/tmp/output/repo` contract or a service graph with a service-owned repository artifact, per-service Dockerfiles, a separate verifier, and a canonical result under `/tmp/output`. Taiga service graphs must be packaged by trusted tooling as an outer capsule. Declared SSE MCP is supported only through that capsule's audited service-DNS proxy; unbundled SSE is rejected.
+- Declare `[environment].required_resources` as one of the Taiga enum values in `alignerr_plugin.taiga_resources`. The `ml` starter defaults to H100 tier `12vcpu+100gib+h100/2`; keep an accelerator tier when the work benefits from it and choose CPU only when justified. Prometheus starters may use their documented defaults. `base_flavor = "auto"` infers CPU/GPU/graphics/TPU from the enum; use `gpu-openroad` only for EDA/OpenROAD tasks with a non-graphics H100 enum. Keep Dockerfiles generic (`ARG BASE_IMAGE`/`ARG BASE_TAG`) so the harness/mothership inject the right base.
 - Available resource enums: CPU `2vcpu+6gib`, `4vcpu+16gib`, `6vcpu+32gib`, `8vcpu+64gib`, `16vcpu+64gib`, `16vcpu+128gib`; CPU perf `2vcpu+6gib+perf`, `4vcpu+16gib+perf`, `6vcpu+32gib+perf`, `8vcpu+64gib+perf`, `16vcpu+64gib+perf`, `16vcpu+128gib+perf`; TPU `13vcpu+32gib+tpuv5e1x1`, `16vcpu+64gib+tpuv5e2x2`, `50vcpu+128gib+tpuv5e2x2`; H100 `3vcpu+25gib+h100/8`, `6vcpu+50gib+h100/4`, `12vcpu+100gib+h100/2`, `24vcpu+200gib+h100/1`; H100 graphics `3vcpu+25gib+h100/8+graphics`, `6vcpu+50gib+h100/4+graphics`, `12vcpu+100gib+h100/2+graphics`, `24vcpu+200gib+h100/1+graphics`.
-- `ml` tasks must declare `[difficulty].license` (a permissive SPDX id from `task_metadata.LICENSES`: MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unlicense, CC0-1.0, CC-BY-4.0, PDDL-1.0, UPL-1.0), or `not_applicable` for edge cases with no applicable external-dataset license. Trace the dataset license upstream; copyleft / non-commercial / research-only data is rejected. Other task types use solver-generated data and may omit it.
+- `ml` tasks must declare `[difficulty].license` (a permissive SPDX id from `task_metadata.LICENSES`) or `self_generated` for fully synthetic data. Trace dataset licenses upstream; copyleft/non-commercial/research-only data is rejected. Other task types may omit it.
 - `reward_type = "multi_deterministic_rubrics"` oracles must create all required `[[outputs]]` artifacts and score `1.0` under the same `scorer/compute_score.py` used for agents.
-- `reward_type = "continuous_scoring_function"` references should score `0.5 ± 0.05`; this preserves ML_Envs continuous-score/reference behavior.
+- `reward_type = "continuous_scoring_function"` references should score `0.5 ± 0.05`.
 - Any task type (not just `mujoco`) may attach a reviewer video by declaring `[ground_truth].render_outputs`; doing so generalizes the same video contract (video named `rendering.mp4`, exactly `1280x720` h264, committed to `.alignerr/ground_truth/`).
 - Numerical-solver tasks (`cfd` / `structures`) use the base-image solver stack; a grader/renderer that needs a base-only engine (OpenFOAM/SU2/OpenSees) must set `[ground_truth].in_container = true` so solve+grade+render run inside the task image. `instruction.md` stays solver-agnostic, and the core solution implementation (`solution/solve.sh` or solution files it calls) must include solver-specific runnable material for the submitted ground-truth oracle. Do not require agent transcript checks or solver-evidence artifacts. See `docs/NUMERICAL_SOLVERS.md` and `project_guidelines/cfd/cfd_environments.md`.
 - Simulation / interaction tasks where the agent must probe a black-box environment (hidden dynamics it cannot read) set `[environment].hidden_env = "env"|"hybrid"` (orthogonal to `task_type`). The rubric server spawns an RPC env server the agent reaches over `/tmp/env.sock`; ship the hidden env at `scorer/data/env.py` (`make_env`, baked root-only) and a public `data/env_client.py`, and grade with `grading.load_env_module` + `grading.load_submitted_policy`. Do NOT use it for static-data tasks. See `docs/HIDDEN_ENV.md` and `examples/hidden-env-bandit/`.
 - If a MuJoCo task needs a trained policy/model, commit the trained artifact or deterministic exporter under `solution/`; full training code is optional provenance, not the validation path.
 - Reviewer video is required for `mujoco` tasks. Declare it in `[ground_truth]` and generate it with `solution/render.sh`.
-- Reviewer videos are MuJoCo-specific and must be 16:9 720p: exactly `1280x720`.
+- MuJoCo videos must be H.264, exactly `1280x720`; other task types may declare reviewer media through `[ground_truth].render_outputs`.
 
 ## Required `task.toml`
 
@@ -84,22 +114,19 @@ uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime rubric-qual
 uv run lbx-rl-harness run --problem-dir problems/<task_id> --runtime claude-code
 ```
 
-Commit both:
+Trusted CI generates authoritative proof/lock evidence from the immutable PR.
+Do not commit local generated proof/lock files. Commit declared reviewed media:
 
 ```bash
-git add problems/<task_id>/.alignerr/build_proof.json
 git add problems/<task_id>/.alignerr/ground_truth/
 ```
-
-For `ml` tasks, `.alignerr/ground_truth/` may be absent; still commit the
-updated `build_proof.json`.
 
 ## Do Not
 
 - Do not treat agent difficulty scores as oracle/reference scores. Agents should generally remain below the task difficulty threshold, while ground-truth submissions must match the declared `reward_type` target.
 - Do not store generated review videos in `solution/` or `.harness-runs/` as the PR artifact.
 - Do not require rendering videos for `ml` tasks unless the task explicitly needs one.
-- Do not accept videos without checksum/size/dimension metadata in `build_proof.json`.
+- Do not accept videos without checksum/size/dimension metadata in trusted CI evidence.
 - Do not lower the oracle score to make a task harder; task difficulty comes from local/LLM/Boreal agent attempts remaining below the desired threshold.
 
 ## References

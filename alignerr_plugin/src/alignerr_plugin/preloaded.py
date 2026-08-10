@@ -162,8 +162,6 @@ def qa_visible_public_files(
 # Conventional dataset dirs auto-mounted (read-only) by trusted CI for known
 # task types, so the raw dataset is mounted at deploy time instead of baked into
 # the per-task image. Each entry is (source-relative-to-problem-dir, mount_path).
-# Mirrors the ML_Envs convention (data/public -> /data, data/private ->
-# /mcp_server/data) using this template's layout.
 AUTO_MOUNT_SPECS: dict[str, list[tuple[str, str]]] = {
     "ml": [
         ("data", "/data"),

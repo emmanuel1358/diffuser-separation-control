@@ -1,0 +1,7 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "description": "Synthetic nested-service cutover conformance task.",
+    "instance_id": "frontier-service-cutover"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "cases": [
+    {
+      "claim": {
+        "billed_cents": 12500,
+        "claim_id": "H-101",
+        "contract_cap_cents": 10000,
+        "covered": true
+      },
+      "expected": {
+        "claim_id": "H-101",
+        "decision": "pay",
+        "payable_cents": 10000
+      }
+    },
+    {
+      "claim": {
+        "billed_cents": 4200,
+        "claim_id": "H-102",
+        "contract_cap_cents": 9000,
+        "covered": true
+      },
+      "expected": {
+        "claim_id": "H-102",
+        "decision": "pay",
+        "payable_cents": 4200
+      }
+    },
+    {
+      "claim": {
+        "billed_cents": 7000,
+        "claim_id": "H-103",
+        "contract_cap_cents": 7000,
+        "covered": false
+      },
+      "expected": {
+        "claim_id": "H-103",
+        "decision": "deny",
+        "payable_cents": 0
+      }
+    }
+  ],
+  "schema_version": "claim-cases.v1"
+}

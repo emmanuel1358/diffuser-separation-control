@@ -11,13 +11,12 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
-from alignerr_plugin.local_runtime import SLIM_FALLBACK_TURN_BONUS
-
 from lbx_rl_tasks_harness.docker import (
     build_task_image,
     copy_output_from_container,
     start_task_container,
     stop_task_container,
+    verifier_container_capabilities,
 )
 from lbx_rl_tasks_harness.mcp_bridge import RubricMcpBridge
 from lbx_rl_tasks_harness.models import HarnessProblem
@@ -387,20 +386,14 @@ async def run_claude_code(
     transcript_path: Path,
     model_name: str | None = None,
     max_steps: int | None = None,
-    flavor: str = "auto",
 ) -> dict[str, Any]:
     effective_model = effective_model_name(model_name)
-    build = build_task_image(problem, flavor=flavor)
+    build = build_task_image(problem)
     image_tag = build.image_tag
-    if build.flavor_fallback:
-        # Slim fallback: agent pip-installs ML wheels at runtime, so add a turn bonus.
-        max_steps = (max_steps or DEFAULT_MAX_TURNS) + SLIM_FALLBACK_TURN_BONUS
-        print(
-            f"[slim fallback] agent turn budget bumped to {max_steps} "
-            f"(+{SLIM_FALLBACK_TURN_BONUS}).",
-            flush=True,
-        )
-    started = start_task_container(image_tag)
+    started = start_task_container(
+        image_tag,
+        verifier_capabilities=verifier_container_capabilities(problem),
+    )
     try:
         async with RubricMcpBridge(started.container_id) as bridge:
             extra_fields = extra_fields_for_mcp(problem, image_tag)

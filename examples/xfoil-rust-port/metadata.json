@@ -1,0 +1,38 @@
+{
+  "benchmark": "taiga_task",
+  "problem_data": {
+    "instance_id": "xfoil-rust-port",
+    "description": "Port the headless behavioral surface of XFOIL 6.97 to a standalone Rust repository."
+  },
+  "provenance": {
+    "source_revision": "d11a1544b53623c01bb3b0cceb5862311be0e1f8",
+    "source_archive_sha256": "fabf00130639aadf5365eea07446df1a267ff907b5f6f0b9ef6d14aa039cde2c",
+    "components": [
+      {
+        "name": "XFOIL 6.97",
+        "path": "data/xfoil-source.tar.gz",
+        "license": "GPL-2.0-or-later",
+        "license_file": "xfoil-source/src/gpl.txt"
+      },
+      {
+        "name": "XFOIL Plotlib",
+        "path": "data/xfoil-source.tar.gz",
+        "license": "LGPL-2.0-or-later",
+        "license_file": "xfoil-source/plotlib/GPL-library"
+      },
+      {
+        "name": "Rust ceiling reference",
+        "path": "(maintainer-only; not present in rollout image)",
+        "license": "MIT",
+        "license_file": "(maintainer-only LICENSE)"
+      },
+      {
+        "name": "Task and framework material",
+        "path": ".",
+        "license": "Apache-2.0"
+      }
+    ],
+    "commercial_delivery_approved": false,
+    "distribution_note": "No commercial-delivery permission is inferred; downstream distribution requires license and source-offer review."
+  }
+}

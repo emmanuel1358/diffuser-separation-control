@@ -14,8 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from grader_runner import run_grader, worker
+from grading import runtime_hardening
 from grader_runner.run_grader import main
 
 
@@ -348,8 +348,9 @@ def test_runner_locks_down_grader_and_private_dirs_before_worker(
         path.mkdir()
     seen: dict[str, object] = {}
 
-    def fake_lock(paths):
+    def fake_lock(paths, *, readonly_mount_ok=()):
         seen["locked_paths"] = tuple(Path(path) for path in paths)
+        seen["readonly_mount_ok"] = tuple(Path(path) for path in readonly_mount_ok)
 
     def fake_cleanup(path):
         seen["cleanup_path"] = Path(path)
@@ -357,6 +358,9 @@ def test_runner_locks_down_grader_and_private_dirs_before_worker(
 
     def fake_run(cmd, **_kwargs):
         result_path = Path(cmd[cmd.index("--result-path") + 1])
+        trace_path = Path(cmd[cmd.index("--evaluation-trace") + 1])
+        seen["trace_path"] = trace_path
+        trace_path.write_text('{"private": true}\n')
         result_path.write_text(
             json.dumps(
                 {
@@ -387,7 +391,78 @@ def test_runner_locks_down_grader_and_private_dirs_before_worker(
 
     assert exit_code == 0
     assert seen["locked_paths"] == (grader_dir, private_dir)
+    # Both the code tree and held-out truth may arrive on a read-only mount
+    # (grader:ro bind mount / is_read_only squashfs); the relaxation is still
+    # gated on the filesystem really being read-only inside lock_down.
+    assert seen["readonly_mount_ok"] == (grader_dir, private_dir)
     assert seen["cleanup_path"] == workspace
+    assert seen["trace_path"].parent != output_dir
+    assert json.loads((output_dir / "evaluation-details.json").read_text()) == {
+        "private": True
+    }
+    assert not seen["trace_path"].parent.exists()
+
+
+def test_trace_publish_failure_writes_infrastructure_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    grader_dir = tmp_path / "grader"
+    private_dir = tmp_path / "private"
+    output_dir = tmp_path / "verifier"
+    for path in (workspace, grader_dir, private_dir):
+        path.mkdir()
+
+    cleanup = {
+        "killed_processes": 0,
+        "removed_symlinks": 0,
+        "removed_nonregular": 0,
+    }
+    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths: None)
+    monkeypatch.setattr(run_grader, "pre_grade_cleanup", lambda _path: cleanup)
+    monkeypatch.setattr(run_grader, "prepare_grader_cache", lambda: {})
+
+    def fake_run(cmd, **_kwargs):
+        result_path = Path(cmd[cmd.index("--result-path") + 1])
+        trace_path = Path(cmd[cmd.index("--evaluation-trace") + 1])
+        trace_path.write_text('{"private": true}\n')
+        result_path.write_text(
+            json.dumps(
+                {
+                    "score": 1.0,
+                    "subscores": {"score": 1.0},
+                    "weights": {"score": 1.0},
+                    "metadata": {},
+                }
+            )
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(run_grader.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        run_grader,
+        "_persist_evaluation_trace",
+        lambda _source, _output: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    exit_code = run_grader._run_worker(
+        workspace=workspace,
+        grader_dir=grader_dir,
+        private=private_dir,
+        output_dir=output_dir,
+        transcript=None,
+        timeout_s=10.0,
+    )
+
+    assert exit_code == 1
+    details = json.loads((output_dir / "reward-details.json").read_text())
+    assert details["score"] == 0.0
+    assert details["env_internal_failure"] is True
+    assert (
+        details["metadata"]["grading_errors"][0]["error_type"]
+        == "evaluation_trace_persist_failed"
+    )
 
 
 def test_runner_writes_failure_when_worker_launch_raises(
@@ -434,6 +509,64 @@ def test_runner_writes_failure_when_worker_launch_raises(
     assert (
         details["metadata"]["grading_errors"][0]["error_type"] == "grader_launch_failed"
     )
+
+
+def test_unreadable_result_on_a_full_disk_is_charged_to_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Filling the box so the grader cannot publish must not void the episode.
+
+    Harbor used to emit grader_result_missing as an infrastructure failure here
+    regardless of the machine's state, so an agent could discard any attempt it
+    was about to lose by exhausting the filesystem.
+    """
+    workspace = tmp_path / "workspace"
+    grader_dir = tmp_path / "grader"
+    private_dir = tmp_path / "private"
+    output_dir = tmp_path / "verifier"
+    for path in (workspace, grader_dir, private_dir):
+        path.mkdir()
+
+    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths: None)
+    monkeypatch.setattr(
+        run_grader,
+        "pre_grade_cleanup",
+        lambda _path: {
+            "killed_processes": 0,
+            "removed_symlinks": 0,
+            "removed_nonregular": 0,
+        },
+    )
+    monkeypatch.setattr(run_grader, "prepare_grader_cache", lambda: {})
+    monkeypatch.setattr(
+        run_grader,
+        "sample_resource_exhaustion",
+        lambda *a, **k: runtime_hardening.ResourceExhaustion(
+            disk=True, shmem=False, meminfo_kib={}
+        ),
+    )
+    # Exit 0 and never write the result file, as a grader killed mid-publish would.
+    monkeypatch.setattr(
+        run_grader.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    exit_code = run_grader._run_worker(
+        workspace=workspace,
+        grader_dir=grader_dir,
+        private=private_dir,
+        output_dir=output_dir,
+        transcript=None,
+        timeout_s=10.0,
+    )
+
+    assert exit_code == 0
+    reward = json.loads((output_dir / "reward.json").read_text())
+    details = json.loads((output_dir / "reward-details.json").read_text())
+    assert reward["score"] == 0.0
+    assert details["env_internal_failure"] is False
+    assert details["metadata"]["agent_fault"] == "disk_exhausted"
 
 
 def test_runner_ignores_success_payload_on_signal_exit(

@@ -1,0 +1,281 @@
+{
+  "alignerr_cli_version": "0.1.0",
+  "base_image_ref": "lbx-tasks-base:runtime-ml-core-py313-local",
+  "built_at": "2026-07-30T22:09:35.459038+00:00",
+  "duration_seconds": 2.54591717699077,
+  "ground_truth_result": {
+    "details_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template-xfoil-pr/.harness-runs-amd64/xfoil-rust-port-problem-dir-1785449363/verifier/reward-details.json",
+    "graded_at": "2026-07-30T22:10:53.790691+00:00",
+    "metadata": {
+      "evaluation": {
+        "attested": false,
+        "decisions": {
+          "geometry": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          },
+          "inviscid": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          },
+          "polar_state": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          },
+          "viscous": {
+            "accepted": true,
+            "reason": "criterion_passed"
+          }
+        },
+        "plan_sha256": "09ce2db463c9e6d556ae7daafc34a2eb7dbe82835b5d262e910f67546dc7e33b",
+        "protocol": "declarative-rubric.v1",
+        "schema_version": "rubric-evaluation-receipt.v1",
+        "seed_commitment": "b74206ed0e3b560682f5ba03f8f6dbb80f0a57087a0665bf317c0cc4a50d16b7",
+        "task_spec_sha256": "ac33f975230393e6325c50dcb7a3acbf4cfb094fda905b2b9e042d84c863cb89"
+      },
+      "headline_score": 1.0,
+      "post_grade_cleanup": {
+        "killed_processes": 0,
+        "removed_nonregular": 0,
+        "removed_symlinks": 0,
+        "removed_tmpfs_entries": 0,
+        "restored_output_directory": 0
+      },
+      "pre_grade_cleanup": {
+        "killed_processes": 0,
+        "removed_nonregular": 0,
+        "removed_symlinks": 0,
+        "removed_tmpfs_entries": 0,
+        "restored_output_directory": 0
+      },
+      "process_monitor": {
+        "emulator_exec_events": 1,
+        "exec_events": 1,
+        "exec_paths": [
+          "/tmp/rstub",
+          "/tmp/xfoil-sealed-binary-1_iymjxi/transform-candidate"
+        ],
+        "setup_error": null,
+        "status": "ok",
+        "thread_clones": 0,
+        "violation": null
+      },
+      "protocol": "transform/v1",
+      "reported_final_score": 1.0,
+      "return_shape": "rubric_grade",
+      "rubric_breakdown": [
+        {
+          "actual": 1.0,
+          "criterion": "geometry",
+          "criterion_id": "geometry",
+          "description": "geometry behavioral compatibility",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "geometry",
+          "label": "geometry behavioral compatibility",
+          "passed": true,
+          "reasoning": "geometry behavioral compatibility",
+          "score": 1.0,
+          "weight": 0.25
+        },
+        {
+          "actual": 1.0,
+          "criterion": "inviscid",
+          "criterion_id": "inviscid",
+          "description": "inviscid behavioral compatibility",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "inviscid",
+          "label": "inviscid behavioral compatibility",
+          "passed": true,
+          "reasoning": "inviscid behavioral compatibility",
+          "score": 1.0,
+          "weight": 0.25
+        },
+        {
+          "actual": 1.0,
+          "criterion": "viscous",
+          "criterion_id": "viscous",
+          "description": "viscous behavioral compatibility",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "viscous",
+          "label": "viscous behavioral compatibility",
+          "passed": true,
+          "reasoning": "viscous behavioral compatibility",
+          "score": 1.0,
+          "weight": 0.25
+        },
+        {
+          "actual": 1.0,
+          "criterion": "polar_state",
+          "criterion_id": "polar_state",
+          "description": "polar state behavioral compatibility",
+          "expected": null,
+          "grading_type": "deterministic",
+          "id": "polar_state",
+          "label": "polar state behavioral compatibility",
+          "passed": true,
+          "reasoning": "polar state behavioral compatibility",
+          "score": 1.0,
+          "weight": 0.25
+        }
+      ],
+      "rubric_weights": {
+        "geometry behavioral compatibility": 0.25,
+        "inviscid behavioral compatibility": 0.25,
+        "polar state behavioral compatibility": 0.25,
+        "viscous behavioral compatibility": 0.25
+      },
+      "scoring_mode": "weighted",
+      "security_tier": "sealed_rescore",
+      "serialized_grade": {
+        "penalties": null,
+        "score": 1.0,
+        "scoring_mode": "weighted",
+        "structured_subscores": [
+          {
+            "criterion_id": "geometry",
+            "description": "geometry behavioral compatibility",
+            "grading_criteria": "geometry behavioral compatibility",
+            "id": "geometry",
+            "label": "geometry behavioral compatibility",
+            "max_score": 1.0,
+            "name": "geometry behavioral compatibility",
+            "reasoning": "geometry behavioral compatibility",
+            "score": 1.0,
+            "weight": 0.25
+          },
+          {
+            "criterion_id": "inviscid",
+            "description": "inviscid behavioral compatibility",
+            "grading_criteria": "inviscid behavioral compatibility",
+            "id": "inviscid",
+            "label": "inviscid behavioral compatibility",
+            "max_score": 1.0,
+            "name": "inviscid behavioral compatibility",
+            "reasoning": "inviscid behavioral compatibility",
+            "score": 1.0,
+            "weight": 0.25
+          },
+          {
+            "criterion_id": "viscous",
+            "description": "viscous behavioral compatibility",
+            "grading_criteria": "viscous behavioral compatibility",
+            "id": "viscous",
+            "label": "viscous behavioral compatibility",
+            "max_score": 1.0,
+            "name": "viscous behavioral compatibility",
+            "reasoning": "viscous behavioral compatibility",
+            "score": 1.0,
+            "weight": 0.25
+          },
+          {
+            "criterion_id": "polar_state",
+            "description": "polar state behavioral compatibility",
+            "grading_criteria": "polar state behavioral compatibility",
+            "id": "polar_state",
+            "label": "polar state behavioral compatibility",
+            "max_score": 1.0,
+            "name": "polar state behavioral compatibility",
+            "reasoning": "polar state behavioral compatibility",
+            "score": 1.0,
+            "weight": 0.25
+          }
+        ],
+        "subscores": {
+          "geometry behavioral compatibility": 1.0,
+          "inviscid behavioral compatibility": 1.0,
+          "polar state behavioral compatibility": 1.0,
+          "viscous behavioral compatibility": 1.0
+        },
+        "weights": {
+          "geometry behavioral compatibility": 0.25,
+          "inviscid behavioral compatibility": 0.25,
+          "polar state behavioral compatibility": 0.25,
+          "viscous behavioral compatibility": 0.25
+        }
+      },
+      "suite_case_counts": {
+        "geometry": 2,
+        "inviscid": 2,
+        "polar_state": 2,
+        "viscous": 2
+      },
+      "task_spec_sha256": "ac33f975230393e6325c50dcb7a3acbf4cfb094fda905b2b9e042d84c863cb89",
+      "weighted_subscore_total": 1.0,
+      "weighted_total": 1.0
+    },
+    "reward_path": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template-xfoil-pr/.harness-runs-amd64/xfoil-rust-port-problem-dir-1785449363/verifier/reward.json",
+    "run_dir": "/Users/manusharma/projects/rl_tasks/lbx-rl-tasks-iso-template-xfoil-pr/.harness-runs-amd64/xfoil-rust-port-problem-dir-1785449363",
+    "runtime": "solution",
+    "score": 1.0,
+    "structured_subscores": [
+      {
+        "criterion_id": "geometry",
+        "description": "geometry behavioral compatibility",
+        "grading_criteria": "geometry behavioral compatibility",
+        "id": "geometry",
+        "label": "geometry behavioral compatibility",
+        "max_score": 1.0,
+        "name": "geometry behavioral compatibility",
+        "reasoning": "geometry behavioral compatibility",
+        "score": 1.0,
+        "weight": 0.25
+      },
+      {
+        "criterion_id": "inviscid",
+        "description": "inviscid behavioral compatibility",
+        "grading_criteria": "inviscid behavioral compatibility",
+        "id": "inviscid",
+        "label": "inviscid behavioral compatibility",
+        "max_score": 1.0,
+        "name": "inviscid behavioral compatibility",
+        "reasoning": "inviscid behavioral compatibility",
+        "score": 1.0,
+        "weight": 0.25
+      },
+      {
+        "criterion_id": "viscous",
+        "description": "viscous behavioral compatibility",
+        "grading_criteria": "viscous behavioral compatibility",
+        "id": "viscous",
+        "label": "viscous behavioral compatibility",
+        "max_score": 1.0,
+        "name": "viscous behavioral compatibility",
+        "reasoning": "viscous behavioral compatibility",
+        "score": 1.0,
+        "weight": 0.25
+      },
+      {
+        "criterion_id": "polar_state",
+        "description": "polar state behavioral compatibility",
+        "grading_criteria": "polar state behavioral compatibility",
+        "id": "polar_state",
+        "label": "polar state behavioral compatibility",
+        "max_score": 1.0,
+        "name": "polar state behavioral compatibility",
+        "reasoning": "polar state behavioral compatibility",
+        "score": 1.0,
+        "weight": 0.25
+      }
+    ],
+    "subscores": {
+      "geometry behavioral compatibility": 1.0,
+      "inviscid behavioral compatibility": 1.0,
+      "polar state behavioral compatibility": 1.0,
+      "viscous behavioral compatibility": 1.0
+    },
+    "trivial_baseline_score": 0.0,
+    "weights": {
+      "geometry behavioral compatibility": 0.25,
+      "inviscid behavioral compatibility": 0.25,
+      "polar state behavioral compatibility": 0.25,
+      "viscous behavioral compatibility": 0.25
+    }
+  },
+  "image_digest": "sha256:b8a42b904656381e80986dc4a56bffded741c3b14ed2b7f06af7bc9f3b9cffbe",
+  "platform": "linux/amd64",
+  "schema_version": "1.0",
+  "task_dir_sha256": "884fc3ddeb8135bc35acd4e932c5a52b27a9d45fc73d4bbff811b92502778853"
+}

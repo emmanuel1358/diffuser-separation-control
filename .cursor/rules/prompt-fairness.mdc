@@ -1,0 +1,27 @@
+---
+description: Agent-facing instruction quality and hidden-test fairness
+globs: "{problems,examples}/**/instruction.md,{problems,examples}/**/README.md"
+alwaysApply: false
+---
+
+# Prompt Fairness
+
+- Write for the agent, not graders or reviewers. State the problem, editable
+  path, public commands, output, compatibility/security/performance constraints,
+  and non-goals.
+- Name installed tools and libraries directly. Never tell agents to inspect the
+  Dockerfile, base image, `metadata.json`, `task.toml`, or declared dependencies
+  to discover requirements.
+- Mention `/tmp/output` and the exact required artifact. Mention public `/data`
+  inputs when present.
+- Every hidden behavior must follow from the prompt or public documentation.
+  Hidden tests may vary values, scale, schedules, errors, order, and seeds; they
+  may not add operations or product requirements.
+- Keep prompts substantive, ASCII-only, free of emoji/AI-artifact language, and
+  free of grader paths, weights, hidden cases, or answer hints.
+- CFD/structures prompts stay solver-agnostic; do not require a specific solver,
+  command transcript, or solver-evidence artifact unless it is a public product
+  requirement.
+- Exporter-added hardware/tool notices should not be duplicated manually.
+
+See `docs/AUTHORING.md` and the matching project guideline.

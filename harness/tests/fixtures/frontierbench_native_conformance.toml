@@ -1,0 +1,259 @@
+schema_version = "1.2"
+
+[task]
+name = "labelbox/frontierbench-native-conformance"
+description = "Synthetic capability-only conformance fixture."
+
+[difficulty]
+task_type = "mujoco"
+domain = "model_environment_construction"
+reward_type = "multi_deterministic_rubrics"
+
+[metadata.frontierbench_conformance]
+primitive_ids = [
+    "artifact.binary",
+    "artifact.file",
+    "artifact.path_set",
+    "artifact.service",
+    "artifact.tree",
+    "browser.sidecar",
+    "capture.pre_verification",
+    "determinism.repeated_gate",
+    "evaluation.engine",
+    "evaluation.gate",
+    "evaluation.report",
+    "mcp.sse",
+    "resource.agent",
+    "resource.verifier",
+    "result.canonical",
+    "security.sealed_verifier",
+    "service.build",
+    "service.capability",
+    "service.dependency",
+    "service.environment",
+    "service.graph",
+    "service.healthcheck",
+    "service.named_volume",
+    "service.network",
+    "service.port",
+    "service.shared_memory",
+    "toolchain.image_owned",
+    "workspace.lifecycle",
+]
+
+[environment]
+required_resources = "4vcpu+16gib"
+storage_mb = 16384
+allow_internet = false
+
+[agent]
+timeout_sec = 7200
+user = "agent"
+
+[agent.resources]
+cpus = 4
+memory_mb = 8192
+storage_mb = 8192
+gpus = 0
+platform = "linux/amd64"
+build_timeout_sec = 900
+runtime_timeout_sec = 7200
+network = "isolated"
+
+[verifier]
+timeout_sec = 900
+user = "root"
+
+[verifier.resources]
+cpus = 2
+memory_mb = 4096
+storage_mb = 4096
+gpus = 0
+platform = "linux/amd64"
+build_timeout_sec = 300
+runtime_timeout_sec = 900
+network = "none"
+
+[workspace]
+seed = "starter"
+root = "/workdir"
+agent_cwd = "/workdir/src"
+init_policy = "copy"
+git_baseline = true
+clean_paths = ["build", ".cache"]
+checkpoint_restore = true
+
+[[volumes]]
+name = "database-data"
+
+[[volumes]]
+name = "browser-shared"
+
+[[services]]
+name = "database"
+role = "sidecar"
+image = "example.invalid/database@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+env = { DATABASE_NAME = "conformance" }
+ports = [{ container_port = 5432, name = "postgres" }]
+healthcheck = { command = ["CMD", "pg_isready"], interval_sec = 2, timeout_sec = 3, retries = 10 }
+volumes = [{ volume = "database-data", target = "/var/lib/database", mode = "rw" }]
+
+[[services]]
+name = "migrate"
+role = "init"
+image = "example.invalid/migrate@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+depends_on = [{ service = "database", condition = "healthy" }]
+
+[[services]]
+name = "browser"
+role = "sidecar"
+image = "example.invalid/browser@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+env = { MCP_PORT = "3080" }
+ports = [{ container_port = 3080, name = "mcp" }]
+capabilities = ["SYS_PTRACE"]
+shm_mb = 1024
+healthcheck = { command = "curl -fsS http://127.0.0.1:3080/sse", interval_sec = 2, timeout_sec = 3, retries = 10 }
+volumes = [{ volume = "browser-shared", target = "/shared", mode = "rw" }]
+
+[[services]]
+name = "browser-observer"
+role = "sidecar"
+image = "example.invalid/observer@sha256:5555555555555555555555555555555555555555555555555555555555555555"
+network_mode = "share"
+network_share_target = "browser"
+
+[[services]]
+name = "main"
+role = "main"
+build = { context = "environment/main", dockerfile = "Dockerfile", platform = "linux/amd64", no_cache = true }
+user = "agent"
+env = { DATABASE_HOST = "database", BROWSER_HOST = "browser" }
+ports = [{ container_port = 8080, name = "app" }]
+depends_on = [
+    { service = "database", condition = "healthy" },
+    { service = "migrate", condition = "completed" },
+    { service = "browser", condition = "healthy" },
+]
+volumes = [{ volume = "browser-shared", target = "/workdir/shared", mode = "rw" }]
+
+[[services]]
+name = "verifier"
+role = "verifier"
+image = "example.invalid/verifier@sha256:6666666666666666666666666666666666666666666666666666666666666666"
+user = "root"
+
+[[captures]]
+name = "database-snapshot"
+service = "database"
+command = ["sh", "-c", "snapshot > /tmp/database.dump.tmp && mv /tmp/database.dump.tmp /tmp/database.dump"]
+timeout_sec = 60
+atomic_destination = "/tmp/database.dump"
+accepted_exit_codes = [0]
+failure_policy = "infrastructure"
+
+[[artifacts]]
+name = "result-file"
+kind = "file"
+source = "/workdir/result.json"
+destination = "result.json"
+service = "main"
+max_bytes = 1048576
+
+[[artifacts]]
+name = "source-tree"
+kind = "tree"
+source = "/workdir/src"
+destination = "src"
+service = "main"
+exclude = ["__pycache__", "*.pyc"]
+max_bytes = 10485760
+max_files = 1000
+max_depth = 20
+
+[[artifacts]]
+name = "source-set"
+kind = "path_set"
+sources = ["/workdir/src", "/workdir/pyproject.toml"]
+destination = "source-set"
+service = "main"
+max_bytes = 20971520
+max_files = 2000
+
+[[artifacts]]
+name = "executable"
+kind = "binary"
+source = "/workdir/bin/candidate"
+destination = "candidate"
+service = "main"
+preserve_mode = true
+max_bytes = 10485760
+
+[[artifacts]]
+name = "database-dump"
+kind = "service"
+source = "/tmp/database.dump"
+destination = "database.dump"
+service = "database"
+max_bytes = 10485760
+
+[[mcp_servers]]
+name = "browser"
+transport = "sse"
+url = "http://browser:3080/sse"
+service = "browser"
+depends_on = ["browser"]
+access = "agent"
+
+[mcp_servers.readiness]
+kind = "http"
+url = "http://browser:3080/sse"
+accepted_statuses = [200, 204]
+timeout_sec = 60
+interval_sec = 2
+
+[evaluation]
+engine = "rubric_task"
+entrypoint = "scorer/compute_score.py"
+hidden_fixtures = ["scorer/data/cases.json"]
+repetitions = 2
+
+[[reports]]
+name = "tests"
+format = "ctrf"
+path = "reports/tests.json"
+required = true
+max_bytes = 1048576
+
+[[reports]]
+name = "diagnostics"
+format = "json"
+path = "reports/diagnostics.json"
+required = false
+max_bytes = 1048576
+
+[[gates]]
+name = "behavior"
+kind = "behavioral"
+required = true
+weight = 0.75
+timeout_sec = 300
+report = "tests"
+
+[[gates]]
+name = "replay"
+kind = "determinism"
+required = true
+weight = 0.25
+timeout_sec = 300
+repetitions = 2
+report = "diagnostics"
+
+[result]
+output_root = "/tmp/output"
+reward_file = "grade.json"
+reward_key = "score"
+subscores_key = "subscores"
+reports = ["tests", "diagnostics"]
+trace_file = "trace.json"
+agent_fault_reward = 0.0
+infrastructure_fault = "discard"

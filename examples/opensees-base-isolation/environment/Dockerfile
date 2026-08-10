@@ -9,11 +9,17 @@ ENV MPLBACKEND=Agg
 
 WORKDIR /workdir
 
-RUN mkdir -p /mcp_server/data /workdir /tmp/output && chown -R 1000:1000 /workdir /tmp/output
+# Declared dependency channels. Each file is optional; the installer routes each
+# one to its isolation boundary:
+#   environment/apt.txt          apt packages (agent-visible)
+#   environment/requirements.txt pip into the runtime venv (agent-visible)
+#   scorer/requirements.txt      pip into root-only /mcp_server/grading_deps
+#   scorer/env-requirements.txt  pip into root-only /mcp_server/env_deps
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
 
-RUN env -u UV_SYSTEM_PYTHON uv pip install --python /opt/lbx-runtime/.venv/bin/python --no-cache \
-    openseespy \
-    numpy
+RUN mkdir -p /mcp_server/data /workdir /tmp/output && chown -R 1000:1000 /workdir /tmp/output
 
 # Public files the agent may read (world-readable at /data).
 COPY ${PROBLEM_DIR}/data/ /data/

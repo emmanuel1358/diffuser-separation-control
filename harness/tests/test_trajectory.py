@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from rich.console import Console
 
 from lbx_rl_tasks_harness.trajectory import _github_actions_preview
@@ -50,6 +51,35 @@ def test_streaming_renderer_prints_only_new_messages() -> None:
     text = console.export_text()
     assert text.count("Tool Result: bash") == 1
     assert "hello" in text
+
+
+def test_streaming_renderer_emits_github_actions_groups(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Under Actions the renderer logs foldable groups instead of rich panels.
+
+    `conftest.py` clears `GITHUB_ACTIONS` for this suite so the panel-rendering
+    tests are stable wherever they run; setting it back here keeps the CI-only
+    branch covered rather than merely hidden.
+    """
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    console = Console(record=True, force_terminal=False, width=100)
+    renderer = StreamingTrajectoryRenderer(console=console)
+
+    renderer.print_new_messages([_ToolMessage()])
+    renderer.print_new_messages([_ToolMessage()])
+    renderer.finish()
+
+    # Exact lines, not substrings: `"::group::" in out` would also pass if the
+    # renderer only ever emitted an opening marker, and `finish()` must stay
+    # silent here rather than closing with a rich rule.
+    assert capsys.readouterr().out.splitlines() == [
+        "Agent trajectory is streaming. Full fidelity is saved to trajectory.json.",
+        "::group::Step 01 - tool_result bash",
+        '{"output": "hello", "error": null, "system": null}',
+        "::endgroup::",
+    ]
+    assert console.export_text() == ""
 
 
 def test_print_rubric_quality_review_outputs_table() -> None:

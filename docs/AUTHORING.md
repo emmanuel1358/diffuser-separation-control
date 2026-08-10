@@ -3,10 +3,11 @@
 ## Setup
 
 ```bash
-git clone https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-template.git
-cd lbx-rl-tasks-template
+git clone https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-template.git
+cd lbx-rl-tasks-iso-template
 uv sync                # grading library + harness + local helpers (one shot)
 uv run lbx-rl-harness --help # confirm the local harness is installed
+uv run lbx-rl-template --help
 ```
 
 The `uv sync` installs:
@@ -25,12 +26,39 @@ local base. CPU tasks use `lbx-tasks-base:runtime-ml-core-py313-local`; GPU
 tasks use `lbx-tasks-base-gpu:runtime-ml-core-py313-local`. The first Docker
 build can be slow because it downloads Python and ML dependencies.
 
+### Local base images
+
+The local tag is a fixed name, so the harness checks the cached image's
+`lbx.base.drift_hash` label — a content hash over every `base/` build input —
+against your working tree before reusing it. A cached base built from a
+different `base/` revision (or from before this repo labelled local bases) is
+rebuilt, and the harness prints why and what the rebuild costs (~16.5 GB and
+tens of minutes) before starting. Without this you would instead get the
+failure from inside your task's own Docker build, typically a missing
+`/opt/lbx-runtime/install-task-deps.sh`.
+
+Set `LBX_RL_TASKS_ALLOW_STALE_BASE=1` to reuse the cached base anyway. That is
+only safe when your task does not depend on the `base/` change in flight — for
+example while switching between worktrees at different `base/` revisions.
+
 ## Scaffold a task
 
-There is one starter per supported `task_type` (`ml`, `mujoco`, `cfd`,
-`structures`). Copy the one that matches your task. Use the `prometheus-*`
-starters when a `cfd` or `structures` task should keep the same local/CI checks
-and submit to Prometheus while also running an independent Taiga mirror.
+Starters ship for `ml`, `mujoco`, `cfd`, `structures`, and
+`software_engineering`. Prefer the creator command so task identity placeholders
+and the generated rubric plan are refreshed automatically:
+
+```bash
+uv run lbx-rl-template create \
+  --name labelbox/my-repo-debugging-task \
+  --template software-engineering \
+  --out problems
+```
+
+For repository work, follow
+[`SOFTWARE_TRANSFORMATION_TASKS.md`](SOFTWARE_TRANSFORMATION_TASKS.md). Use the
+`prometheus-*` starters when a `cfd` or `structures` task should keep the same
+local/CI checks and submit to Prometheus while also running an independent Taiga
+mirror.
 Prometheus has two
 starter families per domain: non-eval starters set `[delivery].eval = false`,
 and eval starters set `[delivery].eval = true`. Both families follow the same
@@ -42,6 +70,7 @@ cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/ml problems/my-task
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/mujoco problems/reacher-control
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/cfd problems/my-cfd-case
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/structures problems/my-frame
+cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/software-engineering problems/my-repo-task
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-cfd problems/my-prometheus-cfd-case
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-structures problems/my-prometheus-frame
 cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-eval-cfd problems/my-prometheus-eval-cfd-case
@@ -50,15 +79,23 @@ cp -R alignerr_plugin/src/alignerr_plugin/starter_templates/prometheus-eval-stru
 
 Use the matching project guide:
 
+- Long-horizon software engineering and Frontier-style service tasks:
+  `project_guidelines/software_engineering/frontier_style_software_engineering_tasks.md`
+- New software task design and delivery:
+  `project_guidelines/software_engineering/new_task_design_workflow.md`
 - Non-eval CFD: `project_guidelines/cfd/prometheus_cfd_environments.md`
 - Eval CFD: `project_guidelines/cfd/prometheus_eval_cfd_environments.md`
 - Non-eval structures: `project_guidelines/strctural_engineering/PROMETHEUS_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`
 - Eval structures: `project_guidelines/strctural_engineering/PROMETHEUS_EVAL_STRUCTURAL_ENGINEER_OPENSEES_AUTHORING.md`
 
-After copying a starter, update `metadata.json` and `task.toml` so
+After copying a starter manually, update `metadata.json` and `task.toml` so
 `problem_data.instance_id` and `[task].name` match your directory. Copy
 task-specific patterns from the matching `examples/` reference (not the example
 directory itself).
+
+New software-engineering problems are accepted only after every required
+trusted CI check is green and the final problem-level Boreal aggregate score is
+`<= 0.4`. A green local run or oracle score alone is not completion.
 
 Before opening or updating a PR, run:
 
@@ -75,23 +112,22 @@ The ground-truth runtime checks the reference solution without calling an LLM.
 It creates or overwrites local generated evidence and, for rendered tasks,
 `.alignerr/ground_truth/` reviewer artifacts. Commit task source, reproducible
 reference/baseline assets, and reviewed render artifacts—not generated
-calibration locks or proofs. When the fork PR opens or updates, the template
-repo dispatches trusted CI in
-`lbx-rl-tasks-iso-mothership`, but the template PR stays the author-facing
-surface. The template workflow posts a handoff comment, and mothership posts the
-`trusted-ci/grade` check, dashboard link, diagnostics, and later Taiga/Boreal
-feedback comments back on the same fork PR. Authors and labelers do not need to
-open mothership to see pipeline status. See
+calibration locks or proofs. When the fork PR opens or updates, the trusted
+mothership control plane dispatches CI in `lbx-rl-tasks-iso-mothership`; no
+credentialed dispatch workflow runs in the template or task fork. The template
+PR remains the author-facing surface: mothership posts the `trusted-ci/grade`
+check, dashboard link, diagnostics, and later Taiga/Boreal feedback comments
+back on that PR. Authors and labelers do not need to open mothership to see
+pipeline status. See
 [`GROUND_TRUTH.md`](GROUND_TRUTH.md) for the oracle and reviewer video contract.
 
 Migrating an older task onto sealed continuous calibration, declarative
 `RubricTask`, or sealed `evaluation.plan.json`? Start with
 [`TASK_MIGRATION.md`](TASK_MIGRATION.md).
 
-For MuJoCo tasks, add the `run_qa`, `run_adversarial`, or
-`run_mujoco_adversarial` label when you want the non-blocking adversarial
-score-shaping review. That review also runs in mothership and posts its
-`MuJoCo Adversarial AutoQA (shadow)` comment back on the template PR.
+MuJoCo adversarial review and explicit Taiga deployment are also initiated by
+trusted mothership automation. They must not be dispatched by a workflow in the
+template or task fork. Their results are posted back to the template PR.
 
 There are no task categories. Add the files your task needs; the validator
 runs checks based on what is present.
@@ -104,15 +140,19 @@ problems/<task_id>/
 ├── metadata.json         # task identity and description metadata
 ├── instruction.md        # task prompt the agent sees
 ├── environment/
-│   └── Dockerfile        # FROM lbx-tasks-base, COPY scorer/ -> /mcp_server/grader/
+│   ├── Dockerfile        # FROM lbx-tasks-base, COPY scorer/ -> /mcp_server/grader/
+│   ├── requirements.txt  # optional: agent-visible pip deps
+│   └── apt.txt           # optional: agent-visible apt packages
 ├── scorer/
 │   ├── compute_score.py  # YOUR scorer (see docs/GRADING.md)
+│   ├── requirements.txt  # optional: grader-only pip deps (root-only)
+│   ├── env-requirements.txt # optional: hidden-env-only pip deps (root-only)
 │   └── data/             # private hidden test set
 ├── data/                 # public data the agent sees at /data/
-├── solution/solve.sh     # required reference/oracle solution
-├── solution/render.sh    # required reviewer video generation for mujoco tasks
-├── baselines/naive.sh    # optional weak baseline
-└── README.md
+├── solution/solve.sh     # required reference/oracle solution (layout varies for ML)
+├── solution/render.sh    # reviewer video when MuJoCo or render_outputs declared
+├── baselines/            # optional weak baseline (layout varies by starter)
+└── README.md             # optional
 ```
 
 ### Runtime Prompt Guidance
@@ -131,13 +171,119 @@ training. You may write domain-specific accelerator guidance yourself; the
 exporter avoids duplicating notices when your prompt already mentions GPU/TPU or
 `tmux`.
 
+## Task Dependencies
+
+**Never add packages to `base/`.** The base images are shared by every task and
+are code-owner reviewed; a task that edits them changes every other task's
+environment. Anything your task needs beyond the base is declared in that task's
+own dependency channels.
+
+Dependencies are declared as **files**, not `task.toml` fields, so a private
+package name never reaches the agent-visible `/task/task.toml`. Each file is
+optional; `base/install-task-deps.sh` (shipped into every base image at
+`/opt/lbx-runtime/install-task-deps.sh`) routes each one:
+
+| File | Installs into | Readable by |
+| --- | --- | --- |
+| `environment/apt.txt` | system apt | agent |
+| `environment/requirements.txt` | `/opt/lbx-runtime/.venv` | agent |
+| `scorer/requirements.txt` | `/mcp_server/grading_deps` (0700 root) | grader only |
+| `scorer/env-requirements.txt` | `/mcp_server/env_deps` (0700 root) | hidden env server only |
+
+**Placement is the isolation boundary, not a filing convention.** The two
+private trees live under `/mcp_server`, which is `0700 root`, so the uid-1000
+agent cannot read them; the grader worker prepends `grading_deps` to `sys.path`
+before loading `compute_score`, and the hidden env server prepends `env_deps`
+before loading `env.py`. A reference implementation or simulator declared in
+`environment/requirements.txt` instead is importable by the agent, which is how
+a scoring library or a black-box env leaks. Validation rejects a package
+declared in both an agent-visible and a private channel, and rejects bare VCS
+URLs and local paths because they defeat that overlap check — use a named PyPI
+spec or the PEP 508 `name @ url` form. `scorer/env-requirements.txt` is only
+valid on a task that sets `[environment].hidden_env`; see
+[`HIDDEN_ENV.md`](HIDDEN_ENV.md).
+
+Every starter wires the channels up the same way, before the private-data COPY
+and permission-sealing steps (the installer re-seals `/mcp_server` itself):
+
+```dockerfile
+COPY ${PROBLEM_DIR}/environment/ /tmp/task-deps/environment/
+COPY ${PROBLEM_DIR}/scorer/ /tmp/task-deps/scorer/
+RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps && rm -rf /tmp/task-deps
+```
+
+Check what is already in the base before declaring anything: the shared ML stack
+plus the numerical-solver stack (OpenSeesPy, OpenFOAM, SU2, CalculiX, Meep,
+aerosandbox, scikit-fem, PySpice, Cantera, and more) is listed in
+[`NUMERICAL_SOLVERS.md`](NUMERICAL_SOLVERS.md).
+
+### How the contract is enforced
+
+Validation checks the declaration two ways, and it is worth knowing which one
+is the real gate.
+
+**The image diff is authoritative.** After the local build, validation
+enumerates what is installed in the runtime venv, in `/mcp_server/grading_deps`,
+in `/mcp_server/env_deps`, and in apt, in both the base image and your built
+task image. Anything your image added must be accounted for by a channel. It
+compares outcomes, not Dockerfile text, so it does not matter how an install was
+spelled — `RUN sh -c 'pip install …'`, an alias, a shim, a variable, exec form —
+the package is either declared or it is not.
+
+Two consequences follow, both intended:
+
+- **Transitive dependencies need no declaration.** The dependency closure of
+  your declared packages is resolved from the metadata inside your built image,
+  so declaring `gymnasium` covers `cloudpickle` and `farama-notifications`
+  without listing them. Optional dependencies are only covered when you asked
+  for the extra: declare `gymnasium[box2d]`, not `gymnasium`, if you want
+  `box2d-py`.
+- **A pip install into a non-runtime interpreter is invisible and therefore
+  fine.** A conda solver env or `/opt/solver-envs/*/bin/pip` installs outside
+  the runtime venv, changes nothing the agent can import, and has no channel to
+  declare it in. For apt, only explicitly-installed packages are compared, so a
+  build toolchain installed and purged in one `RUN` leaves nothing behind.
+
+**The Dockerfile scan is a convenience.** Before the build, validation also
+reads the `environment/Dockerfile` and fails a direct `pip install`,
+`uv pip install`, or `apt-get install` with a line number and the channel to use
+instead — much more actionable than a package-name delta, and it costs nothing
+to produce. It is not what guarantees correctness, so a spelling it fails to
+recognise is a missing convenience rather than a way around the contract.
+
+### When a task needs something genuinely heavy
+
+A handful of engines have no channel: fragile source builds (XFOIL, AVL, PyNEC),
+CUDA extensions built against the base torch (DREAMPlace), and conda solver
+envs. Those stay per-task, built in `environment/Dockerfile` — see the per-task
+recipes in [`NUMERICAL_SOLVERS.md`](NUMERICAL_SOLVERS.md#still-per-task-not-baked-into-the-base).
+Split such a recipe: its apt build toolchain and any pip specs go in the
+channels, and only the un-channelable part (the fetch, the `make`, the
+`conda create`) stays in a `RUN`. A pip install aimed at a non-runtime
+interpreter — a conda solver env's `python` — is left alone by validation
+because no channel routes there.
+
+If the Dockerfile scan flags a `RUN` that genuinely has no channel, precede it
+with
+
+```dockerfile
+# lbx-allow-raw-install: <why this cannot use a channel>
+```
+
+which silences the scan for that one instruction. It does **not** waive the
+image diff, so it cannot be used to get an undeclared package into a task — if
+the install leaves a package behind, you still have to declare it. What it is
+for is the case where the scan is wrong: most often an apt build toolchain
+installed and purged in the same `RUN`, which the diff passes on its own.
+Reviewers read the reason.
+
 ## Task Metadata
 
 Every task must declare three enum-backed metadata fields in `[difficulty]`:
 
 ```toml
 [difficulty]
-task_type = "ml"                         # ml | mujoco | cfd | structures
+task_type = "ml"                         # ml | mujoco | cfd | structures | software_engineering
 domain = "scientific_discovery_computational_science" # enum scoped by task_type
 reward_type = "continuous_scoring_function" # or multi_deterministic_rubrics
 license = "MIT"                           # required for ml tasks; permissive SPDX id
@@ -153,8 +299,9 @@ identifier from `task_metadata.LICENSES` (`MIT`, `Apache-2.0`, `BSD-2-Clause`,
 carry incorrect license claims. Copyleft, share-alike, non-commercial, and
 research-only data is rejected outright because it cannot ship in a commercial
 delivery. (`not_applicable` is still accepted as a back-compat alias for
-`self_generated`.) `mujoco`/`cfd`/`structures` tasks use solver-generated or
-self-authored data and may omit the field.
+`self_generated`.) `mujoco`/`cfd`/`structures`/`software_engineering` tasks may
+omit the dataset-license field. Software tasks must still document upstream
+source licensing in their task README.
 
 `ml` tasks must also set `[difficulty].license_source` -- the provenance pointer
 a licensing code-owner verifies by hand. For a real license it must be the
@@ -181,16 +328,29 @@ Prometheus starter. Trusted CI still runs the same CFD/structures checks before
 delivery: solver-agnostic prompt checks, grader QA, solver-backed oracle
 validation, local agent score gates, Auto QA, and build-proof validation. Only
 the final delivery job changes from Taiga submission to the Prometheus Agent
-Service runner. For Prometheus CFD/structures, `trusted-ci/grade` waits on Submit Prometheus and
-fails when the Prometheus target average is missing or above `0.5`. Standard
-deviation and the trainability audit are diagnostic context, not approval gates.
+Service runner.
+
+For **non-eval** Prometheus CFD/structures, submit for review when **either**
+score lane clears (easing — two independent ways to clear the difficulty bar).
+Full rules and the required PR comment template:
+[`CFD_STRUCTURES_DUAL_LANE_REVIEW.md`](CFD_STRUCTURES_DUAL_LANE_REVIEW.md).
+
+- **Prometheus lane:** CI green, Prometheus mean `<= 0.6`, stddev `>= 0.08`.
+- **Achilles lane:** CI green, Boreal mean `<= 0.4` — **independent of
+  Prometheus**.
+- **Both lanes also require Boreal QA:** wait for Boreal QA to complete on the
+  current head with no undocumented criticals. A passing Prometheus score gate
+  is not permission to submit.
+- Document Boreal critical false positives on the PR (common case: Data Quality
+  treating a required output filename as a missing input).
+
 Eval rows are accepted once trusted CI is green; Boreal QA is non-blocking for
-eval. Non-eval rows also need Boreal required QA complete with no unresolved
-critical findings before review (warnings/info are fine; Boreal average is not
-a blocker). Self-iterate on clear criticals for non-eval; submit for coaching
-when stuck, or for acceptance when gates pass, and name which Boreal surface is
-latest. Submitting a non-passing non-eval row for review violates fair practices
+eval. Submitting a non-eval row that clears neither lane violates fair practices
 and may remove the tasker from the project.
+
+That Prometheus CFD/structures policy does not apply to newly authored
+`software_engineering` problems. Software problems require all trusted CI checks
+green **and** a Boreal aggregate score `<= 0.4`.
 
 Prometheus Harbor exports require agent/verifier user separation in
 ``task.toml``: ``[agent].user = "agent"`` (non-root uid 1000) and
@@ -224,6 +384,10 @@ from `required_resources`), or an explicit compatible `cpu` / `gpu` /
   it for rendering tasks: hardware GL/EGL does **not** work under Taiga's gVisor
   sandbox, so CUDA-native raster is the only deployable render path.
 - `tpu` ships `jax[tpu]` on Python 3.12.
+
+All three CUDA flavors (`gpu`, `gpu-blackwell`, `cuda-graphics`) share one
+matrix: CUDA 13.0.3 on Ubuntu 24.04, Python 3.13, torch 2.9.1+cu130. `cpu` is
+Python 3.13 too; only `tpu` differs.
 
 Base images are built and pushed with drift-hashed tags by
 `base/build_and_push.sh` (the tag is a content hash over every base build input,
@@ -281,7 +445,10 @@ example, ML includes the production taxonomy (`physical_sciences`,
 expansion areas (`world_models`, `active_perception`, `long_horizon_planning`).
 MuJoCo includes `policy_training_improvement` and `manipulation`, CFD includes
 `aerodynamics` and `vortex_suppression`, and structures includes
-`seismic_retrofit` and `topology_optimization`.
+`seismic_retrofit` and `topology_optimization`. Software engineering includes
+repository debugging, feature implementation, migrations, compatibility,
+performance, frontend, data systems, and security hardening; see
+[`SOFTWARE_TRANSFORMATION_TASKS.md`](SOFTWARE_TRANSFORMATION_TASKS.md).
 
 `task_type` is the broad domain family. `domain` is the finer diversity label
 used by the dashboard/Supabase index. `reward_type` controls the ground-truth
@@ -330,11 +497,20 @@ required = true
 description = "Final MJCF model the agent writes."
 ```
 
-This contract is task-type agnostic: `ml`, `mujoco`, `cfd`, `structures`, and any
-hidden-env variant all use the same `[[outputs]]` shape. The Taiga exporter
+This contract is task-type agnostic: `ml`, `mujoco`, `cfd`, `structures`,
+`software_engineering`, and any hidden-env variant all use the same `[[outputs]]`
+shape. The Taiga exporter
 copies these declarations into the problem payload as `outputs` and mirrors them
 under `extra_fields.task_metadata.outputs` so Taiga QA, local Taiga-format runs,
 and reviewers see the same required artifact list as the authoring validator.
+
+Software tasks may use either the simple single-image contract or a declared
+service/capsule graph. Simple tasks publish their repository under
+`/tmp/output/repo`; service tasks collect the repository from the agent service,
+publish the canonical verifier result under `/tmp/output`, and package
+per-service images into a trusted outer capsule. Declared SSE MCP endpoints are
+supported on Taiga only through that capsule's audited service-DNS proxy;
+arbitrary unbundled SSE export remains fail-closed.
 
 Do not use `/workspace` in task prompts or `task.toml` output paths.
 
@@ -433,11 +609,11 @@ cannot. Do not call LLM providers from `compute_score.py`.
 
 | Return shape | When to use |
 | --- | --- |
-| `float` in `[0, 1]` | ML_Envs-style continuous metric (RMSE/F1, anchor-mapped). Single number, no per-criterion breakdown. |
+| `float` in `[0, 1]` | Continuous metric (RMSE/F1, anchor-mapped). Single number, no per-criterion breakdown. |
 | `dict {score, subscores, weights, metadata}` | Custom anchor-mapped headline + diagnostic per-target rows in Boreal UI. The headline is `dict["score"]`, NOT a recomputed weighted average. |
 | `TASK = RubricTask(...)` | Mandatory declarative protocol for `multi_deterministic_rubrics`; shared APIs own loading, faults, aggregation, and traces. |
 
-### Bare float (simplest, ML_Envs migration)
+### Bare float (simplest)
 
 ```python
 # scorer/compute_score.py
@@ -448,14 +624,14 @@ def compute_score(workspace: Path, trajectory, private: Path) -> float:
     return anchor_map(f1, floor=0.0, perfect=1.0)
 ```
 
-This shape is intended for ML_Envs migrations where only the headline
+This shape is for scorers where only the headline
 score matters. See
 [`examples/mle-tabular-classification`](../examples/mle-tabular-classification/)
 for a complete continuous-scoring dataset task.
 
-For the full ML_Envs calibration pattern, including baseline/reference/perfect
+For the full calibration pattern, including baseline/reference/perfect
 anchors and difficulty targets for continuous reward functions, see
-[`docs/GRADING.md`](GRADING.md#continuous-reward-functions-from-ml_envs).
+[`docs/GRADING.md`](GRADING.md#continuous-reward-functions).
 
 ### Score dict (preserve a custom anchor map AND surface diagnostics)
 
@@ -473,7 +649,7 @@ The headline `score` stays exactly what you returned — the runtime does NOT
 recompute it from `subscores * weights`.
 
 Use this shape for continuous ML tasks when you want to preserve the
-original ML_Envs headline math and also expose diagnostic target
+original headline math and also expose diagnostic target
 progress values. This is still not a rubric: the subscores are
 continuous metrics, not pass/fail criteria.
 
@@ -519,9 +695,9 @@ env = []
 ```toml
 [runner]
 attempts = 3                    # n_attempts_per_problem
-turn_limit = 1500               # null = unlimited
-max_ctx = 1_000_000
-context_mode = "none"           # none / autocompact / memory
+turn_limit = 1430               # null = unlimited; unset default matches Taiga cap
+max_ctx = 1_000_000             # Taiga maximum
+context_mode = "autocompact"    # none / autocompact / memory
 api_model_name = "claude-fable-5"
 required_tools = ["bash", "str_replace_editor", "tmux"]
 
@@ -534,6 +710,16 @@ max_episode_sec = 3600
 
 These become per-problem and job-level fields in the Boreal submission.
 Defaults are sensible — leave the section out and the exporter uses them.
+
+### Context mode
+
+| Mode | API flags | Guidance |
+| --- | --- | --- |
+| Default (`none`) | neither | Stop when context fills. |
+| Memory | `enable_memory=true` | `memory` tool + context resets; wiki says up to ~500k total tokens across resets. **Do not enable without consulting Labelbox first.** |
+| Autocompact (default) | `enable_autocompact=true` | Silent summarize/compress near the limit; less control than Memory. Prefer this for long-horizon ISO tasks. |
+
+Trusted CI submit also uses these maxima when `[runner]` omits `max_ctx` / `turn_limit`.
 
 ## Holistic grading guide
 

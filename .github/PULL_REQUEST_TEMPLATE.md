@@ -22,13 +22,12 @@ fixtures used, and why the scoring is deterministic.
 
 ## Local Validation
 
-- [ ] I ran `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>`.
-- [ ] I committed the generated `problems/<task_id>/.alignerr/build_proof.json`.
-- [ ] I set `[difficulty].task_type` to `mujoco` or `ml`.
-- [ ] For rendered tasks, I committed generated reviewer artifacts under `problems/<task_id>/.alignerr/ground_truth/`.
+- [ ] I ran `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` (or `lbx-rl-template check`) for local feedback.
+- [ ] I did **not** commit `problems/<task_id>/.alignerr/build_proof.json` or generated calibration locks; trusted CI regenerates authoritative proof.
+- [ ] I set `[difficulty].task_type` to `ml`, `mujoco`, `cfd`, `structures`, or `software_engineering`.
+- [ ] For rendered tasks (MuJoCo or declared `render_outputs`), I committed reviewer artifacts under `problems/<task_id>/.alignerr/ground_truth/`.
 - [ ] I verified `.env.local`, `.harness-runs/`, provider keys, credentials, and other local secrets are not committed.
-- [ ] I understand trusted CI runs from ISO mothership, but the `trusted-ci/grade`
-      check and diagnostics are posted back on this template PR.
-- [ ] For MuJoCo tasks, I know `run_qa`, `run_adversarial`, or
-      `run_mujoco_adversarial` triggers the non-blocking adversarial review
-      comment on this PR.
+- [ ] I understand trusted CI is dispatched by ISO mothership, while the
+      `trusted-ci/grade` check and diagnostics are posted back on this PR.
+- [ ] I did not add workflow credentials or cross-repository dispatch to this
+      template or task fork.

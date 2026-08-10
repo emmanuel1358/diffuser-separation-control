@@ -66,9 +66,9 @@
     "type": "declarative-rubric.v1"
   },
   "metric_ids": [],
-  "plan_sha256": "32093b8d8dae6f98ae41cfe8e010fa17ac0f380178c7a1d2062012025010eafa",
+  "plan_sha256": "b62bf872cbe824eac0f427fcea1d05252803b6578276b571c0ee5fd5fc9f6e64",
   "protocol": "declarative-rubric.v1",
   "schema_version": "evaluation-plan.v2",
   "security_tier": "sealed_rescore",
-  "task_spec_sha256": "e9acf605660fabf78175874c8b9f17791ae0ead1ff87afe56d38bdd9bfa65ad1"
+  "task_spec_sha256": "e60ca101212d2df8d9751a68ce9767c1285415e90bdaa2bc064801093d999746"
 }

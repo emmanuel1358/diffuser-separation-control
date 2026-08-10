@@ -9,12 +9,17 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from alignerr_plugin.capabilities import (
+    CapabilityConfig,
+    resolve_capabilities,
+)
 from alignerr_plugin.ground_truth import (
     VIDEO_SUFFIXES,
     artifact_matches_proof,
@@ -30,6 +35,7 @@ from alignerr_plugin.proof import PROOF_PATH, verify_build_proof, write_build_pr
 from alignerr_plugin.runtime_notices import accelerator_from_required_resources
 from alignerr_plugin.schemas import StageResult, ValidationResult
 from alignerr_plugin.utils import load_metadata, load_task_toml, read_json, task_id
+from alignerr_plugin.validators.task import image_deps
 
 KNOWN_TOOLS = {"browser", "terminal", "terminal_persistent", "desktop"}
 TRUSTED_CALIBRATION_DIR_ENV = "LBX_TRUSTED_CALIBRATION_DIR"
@@ -70,62 +76,131 @@ EMOJI_PATTERN = re.compile(
 # scanned too when present (resolved at runtime). Generated artifacts, data
 # files, and __pycache__ are deliberately excluded.
 _ASCII_SCAN_FILES = ("instruction.md", "scorer/compute_score.py")
-# ML_Envs-mode equivalents.
-_MLENVS_ASCII_SCAN_FILES = ("prompt.md", "test_file.py")
 
 _MCP_SERVER_ROOT = "/mcp_server"
 _PRIVATE_ROOTS = ("/mcp_server/data", "/mcp_server/grader")
 _PUBLIC_ROOTS = ("/data", "/workdir", "/tmp/output", "/app", "/workspace")
 
+_SOFTWARE_TASK_TYPE = "software_engineering"
+_SOFTWARE_REWARD_TYPE = "multi_deterministic_rubrics"
+_SOFTWARE_SEED_CACHE_NAMES = frozenset(
+    {
+        ".cache",
+        ".git",
+        ".gradle",
+        ".mypy_cache",
+        ".next",
+        ".nox",
+        ".npm",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".yarn",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "target",
+    }
+)
+_SOFTWARE_SEED_SECRET_DIR_NAMES = frozenset({".aws", ".gnupg", ".ssh"})
+_SOFTWARE_SEED_SECRET_FILENAMES = frozenset(
+    {
+        ".env",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "credentials.json",
+        "id_dsa",
+        "id_ed25519",
+        "id_rsa",
+        "service-account.json",
+        "service_account.json",
+        "secrets.json",
+    }
+)
+_SOFTWARE_SEED_SECRET_SOURCE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".go",
+        ".h",
+        ".hpp",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".scala",
+        ".sh",
+        ".swift",
+        ".ts",
+        ".tsx",
+    }
+)
+_SOFTWARE_SEED_NATIVE_SUFFIXES = frozenset(
+    {
+        ".a",
+        ".class",
+        ".dll",
+        ".dylib",
+        ".exe",
+        ".jar",
+        ".o",
+        ".pyc",
+        ".pyo",
+        ".so",
+        ".wasm",
+        ".zip",
+    }
+)
+_SOFTWARE_SEED_NATIVE_MAGICS = (
+    b"\x7fELF",
+    b"MZ",
+    b"!<arch>\n",
+    b"\x00asm",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xfe\xed\xfa\xce",
+)
+_SOFTWARE_PRIVATE_KEY_MARKERS = (
+    b"-----BEGIN PRIVATE KEY-----",
+    b"-----BEGIN RSA PRIVATE KEY-----",
+    b"-----BEGIN DSA PRIVATE KEY-----",
+    b"-----BEGIN EC PRIVATE KEY-----",
+    b"-----BEGIN OPENSSH PRIVATE KEY-----",
+)
 
-# --- ML_Envs-mode path resolution -----------------------------------------
-# ML_Envs-mode tasks use a different layout (prompt.md, a root test_file.py grader
-# with a no-arg compute_score(), hidden data under data/private/). These resolvers
-# let the build-independent validator stages target either layout.
+
+# Fixed native-layout paths, relative to the problem dir.
+PROMPT_REL = "instruction.md"
+GRADER_SOURCE_REL = "scorer/compute_score.py"
+PRIVATE_DATA_REL = "scorer/data"
 
 
-def _is_mlenvs(problem_dir: Path) -> bool:
-    from alignerr_plugin import mlenvs
+def _grading_already_importable() -> bool:
+    """Is a `grading` package resolvable without the checkout's grader/src?"""
 
-    return mlenvs.is_mlenvs_task(problem_dir)
-
-
-def _prompt_rel(problem_dir: Path) -> str:
-    return "prompt.md" if _is_mlenvs(problem_dir) else "instruction.md"
-
-
-def _grader_source_rel(problem_dir: Path) -> str:
-    return "test_file.py" if _is_mlenvs(problem_dir) else "scorer/compute_score.py"
+    if "grading" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("grading") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _grader_scan_paths(problem_dir: Path) -> list[Path]:
     """Python files the static reward-hacking scans must cover for this task."""
-    if _is_mlenvs(problem_dir):
-        grader = problem_dir / "test_file.py"
-        return [grader] if grader.is_file() else []
     scorer_dir = problem_dir / "scorer"
     if not scorer_dir.is_dir():
         return []
     return [p for p in sorted(scorer_dir.rglob("*.py")) if "__pycache__" not in p.parts]
-
-
-def _private_data_rel(problem_dir: Path) -> str:
-    return "data/private" if _is_mlenvs(problem_dir) else "scorer/data"
-
-
-def _ascii_scan_files(problem_dir: Path) -> tuple[str, ...]:
-    return _MLENVS_ASCII_SCAN_FILES if _is_mlenvs(problem_dir) else _ASCII_SCAN_FILES
-
-
-def _mlenvs_task_type(problem_dir: Path) -> str:
-    """The ``ml_task_type`` declared in an ML_Envs ``metadata.json`` (or "")."""
-    try:
-        data = json.loads(
-            (problem_dir / "metadata.json").read_text(encoding="utf-8-sig")
-        )
-    except (OSError, json.JSONDecodeError):
-        return ""
-    return data.get("ml_task_type", "") if isinstance(data, dict) else ""
 
 
 def _declares_continuous_task(source: str) -> bool:
@@ -355,6 +430,7 @@ _DIR_VETO_GUARD_EXC = {
 }
 # Modules whose ``.load`` / ``.loads`` execute pickle (arbitrary code) at load.
 _PICKLE_MODULE_NAMES = {"pickle", "cloudpickle", "dill", "joblib", "torch"}
+_OPEN_MODULE_NAMES = {"builtins", "bz2", "gzip", "io", "lzma", "os"}
 # Bare-name readers a planted directory/FIFO/oversize file can weaponize.
 _GENERIC_AGENT_READER_NAMES = {"open"}
 # Attribute-form readers where the path is the first argument
@@ -371,9 +447,9 @@ _GENERIC_AGENT_READER_ATTRS = {
     "genfromtxt",
 }
 # Path methods where the *receiver* is the path being read
-# (``(workspace / "f").read_text()``, ``p.read_bytes()``). A planted
+# (``(workspace / "f").read_text()``, ``p.open()``). A planted
 # directory/FIFO at that path raises OSError just like the arg-form readers.
-_AGENT_PATH_METHOD_READERS = {"read_text", "read_bytes"}
+_AGENT_PATH_METHOD_READERS = {"open", "read_bytes", "read_text"}
 # Tokens that mark a path as living in the agent-writable submission area.
 _AGENT_PATH_TOKENS = ("workspace", "/tmp/output", "/workdir", "/workspace", "/app")
 # Names of helpers that return a zero/failure grade (so `return _failure(...)`
@@ -383,17 +459,20 @@ _SUBMISSION_PATH_KWARGS = {"path", "filepath_or_buffer", "filepath", "file", "fn
 _AGENT_FAULT_HELPER_HINT = (
     "Read agent submissions via a sanctioned loader -- "
     "grading.helpers.load_submission_or_fault (CSV), load_submission_npz_or_fault "
-    "(.npz/.npy), load_submission_h5_or_fault (HDF5), or the sandboxed "
+    "(.npz/.npy), load_submission_h5_or_fault (HDF5), "
+    "open_submission_file_or_fault (custom file-like parsers), or the sandboxed "
     "run_model_module / run_policy / run_submitted_executable helpers -- which "
-    "reject symlinks / non-regular files AND raise AgentFault for you. A bare "
+    "reject symlinks in every path component / non-regular files AND raise "
+    "AgentFault for you. A bare "
     "`except OSError` is NOT sufficient: it catches a planted dir/FIFO, but a "
     "symlink to the held-out truth (which the agent's predict.py can re-plant AFTER "
     "the runner's pre-grade scrub) reads successfully with no error. An os.lstat + "
     "stat.S_ISREG check is ALSO not sufficient: it is check-then-use on the path, "
     "and a surviving uid-1000 process races it -- swapping a regular file for a "
-    "symlink between the check and the read. If no loader fits, open the fd with "
-    "`os.open(path, os.O_RDONLY | os.O_NOFOLLOW)` (a symlink leaf fails atomically "
-    "at open) and read THAT descriptor -- never re-open the path."
+    "symlink between the check and the read. A leaf-only `O_NOFOLLOW` open is not "
+    "sufficient either: it still follows a replaced `/tmp/output` or nested parent "
+    "directory. Use `open_submission_file_or_fault` and parse the returned "
+    "immutable file object."
 )
 
 # Heuristic reward-hacking lint markers (advisory only). These flag patterns
@@ -443,7 +522,6 @@ class TaskValidator:
 
         stages = {
             "schema": self._schema(problem_dir),
-            "mlenvs_structure": self._mlenvs_structure(problem_dir),
             "prompt_runtime_references": self._prompt_runtime_references(problem_dir),
             "prompt_quality": self._prompt_quality(problem_dir),
             "grader_import": self._grader_import(problem_dir),
@@ -456,6 +534,7 @@ class TaskValidator:
             ),
             "continuous_calibration": self._continuous_calibration(problem_dir),
             "rubric_protocol": self._rubric_protocol(problem_dir),
+            "software_contract": self._software_contract(problem_dir),
             "outputs": self._outputs(problem_dir),
             "ground_truth": self._ground_truth(problem_dir),
             "private_data_layout": self._private_data_layout(problem_dir),
@@ -491,16 +570,12 @@ class TaskValidator:
 
     def _schema(self, problem_dir: Path) -> StageResult:
         issues: list[str] = []
-        if _is_mlenvs(problem_dir):
-            # ML_Envs-mode: task.toml / instruction.md / scorer/ are synthesized.
-            required = ["metadata.json", "prompt.md", "test_file.py"]
-        else:
-            required = [
-                "metadata.json",
-                "task.toml",
-                "instruction.md",
-                "scorer/compute_score.py",
-            ]
+        required = [
+            "metadata.json",
+            "task.toml",
+            "instruction.md",
+            "scorer/compute_score.py",
+        ]
         for rel in required:
             if not (problem_dir / rel).exists():
                 issues.append(f"missing required file: {rel}")
@@ -525,118 +600,9 @@ class TaskValidator:
             issues.append(f"task.toml invalid: {exc}")
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
-    def _mlenvs_structure(self, problem_dir: Path) -> StageResult:
-        """ML_Envs-mode structural + grader-reference requirements (no-op for native).
-
-        Enforces the calibration-provenance layout (data/public, data/private,
-        non-empty reference_solution/ and baselines/), that the grader targets the
-        canonical runtime paths, and that every /data or /mcp_server/data literal it
-        names actually ships. sim_policy graders must read only /mcp_server/data/.
-        """
-        if not _is_mlenvs(problem_dir):
-            return StageResult(passed=True, issues=[], duration_ms=0)
-        issues: list[str] = []
-
-        # Emptiness allowed (dataset tasks mount data at deploy time). public ->
-        # /data (agent-visible); private -> /mcp_server/data.
-        for rel in ("data/public", "data/private"):
-            if not (problem_dir / rel).is_dir():
-                issues.append(f"missing required directory: {rel}/")
-
-        # dataset / sim_policy are NO-SOCKET task types: the socket hidden-env
-        # paradigm (an env server the agent talks to) is reserved for env/hybrid.
-        # Its markers are the reserved DEFAULT env module (data/private/env.py) and
-        # an env_config.json that declares a socket env (see env_server.config);
-        # flag only those. A held-out eval sim shipped under another name is not
-        # blocked, and an ``envs/`` package (which needs ``envs/__init__.py``) is a
-        # socket module ONLY when env_config.json declares "module":
-        # "envs/__init__.py", so an undeclared ``envs/`` package is allowed here.
-        # (env/hybrid REQUIRE the module; that direction is checked in _hidden_env.)
-        task_type = _mlenvs_task_type(problem_dir)
-        if task_type in {"dataset", "sim_policy"}:
-            private = problem_dir / "data" / "private"
-            if (private / "env.py").exists():
-                issues.append(
-                    f"ml_task_type={task_type!r} but data/private/env.py is present: "
-                    "env.py is the reserved hidden-env socket module (env/hybrid "
-                    "only). Rename the held-out eval sim to any other name (an "
-                    "``envs/`` package is fine), loaded in-process via "
-                    "grading.env_loading.load_env_module, or set ml_task_type to "
-                    "'env' or 'hybrid'."
-                )
-            if (private / "env_config.json").exists():
-                issues.append(
-                    f"ml_task_type={task_type!r} but data/private/env_config.json is "
-                    "present: env_config.json declares the socket hidden-env server "
-                    "(env/hybrid only). Remove it, or set ml_task_type to 'env' or "
-                    "'hybrid'."
-                )
-
-        # reference_solution/ anchors the score at 0.5, baselines/ at 0.0; both must
-        # be non-empty so a reviewer can see what calibration was anchored to.
-        for rel in ("reference_solution", "baselines"):
-            directory = problem_dir / rel
-            if not directory.is_dir():
-                issues.append(f"missing required directory: {rel}/")
-                continue
-            files = [
-                p for p in directory.rglob("*") if p.is_file() and p.name != ".DS_Store"
-            ]
-            if not files:
-                issues.append(f"{rel}/ must not be empty")
-
-        grader = problem_dir / "test_file.py"
-        source = ""
-        if grader.is_file():
-            try:
-                source = grader.read_text(encoding="utf-8")
-            except OSError as exc:
-                issues.append(f"could not read test_file.py: {exc}")
-
-        if source:
-            v2_task = _declares_continuous_task(source)
-            if not v2_task and "/tmp/output" not in source:
-                issues.append(
-                    "test_file.py must reference /tmp/output (the agent submission dir)"
-                )
-            if not v2_task and "/mcp_server/data" not in source:
-                issues.append(
-                    "test_file.py must reference /mcp_server/data (the held-out truth)"
-                )
-            # Every /data/ and /mcp_server/data/ literal must resolve to a shipped
-            # file (a dangling ref faults at grade time).
-            issues.extend(
-                _check_data_refs(source, "/data/", problem_dir, "data/public")
-            )
-            issues.extend(
-                _check_data_refs(
-                    source, "/mcp_server/data/", problem_dir, "data/private"
-                )
-            )
-            # sim_policy: the grader reads the held-out eval sim from
-            # /mcp_server/data/ only; /data/ is the agent's training-sim mount.
-            if not v2_task and _mlenvs_task_type(problem_dir) == "sim_policy":
-                bad = sorted(
-                    {
-                        lit
-                        for lit in _string_constants(source)
-                        if lit == "/data" or lit.startswith("/data/")
-                    }
-                )
-                for lit in bad:
-                    issues.append(
-                        f"test_file.py references {lit!r} but ml_task_type='sim_policy': "
-                        "the grader must read only /mcp_server/data/ (use "
-                        "grading.env_loading.load_env_module for the held-out eval "
-                        "sim); /data/ is the agent's training-sim mount."
-                    )
-
-        return StageResult(passed=not issues, issues=issues, duration_ms=0)
-
     def _grader_import(self, problem_dir: Path) -> StageResult:
         issues: list[str] = []
-        grader_path = problem_dir / _grader_source_rel(problem_dir)
-        is_mlenvs = _is_mlenvs(problem_dir)
+        grader_path = problem_dir / GRADER_SOURCE_REL
         repo_root = problem_dir.parent.parent
         try:
             spec = importlib.util.spec_from_file_location(
@@ -648,7 +614,13 @@ class TaskValidator:
             sys.path.insert(0, str(problem_dir))
             sys.path.insert(0, str(grader_path.parent))
             shared_grader_src = repo_root / "grader" / "src"
-            if shared_grader_src.exists():
+            if shared_grader_src.exists() and not _grading_already_importable():
+                # Only fall back to the checkout's copy when no grading package
+                # is installed. Putting it first unconditionally let a fork's
+                # stale vendored snapshot shadow the trusted install in any lane
+                # that validates a fork, so graders failed to import symbols
+                # that exist upstream and authors were nudged into writing
+                # task-local compat shims around shared APIs.
                 sys.path.insert(0, str(shared_grader_src))
             spec.loader.exec_module(module)
             compute_score = getattr(module, "compute_score", None)
@@ -672,7 +644,7 @@ class TaskValidator:
                 and not is_declarative_rubric
             ):
                 issues.append(
-                    f"{_grader_source_rel(problem_dir)} must declare "
+                    f"{GRADER_SOURCE_REL} must declare "
                     "TASK = RubricTask(...) for multi_deterministic_rubrics"
                 )
             if is_declarative_rubric and callable(compute_score):
@@ -699,19 +671,12 @@ class TaskValidator:
                         )
             if not callable(compute_score) and not is_declarative_rubric:
                 issues.append(
-                    f"{_grader_source_rel(problem_dir)} must define callable compute_score "
+                    f"{GRADER_SOURCE_REL} must define callable compute_score "
                     "or TASK = RubricTask(...)"
                 )
             elif callable(compute_score):
                 params = list(inspect.signature(compute_score).parameters)
-                if is_mlenvs:
-                    # ML_Envs graders define a no-arg compute_score().
-                    if params and not is_v2_continuous:
-                        issues.append(
-                            "metadata-mode ML test_file.py compute_score() must take no "
-                            f"arguments (reads /tmp/output and /mcp_server/data); got {params}"
-                        )
-                elif not is_v2_continuous and params[:3] != [
+                if not is_v2_continuous and params[:3] != [
                     "workspace",
                     "trajectory",
                     "private",
@@ -773,7 +738,7 @@ class TaskValidator:
 
     def _prompt_runtime_references(self, problem_dir: Path) -> StageResult:
         """Reject prompt text that points agents at build/source internals."""
-        prompt_rel = _prompt_rel(problem_dir)
+        prompt_rel = PROMPT_REL
         instruction = problem_dir / prompt_rel
         if not instruction.exists():
             return StageResult(passed=True, issues=[], duration_ms=0)
@@ -800,7 +765,7 @@ class TaskValidator:
         """
         start = time.perf_counter()
         issues: list[str] = []
-        prompt_rel = _prompt_rel(problem_dir)
+        prompt_rel = PROMPT_REL
         instruction = problem_dir / prompt_rel
         if not instruction.exists():
             return StageResult(
@@ -826,7 +791,7 @@ class TaskValidator:
         )
         # A cfd/structures instruction must stay solver-agnostic: naming the
         # solver or its commands leaks the intended approach. No-ops for every
-        # other task_type (ML_Envs-mode synthesizes task_type="ml").
+        # other task_type.
         try:
             task_type = str(
                 load_task_toml(problem_dir).difficulty.task_type or ""
@@ -837,7 +802,7 @@ class TaskValidator:
             _instruction_solver_leak_issues(prompt_rel, prompt_text, task_type)
         )
 
-        ascii_targets = [problem_dir / rel for rel in _ascii_scan_files(problem_dir)]
+        ascii_targets = [problem_dir / rel for rel in _ASCII_SCAN_FILES]
         ascii_targets.extend(sorted(problem_dir.glob("README*")))
         for source in ascii_targets:
             if not source.is_file():
@@ -901,10 +866,10 @@ class TaskValidator:
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
     def _continuous_ml_model_contract(self, problem_dir: Path) -> StageResult:
-        """Fail-closed committed-model + training-code contract for continuous ML.
+        """Fail-closed committed-strategy contract for continuous ML.
 
         Runs before calibration-lock handling so missing local evidence cannot
-        skip the train.py / weights / manifest / inference-only requirements.
+        skip strategy provenance, artifact digests, or inference-only checks.
         """
         issues: list[str] = []
         try:
@@ -918,7 +883,7 @@ class TaskValidator:
         ):
             return StageResult(passed=True, issues=[], duration_ms=0)
 
-        grader_path = problem_dir / _grader_source_rel(problem_dir)
+        grader_path = problem_dir / GRADER_SOURCE_REL
         try:
             grader_source = grader_path.read_text(encoding="utf-8")
         except OSError:
@@ -928,22 +893,47 @@ class TaskValidator:
             return StageResult(passed=True, issues=[], duration_ms=0)
 
         naive_rel = "baselines/naive"
+        include_naive = True
         try:
-            from grading.evaluation import load_task_registration
+            from grading.evaluation import (
+                ContinuousTask,
+                PolicyEvaluationTask,
+                load_task_registration,
+            )
+            from grading.evaluation.author import load_task_module
 
             registration = load_task_registration(grader_path)
-            if registration is not None and getattr(registration, "naive", None):
+            if isinstance(registration, ContinuousTask) and registration.naive:
                 naive_rel = str(registration.naive)
+            elif registration is None:
+                module = load_task_module(grader_path)
+                policy_registration = getattr(module, "TASK", None)
+                if isinstance(policy_registration, PolicyEvaluationTask):
+                    include_naive = False
+                else:
+                    issues.append(
+                        "continuous ML TASK must be a grading.evaluation."
+                        "ContinuousTask or PolicyEvaluationTask"
+                    )
+                    return StageResult(
+                        passed=False,
+                        issues=issues,
+                        duration_ms=0,
+                    )
         except Exception as exc:
             issues.append(f"could not load continuous TASK registration: {exc}")
             return StageResult(passed=False, issues=issues, duration_ms=0)
 
         from alignerr_plugin.ml_model_contract import (
-            validate_problem_ml_model_contracts,
+            validate_problem_ml_strategy_contracts,
         )
 
         try:
-            validate_problem_ml_model_contracts(problem_dir, naive_rel=naive_rel)
+            validate_problem_ml_strategy_contracts(
+                problem_dir,
+                naive_rel=naive_rel,
+                include_naive=include_naive,
+            )
         except ValueError as exc:
             issues.append(str(exc))
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
@@ -963,7 +953,7 @@ class TaskValidator:
         ):
             return StageResult(passed=True, issues=[], duration_ms=0)
 
-        grader_path = problem_dir / _grader_source_rel(problem_dir)
+        grader_path = problem_dir / GRADER_SOURCE_REL
         try:
             grader_source = grader_path.read_text(encoding="utf-8")
         except OSError:
@@ -1168,14 +1158,10 @@ class TaskValidator:
             )
 
             for role, strategy_rel in (
-                ("reference", "reference_solution"),
+                ("reference", "solution"),
                 ("naive", registration.naive),
             ):
                 strategy_dir = problem_dir / strategy_rel
-                if not strategy_dir.is_dir() and role == "reference":
-                    # Native continuous ML may use solution/ instead.
-                    strategy_dir = problem_dir / "solution"
-                    strategy_rel = "solution"
                 for generated in sorted(
                     path
                     for path in strategy_dir.rglob("*")
@@ -1212,7 +1198,7 @@ class TaskValidator:
             return StageResult(passed=True, issues=[], duration_ms=0)
 
         issues: list[str] = []
-        grader_path = problem_dir / _grader_source_rel(problem_dir)
+        grader_path = problem_dir / GRADER_SOURCE_REL
         repo_root = Path(__file__).resolve().parents[5]
         paths = [str(repo_root / "grader" / "src"), str(grader_path.parent)]
         added = [path for path in paths if path not in sys.path]
@@ -1234,14 +1220,13 @@ class TaskValidator:
                 return StageResult(
                     passed=False,
                     issues=[
-                        f"{_grader_source_rel(problem_dir)} must declare "
-                        "TASK = RubricTask(...)"
+                        f"{GRADER_SOURCE_REL} must declare " "TASK = RubricTask(...)"
                     ],
                     duration_ms=0,
                 )
             issues.extend(
                 _declarative_rubric_api_issues(
-                    _grader_source_rel(problem_dir),
+                    GRADER_SOURCE_REL,
                     grader_path.read_text(encoding="utf-8"),
                 )
             )
@@ -1346,13 +1331,29 @@ class TaskValidator:
                     sys.path.remove(path)
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
+    def _software_contract(self, problem_dir: Path) -> StageResult:
+        """Validate the repository-submission contract for software tasks only."""
+        start = time.monotonic()
+        try:
+            task_toml = load_task_toml(problem_dir)
+        except (OSError, ValueError):
+            # The schema stage owns malformed or missing task.toml diagnostics.
+            return StageResult(passed=True, issues=[], duration_ms=0)
+        if normalize_enum_value(task_toml.difficulty.task_type) != _SOFTWARE_TASK_TYPE:
+            return StageResult(passed=True, issues=[], duration_ms=0)
+
+        issues = _software_contract_issues(problem_dir, task_toml)
+        return StageResult(
+            passed=not issues,
+            issues=issues,
+            duration_ms=int((time.monotonic() - start) * 1000),
+        )
+
     def _outputs(self, problem_dir: Path) -> StageResult:
         issues: list[str] = []
         try:
             task_toml = load_task_toml(problem_dir)
-            # ML_Envs-mode pins the /tmp/output convention (no [[outputs]] block);
-            # the artifact path lives in prompt.md + test_file.py.
-            if not task_toml.outputs and not _is_mlenvs(problem_dir):
+            if not task_toml.outputs:
                 issues.append("task.toml should declare at least one [[outputs]] entry")
             issues.extend(
                 metadata_validation_issues(
@@ -1383,12 +1384,11 @@ class TaskValidator:
         if not mode:
             return StageResult(passed=True, issues=[], duration_ms=0)
 
-        # Layout differs by mode: native ships the env under scorer/data/ with a
-        # public data/ tree; ML_Envs ships it under data/private/ with a public
-        # data/public/ tree. Both bake to /mcp_server/data/ (root-only) and
-        # /data/ (agent-visible).
-        priv_rel = _private_data_rel(problem_dir)  # "scorer/data" | "data/private"
-        pub_rel = "data/public" if _is_mlenvs(problem_dir) else "data"
+        # The hidden env module ships under scorer/data/ alongside the public
+        # data/ tree; they bake to /mcp_server/data/ (root-only) and /data/
+        # (agent-visible) respectively.
+        priv_rel = PRIVATE_DATA_REL
+        pub_rel = "data"
         scorer_data = problem_dir / priv_rel
         public_data = problem_dir / pub_rel
 
@@ -1527,9 +1527,11 @@ class TaskValidator:
         if dockerfile.exists():
             try:
                 issues.extend(_dockerfile_private_layout_issues(dockerfile))
+                issues.extend(_dockerfile_raw_install_issues(dockerfile))
             except OSError as exc:
                 issues.append(f"could not inspect Dockerfile private layout: {exc}")
         issues.extend(_public_private_duplicate_issues(problem_dir))
+        issues.extend(_dependency_channel_issues(problem_dir))
         return StageResult(passed=not issues, issues=issues, duration_ms=0)
 
     def _solution_answer_key_leak(self, problem_dir: Path) -> StageResult:
@@ -1546,21 +1548,6 @@ class TaskValidator:
         passed, errors, _proof = verify_build_proof(problem_dir)
         if passed:
             return StageResult(passed=True, issues=[], duration_ms=0)
-
-        # ML_Envs-mode references are developed iteratively over cached artifacts
-        # and take hours to run, so they are NOT rebuilt here; validation relies on
-        # the run_reference provenance instead of an on-the-fly rebuild.
-        if _is_mlenvs(problem_dir):
-            return StageResult(
-                passed=True,
-                issues=[],
-                warnings=[
-                    "metadata-mode ML build proof not rebuilt during validation by design "
-                    "(iterative cached-artifact references); provenance is the "
-                    "run_reference package, not a local rebuild."
-                ],
-                duration_ms=0,
-            )
 
         start = time.monotonic()
         try:
@@ -1617,6 +1604,15 @@ class TaskValidator:
                 return StageResult(
                     passed=False,
                     issues=[*errors, agent_python_error],
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
+            dependency_issues = _image_dependency_issues(
+                base.ref, image_tag, problem_dir, repo_root
+            )
+            if dependency_issues:
+                return StageResult(
+                    passed=False,
+                    issues=[*errors, *dependency_issues],
                     duration_ms=int((time.monotonic() - start) * 1000),
                 )
             image_digest = (
@@ -1699,8 +1695,8 @@ class TaskValidator:
                               there is no reference / the grader errors)
           * ``uses_llm_judge``  static check of the grader source; LLM judges are disallowed
 
-        Asserts the normalized headline lands in ``[0, 1]`` (catches the most
-        common ML_Envs bug — forgotten clip on a custom anchor mapping).
+        Asserts the normalized headline lands in ``[0, 1]`` (catches a
+        forgotten clip on a custom anchor mapping).
         """
         import tempfile
 
@@ -1715,7 +1711,7 @@ class TaskValidator:
         }
         start = time.monotonic()
 
-        grader_rel = _grader_source_rel(problem_dir)
+        grader_rel = GRADER_SOURCE_REL
         grader_source = problem_dir / grader_rel
         if not grader_source.exists():
             issues.append(f"{grader_rel} is missing; tasks must define a scorer.")
@@ -1738,46 +1734,6 @@ class TaskValidator:
                 )
         except OSError:
             pass
-
-        # ML_Envs no-arg graders read baked /tmp/output + /mcp_server/data paths,
-        # so they cannot be host-probed; the sample/trivial/[0,1]/oracle checks run
-        # in-container via the build-proof / ground-truth run instead. The
-        # committed proof's recorded no-op score IS checked here so a stale or
-        # unanchored trivial_baseline_score cannot pass validation.
-        if _is_mlenvs(problem_dir):
-            meta["return_shape"] = "bare_float"
-            issues.extend(_mlenvs_trivial_baseline_issues(problem_dir, meta))
-            proof_path = problem_dir / PROOF_PATH
-            if proof_path.is_file():
-                try:
-                    proof = read_json(proof_path)
-                    result = proof.get("ground_truth_result")
-                    if isinstance(result, dict) and isinstance(
-                        result.get("score"), (int, float)
-                    ):
-                        score = float(result["score"])
-                        meta["ground_truth_score"] = score
-                        proof_task_toml = load_task_toml(problem_dir)
-                        expectation = expected_ground_truth_score(
-                            proof_task_toml.difficulty.reward_type,
-                            deterministic_epsilon=proof_task_toml.ground_truth.score_epsilon,
-                            continuous_epsilon=proof_task_toml.ground_truth.continuous_score_epsilon,
-                        )
-                        meta["ground_truth_passed"] = expectation.passed(score)
-                except Exception:
-                    pass
-            return (
-                StageResult(
-                    passed=not issues,
-                    issues=issues,
-                    warnings=[
-                        "metadata-mode ML grader executed in-container (build proof), not "
-                        "host-probed: sample/trivial-score and [0,1] checks run there."
-                    ],
-                    duration_ms=int((time.monotonic() - start) * 1000),
-                ),
-                meta,
-            )
 
         # In-container ground-truth tasks (e.g. OpenFOAM/SU2/Meep/OpenROAD) cannot
         # be probed on the host -- their grader invokes engines that live only in
@@ -1821,8 +1777,8 @@ class TaskValidator:
         # probe fail spuriously (e.g. "RuntimeError: Could not locate
         # train.parquet") and red-wall tasks whose in-container oracle scored its
         # target. Skip it here and lean on the in-container oracle grade as the
-        # authoritative sample/[0,1]/oracle check (mirrors the ML_Envs /
-        # in_container branches above). CPU tasks still host-probe normally.
+        # authoritative sample/[0,1]/oracle check (mirrors the in_container
+        # branch above). CPU tasks still host-probe normally.
         _env = (
             getattr(_task_toml_for_gt, "environment", None)
             if _task_toml_for_gt
@@ -1946,9 +1902,21 @@ class TaskValidator:
                 host_data = (problem_dir / "data").resolve()
                 if host_data.exists():
                     src = src.replace("/data/", str(host_data) + "/")
+                # The script runs as text, so `$0` is "bash" and a solve.sh that
+                # locates its own committed artifacts relative to itself resolves
+                # them against the temp workspace. Hand it the same directory
+                # variables the container exports.
+                probe_env = os.environ.copy()
+                probe_env["LBX_SOLUTION_DIR"] = str(
+                    (problem_dir / "solution").resolve()
+                )
+                probe_env["LBT_OUTPUT_DIR"] = str(workspace)
+                if host_data.exists():
+                    probe_env["LBT_DATA_DIR"] = str(host_data)
                 completed = subprocess.run(
                     ["bash", "-c", src],
                     cwd=workspace,
+                    env=probe_env,
                     capture_output=True,
                     text=True,
                 )
@@ -2068,8 +2036,7 @@ class TaskValidator:
             if not (0.0 <= sample_score <= 1.0):
                 issues.append(
                     f"compute_score returned a sample score {sample_score} outside [0, 1]. "
-                    "Clamp the headline before returning (this is the most common "
-                    "ML_Envs migration bug)."
+                    "Clamp the headline before returning."
                 )
             _gt2 = load_task_toml(problem_dir)
             expectation = expected_ground_truth_score(
@@ -2194,6 +2161,845 @@ class TaskValidator:
         )
 
 
+def _software_contract_issues(problem_dir: Path, task_toml: Any) -> list[str]:
+    issues: list[str] = []
+    uses_service_capsule = bool(task_toml.services)
+    capabilities: CapabilityConfig | None = None
+    if uses_service_capsule:
+        try:
+            capabilities = resolve_capabilities(task_toml)
+        except (TypeError, ValueError) as exc:
+            issues.append(f"invalid software capability contract: {exc}")
+
+    if normalize_enum_value(task_toml.difficulty.reward_type) != _SOFTWARE_REWARD_TYPE:
+        issues.append(
+            "software_engineering tasks must set "
+            "[difficulty].reward_type = 'multi_deterministic_rubrics'"
+        )
+    if task_toml.environment.allow_internet:
+        issues.append(
+            "software_engineering tasks must set "
+            "[environment].allow_internet = false for offline reproducibility"
+        )
+
+    seed, seed_issues = _software_workspace_seed(problem_dir, task_toml)
+    issues.extend(seed_issues)
+    if seed is not None:
+        issues.extend(_software_seed_tree_issues(problem_dir, seed))
+
+    scorer_isolation_issues = _software_scorer_isolation_issues(
+        problem_dir, seed, task_toml.outputs
+    )
+    issues.extend(scorer_isolation_issues)
+    issues.extend(_software_candidate_execution_issues(problem_dir))
+
+    registration: Any = None
+    rubric_task_type: Any = ()
+    workspace_artifact_type: Any = ()
+    if scorer_isolation_issues:
+        issues.append(
+            "software TASK registration could not be safely inspected until scorer "
+            "candidate-code import/exec findings are fixed"
+        )
+    else:
+        try:
+            from grading.evaluation import RubricTask, WorkspaceArtifact
+
+            rubric_task_type = RubricTask
+            workspace_artifact_type = WorkspaceArtifact
+            registration = _load_software_registration(problem_dir)
+        except Exception as exc:  # noqa: BLE001 - report authored import failures
+            issues.append(f"could not import software TASK registration: {exc}")
+
+    artifact: Any = None
+    if registration is not None:
+        if not isinstance(registration, rubric_task_type):
+            issues.append(
+                f"{GRADER_SOURCE_REL} must register TASK = RubricTask(...) "
+                "for software_engineering tasks"
+            )
+        elif not isinstance(registration.artifact, workspace_artifact_type):
+            issues.append(
+                "software_engineering TASK must declare artifact=WorkspaceArtifact(...)"
+            )
+        else:
+            artifact = registration.artifact
+            if not artifact.reject_native_payloads:
+                issues.append(
+                    "software WorkspaceArtifact must keep reject_native_payloads=True"
+                )
+    elif not scorer_isolation_issues:
+        issues.append(
+            f"{GRADER_SOURCE_REL} must register TASK = RubricTask(...) "
+            "for software_engineering tasks"
+        )
+
+    if artifact is not None:
+        if not uses_service_capsule:
+            issues.extend(_software_output_issues(task_toml, artifact))
+        elif capabilities is not None:
+            issues.extend(
+                _software_capability_issues(
+                    problem_dir,
+                    task_toml,
+                    artifact,
+                    capabilities,
+                )
+            )
+        try:
+            from grading.evaluation.plan import check_evaluation_plan
+
+            plan_sync = check_evaluation_plan(problem_dir)
+            if plan_sync.status != "unchanged":
+                issues.append(
+                    plan_sync.message
+                    or "scorer/evaluation.plan.json must match the registered TASK"
+                )
+        except Exception as exc:  # noqa: BLE001 - plan loading imports task code
+            issues.append(f"could not verify scorer/evaluation.plan.json: {exc}")
+
+    issues.extend(_software_private_fixture_issues(problem_dir))
+    if not uses_service_capsule:
+        issues.extend(_software_private_layout_issues(problem_dir))
+    issues.extend(_software_oracle_baseline_issues(problem_dir))
+    issues.extend(_software_timeout_issues(task_toml))
+    return list(dict.fromkeys(issues))
+
+
+def _load_software_registration(problem_dir: Path) -> Any:
+    grader_path = problem_dir / GRADER_SOURCE_REL
+    if not grader_path.is_file():
+        raise FileNotFoundError(f"missing required file: {GRADER_SOURCE_REL}")
+
+    repo_root = Path(__file__).resolve().parents[5]
+    candidate_paths = (repo_root / "grader" / "src", grader_path.parent)
+    added = [str(path) for path in candidate_paths if str(path) not in sys.path]
+    for path in reversed(added):
+        sys.path.insert(0, path)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "task_software_contract_probe", grader_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot import {grader_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module, "TASK", None)
+    finally:
+        for path in added:
+            if path in sys.path:
+                sys.path.remove(path)
+
+
+def _software_output_issues(task_toml: Any, artifact: Any) -> list[str]:
+    artifact_path = PurePosixPath(artifact.path)
+    workspace_root = PurePosixPath("/tmp/output") / artifact_path
+    issues: list[str] = []
+    if not any(
+        output.required and PurePosixPath(output.path) == workspace_root
+        for output in task_toml.outputs
+    ):
+        issues.append(
+            "software_engineering tasks must declare a required [[outputs]] entry "
+            f"for the WorkspaceArtifact root {workspace_root.as_posix()!r}"
+        )
+
+    transformation = task_toml.metadata.get("transformation")
+    if isinstance(transformation, dict) and "workspace_root" in transformation:
+        declared = transformation["workspace_root"]
+        if not isinstance(declared, str) or PurePosixPath(declared) != workspace_root:
+            issues.append(
+                "[metadata.transformation].workspace_root must match the "
+                f"WorkspaceArtifact output root {workspace_root.as_posix()!r}"
+            )
+    return issues
+
+
+def _software_capability_issues(
+    problem_dir: Path,
+    task_toml: Any,
+    artifact: Any,
+    capabilities: CapabilityConfig,
+) -> list[str]:
+    """Validate the equivalent repository and trust boundary for task capsules."""
+    issues: list[str] = []
+    agent_service = capabilities.agent_service
+    verifier_service = capabilities.verifier_service
+    issues.extend(_software_service_network_issues(capabilities))
+    if agent_service is None:
+        issues.append(
+            "software capability tasks require exactly one service with role='main'"
+        )
+    if verifier_service is None:
+        issues.append(
+            "software capability tasks require an isolated service with role='verifier'"
+        )
+
+    artifact_path = PurePosixPath(artifact.path)
+    workspace = task_toml.workspace
+    workspace_root = PurePosixPath(
+        workspace.root if workspace is not None else "/workdir"
+    )
+    expected_source = workspace_root / artifact_path
+    matching_artifacts = [
+        item
+        for item in capabilities.artifacts
+        if PurePosixPath(str(item.get("destination", ""))) == artifact_path
+    ]
+    if not matching_artifacts:
+        issues.append(
+            "software capability tasks must collect the WorkspaceArtifact root "
+            f"{artifact_path.as_posix()!r} as a service-owned artifact"
+        )
+    elif agent_service is not None and not any(
+        item.get("service") == agent_service.harbor_name
+        and PurePosixPath(str(item.get("source", ""))) == expected_source
+        for item in matching_artifacts
+    ):
+        issues.append(
+            "software capability WorkspaceArtifact must be collected from the "
+            f"agent service at {expected_source.as_posix()!r}"
+        )
+
+    result = task_toml.result
+    if result is None:
+        issues.append(
+            "software capability tasks require a canonical [result] declaration"
+        )
+    else:
+        result_root = PurePosixPath(result.output_root)
+        reward_file = PurePosixPath(result.reward_file)
+        if (
+            result_root != PurePosixPath("/tmp/output")
+            or reward_file.is_absolute()
+            or ".." in reward_file.parts
+            or reward_file in {PurePosixPath(), PurePosixPath(".")}
+        ):
+            issues.append(
+                "software capability tasks must publish a relative canonical "
+                "[result].reward_file under /tmp/output"
+            )
+        else:
+            canonical_result = result_root / reward_file
+            if not any(
+                output.required and PurePosixPath(output.path) == canonical_result
+                for output in task_toml.outputs
+            ):
+                issues.append(
+                    "software capability tasks must declare the canonical verifier "
+                    f"result {canonical_result.as_posix()!r} as a required "
+                    "[[outputs]] entry"
+                )
+
+    if agent_service is not None:
+        agent_user = _container_user_identity(agent_service.raw.get("user"))
+        if agent_user in {"", "0", "root"}:
+            issues.append(
+                f"software agent service {agent_service.name!r} must run as non-root"
+            )
+    if verifier_service is not None:
+        verifier_user = _container_user_identity(verifier_service.raw.get("user"))
+        if verifier_user not in {"0", "root"}:
+            issues.append(
+                f"software verifier service {verifier_service.name!r} must run as root"
+            )
+        if _service_network_policy(verifier_service) != "none":
+            issues.append(
+                f"software verifier service {verifier_service.name!r} must disable "
+                "network access"
+            )
+
+    for service in capabilities.services:
+        if service.build is None:
+            continue
+        build_root = _contained_task_path(
+            problem_dir,
+            service.build.context,
+            label=f"service {service.name!r} build context",
+            issues=issues,
+        )
+        if build_root is None:
+            continue
+        dockerfile = _contained_task_path(
+            build_root,
+            service.build.dockerfile,
+            label=f"service {service.name!r} Dockerfile",
+            issues=issues,
+        )
+        if dockerfile is None or not dockerfile.is_file() or dockerfile.is_symlink():
+            issues.append(
+                f"software service {service.name!r} requires a regular build Dockerfile"
+            )
+            continue
+        if service.role == "verifier":
+            continue
+        try:
+            for line_number, instruction in _dockerfile_instructions(dockerfile):
+                if not instruction.lower().startswith(("copy ", "add ")):
+                    continue
+                try:
+                    tokens = shlex.split(instruction)
+                except ValueError:
+                    tokens = instruction.split()
+                _flags, positional = _dockerfile_copy_parts(tokens)
+                for source in positional[:-1]:
+                    normalized = source.replace("\\", "/").casefold()
+                    if any(
+                        private in f"/{normalized.strip('/')}/"
+                        for private in (
+                            "/scorer/",
+                            "/solution/",
+                            "/mcp_server/",
+                        )
+                    ):
+                        issues.append(
+                            f"{dockerfile.relative_to(problem_dir)}:{line_number}: "
+                            "agent-facing service images must not copy scorer, "
+                            "solution, or /mcp_server private material"
+                        )
+        except OSError as exc:
+            issues.append(
+                f"could not inspect software service Dockerfile {dockerfile}: {exc}"
+            )
+    return issues
+
+
+def _container_user_identity(value: Any) -> str:
+    """Return the UID/name portion of Docker's optional ``user:group`` form."""
+    return str(value or "").strip().split(":", 1)[0].strip().lower()
+
+
+def _service_network_policy(service: Any) -> str:
+    """Read the authored policy without collapsing ``isolated`` into offline."""
+    resources = service.raw.get("resources")
+    if not isinstance(resources, dict):
+        return "isolated"
+    return str(resources.get("network") or "isolated").strip().lower()
+
+
+def _software_service_network_issues(capabilities: CapabilityConfig) -> list[str]:
+    """Keep every agent-phase software service on a reproducible offline network."""
+    return [
+        f"software service {service.name!r} must not enable internet access"
+        for service in capabilities.services
+        if service.role != "verifier" and _service_network_policy(service) == "internet"
+    ]
+
+
+def _contained_task_path(
+    root: Path,
+    raw_path: str,
+    *,
+    label: str,
+    issues: list[str],
+) -> Path | None:
+    relative = Path(raw_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        issues.append(f"{label} must stay inside the task directory")
+        return None
+    candidate = root / relative
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError):
+        issues.append(f"{label} escapes the task directory")
+        return None
+    return candidate
+
+
+def _software_workspace_seed(
+    problem_dir: Path, task_toml: Any
+) -> tuple[Path | None, list[str]]:
+    workspace = task_toml.workspace
+    if (
+        workspace is not None
+        and workspace.init_policy == "empty"
+        and workspace.seed is None
+    ):
+        return None, []
+    raw_seed = workspace.seed if workspace is not None and workspace.seed else "starter"
+    raw_path = Path(raw_seed)
+    if (
+        raw_path.is_absolute()
+        or ".." in raw_path.parts
+        or raw_path in {Path(), Path(".")}
+    ):
+        return None, [
+            (
+                "software_engineering workspace seed must be a dedicated "
+                "task-relative directory (declare [workspace].seed or provide starter/)"
+            )
+        ]
+
+    seed = problem_dir / raw_path
+    if not seed.exists() and not seed.is_symlink():
+        return None, [
+            f"software_engineering workspace seed is missing: {raw_path.as_posix()}"
+        ]
+    if seed.is_symlink():
+        return None, [
+            (
+                "software_engineering workspace seed must not be a symlink: "
+                f"{raw_path.as_posix()}"
+            )
+        ]
+    if not seed.is_dir():
+        return None, [
+            (
+                "software_engineering workspace seed must be a directory: "
+                f"{raw_path.as_posix()}"
+            )
+        ]
+    return seed, []
+
+
+def _software_seed_tree_issues(problem_dir: Path, seed: Path) -> list[str]:
+    issues: list[str] = []
+    regular_files = 0
+    for directory, dirnames, filenames in os.walk(
+        seed, topdown=True, followlinks=False
+    ):
+        base = Path(directory)
+        kept_directories: list[str] = []
+        for name in sorted(dirnames):
+            path = base / name
+            rel = path.relative_to(problem_dir).as_posix()
+            if path.is_symlink():
+                issues.append(f"software workspace seed contains a symlink: {rel}")
+                continue
+            folded = name.casefold()
+            if folded in _SOFTWARE_SEED_CACHE_NAMES:
+                issues.append(
+                    f"software workspace seed contains generated cache/build "
+                    f"directory: {rel}"
+                )
+                continue
+            if folded in _SOFTWARE_SEED_SECRET_DIR_NAMES:
+                issues.append(
+                    f"software workspace seed contains credential directory: {rel}"
+                )
+                continue
+            kept_directories.append(name)
+        dirnames[:] = kept_directories
+
+        for name in sorted(filenames):
+            path = base / name
+            rel = path.relative_to(problem_dir).as_posix()
+            if path.is_symlink():
+                issues.append(f"software workspace seed contains a symlink: {rel}")
+                continue
+            if name.casefold() in _SOFTWARE_SEED_CACHE_NAMES or name.casefold() in {
+                ".coverage",
+                ".ds_store",
+            }:
+                issues.append(
+                    f"software workspace seed contains generated cache/build file: {rel}"
+                )
+                continue
+            try:
+                info = path.lstat()
+            except OSError as exc:
+                issues.append(
+                    f"could not inspect software workspace seed file {rel}: {exc}"
+                )
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                issues.append(
+                    f"software workspace seed contains a non-regular file: {rel}"
+                )
+                continue
+            regular_files += 1
+
+            if _software_seed_secret_name(name):
+                issues.append(
+                    f"software workspace seed contains a secret/credential file: {rel}"
+                )
+            if path.suffix.casefold() in _SOFTWARE_SEED_NATIVE_SUFFIXES:
+                issues.append(
+                    f"software workspace seed contains a compiled/native payload: {rel}"
+                )
+                continue
+            try:
+                with path.open("rb") as handle:
+                    prefix = handle.read(8192)
+            except OSError as exc:
+                issues.append(
+                    f"could not read software workspace seed file {rel}: {exc}"
+                )
+                continue
+            if any(prefix.startswith(magic) for magic in _SOFTWARE_SEED_NATIVE_MAGICS):
+                issues.append(
+                    f"software workspace seed contains a compiled/native payload: {rel}"
+                )
+            if any(marker in prefix for marker in _SOFTWARE_PRIVATE_KEY_MARKERS):
+                issues.append(
+                    f"software workspace seed contains private key material: {rel}"
+                )
+
+    if regular_files == 0:
+        issues.append("software_engineering workspace seed contains no source files")
+    return issues
+
+
+def _software_seed_secret_name(name: str) -> bool:
+    folded = name.casefold()
+    if folded in _SOFTWARE_SEED_SECRET_FILENAMES:
+        return True
+    if folded.startswith(".env."):
+        return not folded.endswith((".example", ".sample", ".template"))
+    if Path(folded).suffix in _SOFTWARE_SEED_SECRET_SOURCE_SUFFIXES:
+        return False
+    tokens = set(filter(None, re.split(r"[^a-z0-9]+", Path(folded).stem)))
+    return bool(tokens & {"credential", "credentials", "secret", "secrets"})
+
+
+def _software_scorer_paths(problem_dir: Path) -> list[Path]:
+    scorer = problem_dir / "scorer"
+    if not scorer.is_dir():
+        return []
+    paths: list[Path] = []
+    for path in sorted(scorer.rglob("*.py")):
+        relative = path.relative_to(scorer)
+        if "__pycache__" in relative.parts or relative.parts[:1] == ("data",):
+            continue
+        paths.append(path)
+    return paths
+
+
+def _software_seed_module_names(seed: Path | None) -> set[str]:
+    if seed is None:
+        return set()
+    names = {seed.name} if seed.name.isidentifier() else set()
+    for directory, dirnames, filenames in os.walk(
+        seed, topdown=True, followlinks=False
+    ):
+        base = Path(directory)
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not (base / name).is_symlink()
+            and name.casefold() not in _SOFTWARE_SEED_CACHE_NAMES
+        ]
+        relative = base.relative_to(seed)
+        if relative.parts and "__init__.py" in filenames:
+            package = relative.parts[-1]
+            if package.isidentifier():
+                names.add(package)
+        for name in filenames:
+            path = base / name
+            if path.is_symlink() or path.suffix.casefold() != ".py":
+                continue
+            if path.stem.isidentifier() and path.stem != "__init__":
+                names.add(path.stem)
+        if relative == Path():
+            for name in dirnames:
+                if name.isidentifier():
+                    names.add(name)
+    return names
+
+
+def _software_scorer_isolation_issues(
+    problem_dir: Path, seed: Path | None, outputs: list[Any]
+) -> list[str]:
+    candidate_modules = _software_seed_module_names(seed)
+    candidate_modules.update(
+        PurePosixPath(output.path).name
+        for output in outputs
+        if PurePosixPath(output.path).name.isidentifier()
+    )
+    issues: list[str] = []
+    for source in _software_scorer_paths(problem_dir):
+        rel = source.relative_to(problem_dir).as_posix()
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            issues.append(f"could not inspect software scorer {rel}: {exc}")
+            continue
+        issues.extend(_grader_sandbox_issues(rel, text))
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        imports = _import_aliases(tree)
+        for node in ast.walk(tree):
+            imported: list[str] = []
+            if isinstance(node, ast.Import):
+                imported = [alias.name.split(".", 1)[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported = [node.module.split(".", 1)[0]]
+            for name in imported:
+                if name in candidate_modules:
+                    issues.append(
+                        f"{rel}:{node.lineno}: root scorer must not import candidate "
+                        f"workspace module {name!r}; execute it through "
+                        "context.run_candidate() or context.run_candidate_suite()"
+                    )
+
+            if isinstance(node, ast.Call):
+                name = _canonical_call_name(node.func, imports)
+                if name in {
+                    "__import__",
+                    "builtins.__import__",
+                    "import_module",
+                    "importlib.import_module",
+                }:
+                    issues.append(
+                        f"{rel}:{node.lineno}: root scorer must not dynamically import "
+                        "candidate modules; execute them through context.run_candidate() "
+                        "or context.run_candidate_suite()"
+                    )
+    return list(dict.fromkeys(issues))
+
+
+def _software_candidate_execution_issues(problem_dir: Path) -> list[str]:
+    issues: list[str] = []
+    safe_call_found = False
+    for source in _software_scorer_paths(problem_dir):
+        rel = source.relative_to(problem_dir).as_posix()
+        try:
+            text = source.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        imports = _import_aliases(tree)
+        reachable = _reachable_from_compute_score(tree)
+        enclosing = _enclosing_func_name(tree)
+        has_entrypoint = bool(reachable)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            scope = enclosing.get(id(node))
+            live = not has_entrypoint or scope is None or scope in reachable
+            if not live:
+                continue
+            name = _canonical_call_name(node.func, imports)
+            if name.endswith((".run_candidate", ".run_candidate_suite")):
+                safe_call_found = True
+                issues.extend(_software_bound_issues(rel, node, name))
+            elif name == "CandidateCommandSpec" or name.endswith(
+                ".CandidateCommandSpec"
+            ):
+                issues.extend(_software_bound_issues(rel, node, name))
+
+            if name.startswith("subprocess.") or name in {"os.popen", "os.system"}:
+                issues.append(
+                    f"{rel}:{node.lineno}: software scorer must run external candidate "
+                    "code through context.run_candidate() or "
+                    "context.run_candidate_suite(), not direct process APIs"
+                )
+            elif name.startswith(("os.exec", "os.spawn")):
+                issues.append(
+                    f"{rel}:{node.lineno}: software scorer must not exec/spawn candidate "
+                    "code directly; use context.run_candidate() or "
+                    "context.run_candidate_suite()"
+                )
+    if not safe_call_found:
+        issues.append(
+            "software RubricTask evaluate path must execute the submitted workspace "
+            "through context.run_candidate() or context.run_candidate_suite()"
+        )
+    return list(dict.fromkeys(issues))
+
+
+def _software_bound_issues(rel: str, call: ast.Call, call_name: str) -> list[str]:
+    issues: list[str] = []
+    bounded_fields = {
+        "timeout_s",
+        "max_output_bytes",
+        "max_attempt_elapsed_s",
+        "max_total_elapsed_s",
+    }
+    for keyword in call.keywords:
+        if keyword.arg not in bounded_fields:
+            continue
+        known, value = _numeric_literal(keyword.value)
+        if known and (value is None or value <= 0):
+            issues.append(
+                f"{rel}:{call.lineno}: {call_name} {keyword.arg} must be positive"
+            )
+    return issues
+
+
+def _numeric_literal(node: ast.AST) -> tuple[bool, float | None]:
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or node.value is None:
+            return True, None
+        if isinstance(node.value, (int, float)):
+            return True, float(node.value)
+        return False, None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        known, value = _numeric_literal(node.operand)
+        if known and value is not None:
+            return True, -value if isinstance(node.op, ast.USub) else value
+    return False, None
+
+
+def _software_private_fixture_issues(problem_dir: Path) -> list[str]:
+    issues: list[str] = []
+    private_data = problem_dir / PRIVATE_DATA_REL
+    if not private_data.is_dir():
+        issues.append(
+            "software_engineering tasks must keep hidden fixtures under scorer/data/"
+        )
+    elif not any(
+        path.is_file() and not path.is_symlink() for path in private_data.rglob("*")
+    ):
+        issues.append("software_engineering scorer/data/ must contain hidden fixtures")
+    return issues
+
+
+def _software_private_layout_issues(problem_dir: Path) -> list[str]:
+    issues: list[str] = []
+
+    dockerfile = problem_dir / "environment" / "Dockerfile"
+    if not dockerfile.is_file():
+        issues.append(
+            "software_engineering tasks require environment/Dockerfile with a "
+            "root-only scorer/data layout"
+        )
+        return issues
+    try:
+        issues.extend(_dockerfile_private_layout_issues(dockerfile))
+        copied_data = False
+        copied_grader = False
+        for _line_number, instruction in _dockerfile_instructions(dockerfile):
+            if not instruction.lower().startswith(("copy ", "add ")):
+                continue
+            try:
+                tokens = shlex.split(instruction)
+            except ValueError:
+                tokens = instruction.split()
+            _flags, positional = _dockerfile_copy_parts(tokens)
+            if len(positional) < 2:
+                continue
+            sources = positional[:-1]
+            destination = positional[-1]
+            destination_root = _matching_private_root(destination)
+            for source in sources:
+                source_kind = _software_private_source_kind(source)
+                if source_kind == "data" and destination_root == "/mcp_server/data":
+                    copied_data = True
+                if source_kind == "scorer" and destination_root == "/mcp_server/grader":
+                    copied_grader = True
+        if not copied_data:
+            issues.append(
+                "environment/Dockerfile must copy scorer/data/ to root-only "
+                "/mcp_server/data/"
+            )
+        if not copied_grader:
+            issues.append(
+                "environment/Dockerfile must copy scorer/ to root-only "
+                "/mcp_server/grader/"
+            )
+    except OSError as exc:
+        issues.append(f"could not inspect software Dockerfile private layout: {exc}")
+    return issues
+
+
+def _software_private_source_kind(source: str) -> str | None:
+    normalized = source.replace("\\", "/").rstrip("/")
+    parts = [part for part in normalized.split("/") if part and part != "."]
+    if len(parts) >= 2 and parts[-2:] == ["scorer", "data"]:
+        return "data"
+    if parts and parts[-1] == "scorer":
+        return "scorer"
+    return None
+
+
+def _software_oracle_baseline_issues(problem_dir: Path) -> list[str]:
+    issues: list[str] = []
+    oracle = problem_dir / "solution" / "solve.sh"
+    if not _regular_nonempty_file(oracle):
+        issues.append(
+            "software_engineering tasks require a non-empty regular "
+            "solution/solve.sh oracle"
+        )
+
+    baselines = problem_dir / "baselines"
+    baseline_found = False
+    if baselines.is_dir() and not baselines.is_symlink():
+        for child in baselines.iterdir():
+            raw_name = child.stem if child.is_file() else child.name
+            normalized = re.sub(r"[^a-z0-9]", "", raw_name.casefold())
+            if not normalized.startswith(("naive", "noop")):
+                continue
+            if _regular_nonempty_file(child) or _directory_has_regular_file(child):
+                baseline_found = True
+                break
+    if not baseline_found:
+        issues.append(
+            "software_engineering tasks require a committed no-op or naive baseline "
+            "under baselines/"
+        )
+    return issues
+
+
+def _regular_nonempty_file(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and info.st_size > 0
+
+
+def _directory_has_regular_file(path: Path) -> bool:
+    if path.is_symlink() or not path.is_dir():
+        return False
+    return any(
+        _regular_nonempty_file(candidate)
+        for candidate in path.rglob("*")
+        if not candidate.is_symlink()
+    )
+
+
+def _software_timeout_issues(task_toml: Any) -> list[str]:
+    values = {
+        "[agent].timeout_sec": task_toml.agent.timeout_sec,
+        "[verifier].timeout_sec": task_toml.verifier.timeout_sec,
+        "[runner.timeouts].setup_sec": task_toml.runner.timeouts.setup_sec,
+        "[runner.timeouts].grading_sec": task_toml.runner.timeouts.grading_sec,
+        "[runner.timeouts].tool_sec": task_toml.runner.timeouts.tool_sec,
+        "[runner.timeouts].max_episode_sec": (
+            task_toml.runner.timeouts.max_episode_sec
+        ),
+    }
+    positive: dict[str, float] = {}
+    issues: list[str] = []
+    for label, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            issues.append(f"software_engineering {label} must be a positive timeout")
+        else:
+            positive[label] = float(value)
+
+    agent = "[agent].timeout_sec"
+    verifier = "[verifier].timeout_sec"
+    setup = "[runner.timeouts].setup_sec"
+    grading = "[runner.timeouts].grading_sec"
+    tool = "[runner.timeouts].tool_sec"
+    episode = "[runner.timeouts].max_episode_sec"
+    if (
+        verifier in positive
+        and grading in positive
+        and positive[verifier] > positive[grading]
+    ):
+        issues.append(
+            "software_engineering [runner.timeouts].grading_sec must cover "
+            "[verifier].timeout_sec"
+        )
+    if tool in positive and agent in positive and positive[tool] > positive[agent]:
+        issues.append(
+            "software_engineering [agent].timeout_sec must cover "
+            "[runner.timeouts].tool_sec"
+        )
+    if episode in positive:
+        for label in (agent, verifier, setup, grading, tool):
+            if label in positive and positive[label] > positive[episode]:
+                issues.append(
+                    "software_engineering [runner.timeouts].max_episode_sec must "
+                    f"cover {label}"
+                )
+    return issues
+
+
 def _output_relative_path(path: str) -> Path | None:
     prefix = "/tmp/output/"
     if path == "/tmp/output":
@@ -2305,8 +3111,7 @@ def _prompt_quality_issues(
 # leaking the intended solver / approach) and require the ground-truth oracle to
 # exercise a RUNNABLE domain solver from the SUBMITTED solution path (not just
 # public debug probes or scorer-only use). Every function early-returns for any
-# other task_type, so ML_Envs-mode tasks (synthesized task_type='ml') and all
-# non-cfd/structures native tasks are unaffected.
+# other task_type, so non-cfd/structures tasks are unaffected.
 _SOLVER_LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("solver mention", re.compile(r"\bsolvers?\b", re.IGNORECASE)),
     ("OpenFOAM", re.compile(r"\bOpenFOAM\b", re.IGNORECASE)),
@@ -3266,13 +4071,48 @@ def _pickle_exec_reader(
     return None
 
 
-def _generic_reader_name(call: ast.Call) -> str | None:
+def _import_open_reader_maps(tree: ast.AST) -> tuple[dict[str, str], dict[str, str]]:
+    module_aliases: dict[str, str] = {}
+    bare_readers: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _OPEN_MODULE_NAMES:
+                    module_aliases[alias.asname or alias.name] = alias.name
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "") in _OPEN_MODULE_NAMES
+        ):
+            for alias in node.names:
+                if alias.name == "open":
+                    bare_readers[alias.asname or alias.name] = f"{node.module}.open"
+    return module_aliases, bare_readers
+
+
+def _generic_reader_name(
+    call: ast.Call,
+    *,
+    open_module_aliases: dict[str, str] | None = None,
+    bare_open_readers: dict[str, str] | None = None,
+) -> str | None:
     """Return a reader name if the call reads a file path (open / pandas readers /
     np.load / json.load / h5py.File), else None."""
+    open_module_aliases = open_module_aliases or {}
+    bare_open_readers = bare_open_readers or {}
     func = call.func
-    if isinstance(func, ast.Name) and func.id in _GENERIC_AGENT_READER_NAMES:
-        return func.id
+    if isinstance(func, ast.Name):
+        if func.id in bare_open_readers:
+            return bare_open_readers[func.id]
+        if func.id in _GENERIC_AGENT_READER_NAMES:
+            return func.id
     if isinstance(func, ast.Attribute):
+        if func.attr == "open":
+            if (
+                isinstance(func.value, ast.Name)
+                and func.value.id in open_module_aliases
+            ):
+                return f"{open_module_aliases[func.value.id]}.open"
+            return "Path.open"
         if func.attr in _GENERIC_AGENT_READER_ATTRS:
             return func.attr
         if func.attr in _AGENT_PATH_METHOD_READERS:
@@ -3286,9 +4126,19 @@ def _generic_reader_name(call: ast.Call) -> str | None:
     return None
 
 
-def _reader_path_arg(call: ast.Call) -> ast.AST | None:
+def _reader_path_arg(
+    call: ast.Call, *, reader_name: str | None = None
+) -> ast.AST | None:
     func = call.func
-    if isinstance(func, ast.Attribute) and func.attr in _AGENT_PATH_METHOD_READERS:
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr in _AGENT_PATH_METHOD_READERS
+        and not (
+            func.attr == "open"
+            and reader_name is not None
+            and reader_name != "Path.open"
+        )
+    ):
         # ``path.read_text()`` / ``path.read_bytes()``: the path is the receiver.
         return func.value
     if call.args and not isinstance(call.args[0], ast.Starred):
@@ -3311,35 +4161,6 @@ def _is_write_open(call: ast.Call) -> bool:
 
 def _path_segment_is_agent_writable(segment: str) -> bool:
     return any(token in segment for token in _AGENT_PATH_TOKENS)
-
-
-def _has_nofollow_guard(tree: ast.AST) -> bool:
-    """Module-level check (AST, not substring): does the scorer open a descriptor
-    with ``O_NOFOLLOW`` as REAL CODE?
-
-    This is the ONLY hand-rolled guard that closes symlink EXFILTRATION on a raw
-    read. An ``os.lstat`` + ``stat.S_ISREG`` / ``Path.is_symlink`` check is NOT
-    sufficient: it is check-then-use on the PATH, and a uid-1000 process that
-    survived a mid-grade ``run_model_module`` / ``run_policy`` races it (swaps a
-    regular file for a symlink between the check and the reader's open). Only
-    opening the fd with ``O_NOFOLLOW`` (a symlink leaf fails atomically at open)
-    and reading THAT fd -- what ``load_submission_npz_or_fault`` does internally
-    -- is race-free.
-
-    Matches an ``O_NOFOLLOW`` ``Name`` / ``Attribute`` node (``os.O_NOFOLLOW`` or
-    ``from os import O_NOFOLLOW``), NOT a substring, so a comment / docstring /
-    string literal mentioning it does not count (the previous substring check let
-    a stray token in a comment clear the finding). Module-scoped (like
-    ``_raises_agent_fault``): precision over recall is acceptable (scorer files
-    are small); a grader that routes reads through a sanctioned loader has no raw
-    reader flagged and never needs this.
-    """
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == "O_NOFOLLOW":
-            return True
-        if isinstance(node, ast.Name) and node.id == "O_NOFOLLOW":
-            return True
-    return False
 
 
 def _agent_writable_names(tree: ast.AST, text: str) -> set[str]:
@@ -3586,13 +4407,12 @@ def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
     if not reachable:
         return issues
     enclosing = _enclosing_func_name(tree)
-    module_raises_af = _raises_agent_fault(tree, enclosing, reachable)
     guarded = _guarded_node_ids(tree)
     agent_names = _agent_writable_names(tree, text)
-    nofollow_guarded = _has_nofollow_guard(tree)
     # Resolve import aliases once so the pickle-ban lint catches the from-import
     # and `as`-aliased deserializer forms, not only the module-qualified literal.
     module_aliases, bare_pickle_readers = _import_reader_maps(tree)
+    open_module_aliases, bare_open_readers = _import_open_reader_maps(tree)
     # Names / with-handles that provably point at trusted held-out truth or public
     # baked data, so the fail-closed pickle gate below can suppress a legitimate
     # truth load while flagging everything it cannot prove trusted.
@@ -3619,6 +4439,17 @@ def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
         ):
             continue
 
+        if any(
+            keyword.arg == "drop_privileges"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is False
+            for keyword in node.keywords
+        ):
+            issues.append(
+                f"{rel_path}:{node.lineno}: submitted-code workers must not set "
+                "drop_privileges=False; that executes agent code in the root grader"
+            )
+
         pickle_reader = _pickle_exec_reader(node, module_aliases, bare_pickle_readers)
         if pickle_reader is not None:
             # RCE-on-load: a pickle / joblib / torch deserialize runs the
@@ -3642,12 +4473,16 @@ def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
                 )
             continue
 
-        reader_name = _generic_reader_name(node)
+        reader_name = _generic_reader_name(
+            node,
+            open_module_aliases=open_module_aliases,
+            bare_open_readers=bare_open_readers,
+        )
         if reader_name is None:
             continue
         if reader_name == "open" and _is_write_open(node):
             continue
-        path_arg = _reader_path_arg(node)
+        path_arg = _reader_path_arg(node, reader_name=reader_name)
         if path_arg is None:
             continue
         segment = ast.get_source_segment(text, path_arg) or ""
@@ -3656,22 +4491,7 @@ def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
             is_agent_path = path_arg.id in agent_names
         if not is_agent_path:
             continue
-        if nofollow_guarded:
-            # An O_NOFOLLOW open (a symlink leaf fails atomically at open) is
-            # race-free -- it closes symlink-exfil AND the OSError over-discard.
-            # (A racy os.lstat + S_ISREG check does NOT qualify; see
-            # _has_nofollow_guard.) Only nudge if the scorer signals the reject
-            # with a homebrew `return 0.0` instead of the typed AgentFault.
-            if not module_raises_af:
-                issues.append(
-                    f"{rel_path}:{node.lineno}: `{reader_name}` guards an "
-                    f"agent-writable read, but the scorer never raises "
-                    f"grading.faults.AgentFault on the grading path. Signal "
-                    f"agent-caused failures via the typed AgentFault so they are kept "
-                    f"as a real 0.0 for training, not a homebrew `return 0.0`. "
-                    f"{_AGENT_FAULT_HELPER_HINT}"
-                )
-        elif id(node) not in guarded:
+        if id(node) not in guarded:
             issues.append(
                 f"{rel_path}:{node.lineno}: `{reader_name}` reads an agent-writable "
                 f"path with no guard. A planted directory/FIFO raises OSError out of "
@@ -3679,33 +4499,21 @@ def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
                 f"and a symlink to the held-out truth is followed and read as root "
                 f"(perfect-score exfiltration). {_AGENT_FAULT_HELPER_HINT}"
             )
-        elif reader_name not in _AGENT_PATH_METHOD_READERS:
-            # A structured-data reader (np.load / read_csv / open / h5py.File / ...)
-            # behind a `try/except` but with NO O_NOFOLLOW guard: a symlink to the
-            # held-out truth reads successfully (no OSError) and the root grader
-            # scores the truth as the agent's submission. This is exactly the
-            # reported hack's "fixed" form -- a try/except is not enough, and
-            # neither is a racy os.lstat + S_ISREG check (see _has_nofollow_guard).
-            # (Scoped to data readers; the `.read_text()`/`.read_bytes()` config
-            # reads that rubric scorers use fall through to the AgentFault nudge.)
+        else:
+            # Any raw pathname reader behind try/except remains vulnerable.
+            # Catching OSError, lstat, or leaf-only O_NOFOLLOW cannot pin mutable
+            # parent directories; only a sanctioned component-safe loader can.
             issues.append(
                 f"{rel_path}:{node.lineno}: `{reader_name}` reads an agent-writable "
-                f"path behind a `try/except`, but with no O_NOFOLLOW guard against a "
-                f"non-regular file. A try/except catches a planted dir/FIFO, and an "
-                f"os.lstat + S_ISREG check is raced by a surviving uid-1000 process, "
-                f"but a SYMLINK to the "
+                f"path behind a `try/except`, but without a component-safe shared "
+                f"loader. A try/except catches a planted dir/FIFO, an os.lstat + "
+                f"S_ISREG check is raced by a surviving uid-1000 process, and a "
+                f"leaf-only O_NOFOLLOW still follows a replaced parent directory. "
+                f"A SYMLINK to the "
                 f"held-out truth (re-planted by the agent's script after the runner's "
                 f"pre-grade scrub) reads successfully with no error -- the root grader "
                 f"loads the truth as the agent's submission (perfect score). "
                 f"{_AGENT_FAULT_HELPER_HINT}"
-            )
-        elif not module_raises_af:
-            issues.append(
-                f"{rel_path}:{node.lineno}: `{reader_name}` reads an agent-writable "
-                f"path behind a guard, but the scorer never raises "
-                f"grading.faults.AgentFault on the grading path. Signal agent-caused "
-                f"failures via the typed AgentFault so they are kept as a real 0.0 for "
-                f"training, not a homebrew `return 0.0`. {_AGENT_FAULT_HELPER_HINT}"
             )
         continue
     return issues
@@ -3840,7 +4648,7 @@ def _committed_baseline_names(problem_dir: Path) -> set[str]:
 def baseline_trio_warnings(problem_dir: Path) -> list[str]:
     """Advisory (never blocking) check for the weak-baseline trio.
 
-    ML_Envs convention is that a static-dataset ml continuous-scoring task ships
+    A static-dataset ml continuous-scoring task ships
     a trio of weak baselines as calibration evidence -- naive (mean/median or
     majority/random), linear/logistic on raw features, and an untuned GBT on raw
     features. Policy/environment-style ml tasks use analogues (random-action,
@@ -4322,8 +5130,7 @@ def _trivial_baseline_proof_issues(
 ) -> list[str]:
     """Enforce the proof-recorded no-op score (trivial_baseline_score).
 
-    Shared by the in-container and ML_Envs proof paths: the ceiling gate
-    applies to every recorded score; continuous scoring functions additionally
+    The ceiling gate applies to every recorded score; continuous scoring functions additionally
     require the field to be present and anchored to ~0.
     """
     issues: list[str] = []
@@ -4361,36 +5168,6 @@ def _trivial_baseline_proof_issues(
             "to record it."
         )
     return issues
-
-
-def _mlenvs_trivial_baseline_issues(
-    problem_dir: Path, meta: dict[str, Any]
-) -> list[str]:
-    """Zero-anchor proof check for ML_Envs-mode tasks (always continuous).
-
-    ML_Envs graders cannot be host-probed and their build proof is not rebuilt
-    during validation, so when a committed proof carries a ``ground_truth_result``
-    the recorded ``trivial_baseline_score`` must exist and be anchored to ~0 --
-    otherwise a stale/bad proof would pass CI while native in-container tasks
-    fail the same check. A proof without ``ground_truth_result`` (authoring
-    iteration before the first ground-truth run) is left to the ground-truth
-    harness, which enforces the anchor at run time and records the field.
-    """
-    proof_path = problem_dir / PROOF_PATH
-    if not proof_path.exists():
-        return []
-    try:
-        proof = read_json(proof_path)
-    except Exception:  # noqa: BLE001 -- proof integrity is verified elsewhere
-        return []
-    result = proof.get("ground_truth_result")
-    if not isinstance(result, dict):
-        return []
-    try:
-        task_toml = load_task_toml(problem_dir)
-    except Exception:  # noqa: BLE001 -- schema stage reports the parse failure
-        return []
-    return _trivial_baseline_proof_issues(result, task_toml=task_toml, meta=meta)
 
 
 def _dockerfile_instructions(dockerfile: Path) -> list[tuple[int, str]]:
@@ -4546,25 +5323,18 @@ def _solution_private_read_issues(problem_dir: Path) -> list[str]:
 
     Scans ``solution/*.sh`` (line/substring) and ``solution/*.py`` (string
     literals via AST) for references to the private held-out truth, under either
-    its on-disk name (``scorer/data`` native, ``data/private/`` ML_Envs) or its
-    baked container roots (``/mcp_server/data``, ``/mcp_server/grader``). A
+    its on-disk name (``scorer/data``) or its baked container roots
+    (``/mcp_server/data``, ``/mcp_server/grader``). A
     reference that reads the answer key would score perfectly and miscalibrate the
     reference/0.5 anchor.
 
     No-ops (returns ``[]``) when the reference dir is absent, e.g. a task type
-    that ships no reference. ML_Envs-mode tasks keep the reference under
-    ``reference_solution/`` instead of ``solution/``.
+    that ships no reference.
     """
-    is_mlenvs = _is_mlenvs(problem_dir)
-    solution_dir = problem_dir / ("reference_solution" if is_mlenvs else "solution")
+    solution_dir = problem_dir / "solution"
     if not solution_dir.is_dir():
         return []
-    # In ML_Envs mode the on-disk private root is data/private/ (baked to the
-    # /mcp_server/data container root, which is already covered). The trailing
-    # slash keeps a public file named data/private_* from false-matching.
-    tokens = (
-        (*_PRIVATE_READ_TOKENS, "data/private/") if is_mlenvs else _PRIVATE_READ_TOKENS
-    )
+    tokens = _PRIVATE_READ_TOKENS
     issues: list[str] = []
     for path in sorted(solution_dir.rglob("*")):
         if not path.is_file():
@@ -4846,12 +5616,8 @@ def _owner_assigns_nonroot_user(owner: str) -> bool:
 
 
 def _public_private_duplicate_issues(problem_dir: Path) -> list[str]:
-    if _is_mlenvs(problem_dir):
-        public_dir = problem_dir / "data" / "public"
-        private_dir = problem_dir / "data" / "private"
-    else:
-        public_dir = problem_dir / "data"
-        private_dir = problem_dir / "scorer" / "data"
+    public_dir = problem_dir / "data"
+    private_dir = problem_dir / "scorer" / "data"
     if not public_dir.exists() or not private_dir.exists():
         return []
 
@@ -4874,6 +5640,390 @@ def _public_private_duplicate_issues(problem_dir: Path) -> list[str]:
                 f"{public_match.relative_to(problem_dir)}"
             )
     return issues
+
+
+# Agent-visible channel -> the private channels it must not overlap with. A
+# package installed into the runtime venv is importable by the uid-1000 agent,
+# so listing it in a private channel too buys nothing and silently defeats the
+# root-only /mcp_server isolation that channel exists to provide.
+_AGENT_REQUIREMENTS = Path("environment") / "requirements.txt"
+# Base package lists are memoized here, keyed by base image ID (see
+# image_deps.base_packages_cached). Local scratch, gitignored.
+_BASE_PACKAGE_CACHE_DIR = Path(".alignerr-cache") / "base-packages"
+_PRIVATE_REQUIREMENTS = (
+    (Path("scorer") / "requirements.txt", "grader-only, /mcp_server/grading_deps"),
+    (Path("scorer") / "env-requirements.txt", "env-server-only, /mcp_server/env_deps"),
+)
+
+# A normalized distribution name (post-_pkg_name). A bare VCS URL
+# (`git+https://...`) or local path (`./pkg`) leaves URL/path artifacts
+# (`:`, `/`, `+`) that this rejects -- such specs are "un-analyzable".
+_VALID_PKG_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+def _pkg_name(spec: str) -> str:
+    """Normalized distribution name from a pip spec (``foo[all]==1`` -> ``foo``)."""
+    name = spec.strip().lower()
+    for sep in ("[", "<", ">", "=", "!", "~", " ", ";", "@"):
+        name = name.split(sep, 1)[0]
+    return name.strip().replace("_", "-")
+
+
+def _dep_name_analyzable(spec: str) -> bool:
+    """True if ``spec``'s distribution name can be resolved for the overlap check.
+
+    A PEP 508 direct reference (``name @ git+https://...``) IS analyzable --
+    ``_pkg_name`` yields the ``name`` before ``@``. A BARE VCS URL / local path
+    has no resolvable name, so the same package spelled as a URL in one channel
+    and a plain name in another would slip past the overlap check below.
+    """
+    return bool(_VALID_PKG_NAME_RE.match(_pkg_name(spec)))
+
+
+def _requirement_specs(path: Path) -> list[str]:
+    """Requirement specs from a requirements file (comments and pip flags dropped)."""
+    if not path.is_file():
+        return []
+    specs: list[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        # `-r other.txt`, `--index-url ...` and friends are pip options, not specs.
+        if not line or line.startswith("-"):
+            continue
+        specs.append(line)
+    return specs
+
+
+def _hidden_env_requirements_issues(problem_dir: Path) -> list[str]:
+    """``scorer/env-requirements.txt`` only means anything with a hidden env server.
+
+    That tree is installed into ``/mcp_server/env_deps`` and put on ``sys.path``
+    by the env server before it loads ``env.py``. With no ``[environment].hidden_env``
+    there is no env server, so the packages are installed and sealed where nothing
+    ever imports them -- silently dead rather than agent-visible, but the author
+    almost certainly meant ``environment/requirements.txt`` or ``scorer/requirements.txt``.
+    """
+    env_file = problem_dir / (Path("scorer") / "env-requirements.txt")
+    if not _requirement_specs(env_file):
+        return []
+    try:
+        task = load_task_toml(problem_dir)
+    except Exception:
+        return []  # the schema stage reports a malformed/absent task.toml
+    if task.environment.hidden_env:
+        return []
+    return [
+        "scorer/env-requirements.txt declares hidden-env-server-only packages but "
+        "[environment].hidden_env is unset, so no env server ever imports "
+        "/mcp_server/env_deps. Set [environment].hidden_env, or "
+        "move these to environment/requirements.txt (agent-visible) or "
+        "scorer/requirements.txt (grader-only)."
+    ]
+
+
+def _dependency_channel_issues(problem_dir: Path) -> list[str]:
+    """Reject a package declared in both the agent-visible and a private channel."""
+    agent_specs = _requirement_specs(problem_dir / _AGENT_REQUIREMENTS)
+    agent_pkgs = {_pkg_name(spec) for spec in agent_specs}
+
+    issues: list[str] = _hidden_env_requirements_issues(problem_dir)
+    unanalyzable: set[str] = set()
+    unanalyzable.update(s for s in agent_specs if not _dep_name_analyzable(s))
+
+    for rel, description in _PRIVATE_REQUIREMENTS:
+        private_specs = _requirement_specs(problem_dir / rel)
+        unanalyzable.update(s for s in private_specs if not _dep_name_analyzable(s))
+        overlap = sorted({_pkg_name(s) for s in private_specs} & agent_pkgs)
+        if overlap:
+            issues.append(
+                f"packages {overlap} appear in both {_AGENT_REQUIREMENTS.as_posix()} "
+                f"(agent-visible) and {rel.as_posix()} ({description}); the "
+                "agent-visible copy is importable by the agent, defeating the "
+                "isolation that channel provides. Declare each package in exactly "
+                "one channel."
+            )
+
+    if unanalyzable:
+        issues.append(
+            f"dependency spec(s) {sorted(unanalyzable)} are a bare VCS URL or local "
+            "path, so the agent/private overlap check cannot resolve their package "
+            "name. Use a named PyPI spec (or the PEP 508 'name @ url' form) so the "
+            "same package cannot appear in two channels under different spellings."
+        )
+    return issues
+
+
+# The runtime venv the agent-visible channel installs into. A pip install that
+# targets anything outside this prefix (a conda solver env's interpreter) has no
+# channel to move to, so it is not a raw-install violation.
+_RUNTIME_PREFIX = "/opt/lbx-runtime"
+# ...but an absolute path is only evidence of a *separate* environment when it
+# is a self-contained prefix of its own. Every base aliases the system-wide
+# python/pip names into the runtime venv (base/install-common.sh makes
+# /usr/local/bin/python a wrapper exec'ing the venv interpreter, symlinks
+# python3 to it, and points both pip names at the venv's pip) and puts the
+# venv's bin dir first on PATH. So `/usr/local/bin/pip install foo` is an
+# agent-visible runtime install spelled without the word lbx-runtime, and a
+# path in any system bin dir must be classified as runtime, not as an escape.
+_SYSTEM_BIN_DIRS = frozenset(
+    {"/usr/local/bin", "/usr/local/sbin", "/usr/bin", "/usr/sbin", "/bin", "/sbin"}
+)
+_APT_COMMANDS = frozenset({"apt", "apt-get", "aptitude"})
+# pip, pip3, and versioned entry points such as pip3.13, which the runtime venv
+# and /usr/local/bin both carry alongside the unversioned names.
+_PIP_COMMAND_RE = re.compile(r"^pip[0-9]*(?:\.[0-9]+)*$")
+_CONDA_COMMANDS = frozenset({"conda", "mamba", "micromamba"})
+_SHELL_COMMANDS = frozenset({"sh", "bash", "dash", "ash", "zsh"})
+# Bound on unwrapping `sh -c "sh -c '...'"` chains.
+_MAX_SHELL_NESTING = 4
+# Opt-out for an install that genuinely has no channel. Requires a reason so it
+# is a deliberate, reviewable statement rather than a silencer.
+_RAW_INSTALL_OPT_OUT_RE = re.compile(r"^#\s*lbx-allow-raw-install:\s*\S")
+# Shell operators that separate one command from the next inside a RUN body.
+_SHELL_SEPARATOR_RE = re.compile(r"&&|\|\||\||;|\n")
+# `$(which pip)` and `` `command -v python` `` resolve through PATH, which every
+# base points at the runtime venv first. Rewrite them to the bare name so they
+# classify as an ambient-interpreter install instead of tokenizing into
+# fragments no rule recognizes.
+_COMMAND_SUBSTITUTION_RE = re.compile(
+    r"\$\(\s*(?:which|command\s+-v)\s+([\w.+-]+)\s*\)"
+    r"|`\s*(?:which|command\s+-v)\s+([\w.+-]+)\s*`"
+)
+
+
+def _dockerfile_raw_install_issues(dockerfile: Path) -> list[str]:
+    """Fast pre-build convenience check for installs written into the Dockerfile.
+
+    NOT the authoritative gate. ``_image_dependency_issues`` is: it diffs the
+    built image against the base, so no spelling of an install command evades
+    it. This layer exists because "line 14 installs pip packages directly,
+    declare them in environment/requirements.txt" is a far more actionable
+    error than a package-name delta, and it costs nothing to produce before the
+    build. **A gap here is a missing convenience, not a hole in the contract**
+    -- pattern-matching shell text can always be worked around, which is
+    exactly why correctness does not rest on it.
+
+    Task-local dependencies belong in the declared channels that
+    ``install-task-deps.sh`` routes: where a package lands is the isolation
+    boundary, and a raw ``RUN pip install`` lands every one of them in the
+    agent-visible runtime venv. Only mechanisms that HAVE a channel are
+    flagged -- pip into the runtime venv, and apt. Source builds, conda envs,
+    binary fetches, and pip aimed at a non-runtime interpreter have no channel;
+    ``docs/NUMERICAL_SOLVERS.md`` documents per-task recipes that need exactly
+    those, so they are left alone.
+
+    ``# lbx-allow-raw-install: <reason>`` on the line before an instruction
+    waives *this* check for that instruction only. It cannot waive the image
+    diff, so it can no longer be used to get an undeclared package into a task.
+    """
+    issues: list[str] = []
+    opted_out = _raw_install_opt_out_lines(dockerfile)
+    for line_number, instruction in _dockerfile_instructions(dockerfile):
+        if not instruction.lower().startswith("run ") or line_number in opted_out:
+            continue
+        flagged: set[str] = set()
+        for tokens in _run_command_tokens(instruction[len("run ") :]):
+            if _is_apt_install(tokens) and "apt" not in flagged:
+                flagged.add("apt")
+                issues.append(
+                    f"{dockerfile}:{line_number}: installs apt packages directly. "
+                    "Declare them one per line in environment/apt.txt and install "
+                    "the task's channels with `RUN /opt/lbx-runtime/"
+                    "install-task-deps.sh /tmp/task-deps` instead; authors must "
+                    "not add packages to the shared base images either. If this "
+                    "install genuinely has no channel (build toolchain for a "
+                    "source-built engine, purged in the same layer), precede the "
+                    "RUN with `# lbx-allow-raw-install: <reason>`."
+                )
+            elif _is_runtime_pip_install(tokens) and "pip" not in flagged:
+                flagged.add("pip")
+                issues.append(
+                    f"{dockerfile}:{line_number}: installs pip packages directly "
+                    "into the runtime venv, which makes every one of them "
+                    "agent-visible. Declare them in the channel that matches who "
+                    "may import them: environment/requirements.txt "
+                    "(agent-visible), scorer/requirements.txt (grader-only, "
+                    "/mcp_server/grading_deps), or scorer/env-requirements.txt "
+                    "(env-server-only, /mcp_server/env_deps), then install with "
+                    "`RUN /opt/lbx-runtime/install-task-deps.sh /tmp/task-deps`. "
+                    "A pip install aimed at a non-runtime interpreter (a conda "
+                    "solver env) has no channel and is not flagged."
+                )
+    return issues
+
+
+def _run_command_tokens(body: str) -> list[list[str]]:
+    """Tokens for each command in a RUN body, in either shell or exec form.
+
+    Exec form (``RUN ["pip", "install", "x"]``) is already argv and runs without
+    a shell, so it is a single command -- except for the ``["sh", "-c", "..."]``
+    spelling, whose argument is a shell body and splits like shell form.
+    """
+    stripped = body.strip()
+    if stripped.startswith("["):
+        try:
+            argv = json.loads(stripped)
+        except ValueError:
+            argv = None
+        if isinstance(argv, list) and all(isinstance(arg, str) for arg in argv):
+            nested = _nested_shell_body(argv)
+            if nested is not None:
+                return _shell_command_tokens(nested)
+            return [argv]
+    return _shell_command_tokens(stripped)
+
+
+def _shell_command_tokens(body: str, depth: int = 0) -> list[list[str]]:
+    tokens: list[list[str]] = []
+    for segment in _SHELL_SEPARATOR_RE.split(body):
+        segment = _COMMAND_SUBSTITUTION_RE.sub(
+            lambda match: match.group(1) or match.group(2), segment
+        )
+        try:
+            argv = shlex.split(segment)
+        except ValueError:
+            argv = segment.split()
+        nested = _nested_shell_body(argv)
+        if nested is not None and depth < _MAX_SHELL_NESTING:
+            # `sh -c 'pip install x'`: shlex quite correctly keeps the payload as
+            # one token, so the command inside is invisible until it is split
+            # again as a shell body of its own.
+            tokens.extend(_shell_command_tokens(nested, depth + 1))
+            continue
+        tokens.append(argv)
+    return tokens
+
+
+def _nested_shell_body(argv: list[str]) -> str | None:
+    """The script argument of a ``sh -c <body>`` style invocation, if this is one.
+
+    Covers clustered short options (``bash -lc``, ``sh -euxc``), where the ``c``
+    that takes the script is the last letter of the cluster.
+    """
+    if len(argv) < 3 or PurePosixPath(argv[0]).name not in _SHELL_COMMANDS:
+        return None
+    for index, token in enumerate(argv[1:-1], 1):
+        if not token.startswith("-") or token.startswith("--"):
+            break
+        if token.endswith("c"):
+            return argv[index + 1]
+    return None
+
+
+def _raw_install_opt_out_lines(dockerfile: Path) -> set[int]:
+    """Start lines of instructions preceded by the raw-install opt-out comment."""
+    opted_out: set[int] = set()
+    pending = False
+    for line_number, raw_line in enumerate(dockerfile.read_text().splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            pending = pending or bool(_RAW_INSTALL_OPT_OUT_RE.match(line))
+            continue
+        if pending:
+            opted_out.add(line_number)
+            pending = False
+    return opted_out
+
+
+def _is_apt_install(tokens: list[str]) -> bool:
+    return any(
+        PurePosixPath(token).name in _APT_COMMANDS and "install" in tokens[index + 1 :]
+        for index, token in enumerate(tokens)
+    )
+
+
+def _is_runtime_pip_install(tokens: list[str]) -> bool:
+    """True for a pip install that lands in the runtime venv (or its fallback).
+
+    ``conda run``/``mamba run`` delegate to another env's interpreter, so a pip
+    install underneath one is out of the runtime venv and out of scope.
+
+    Deliberately not resolved, because each needs shell evaluation rather than
+    tokenization and this check exists to stop accidental and casual bypasses
+    rather than to sandbox an author working to defeat it: indirection through a
+    variable (``PIP=/usr/local/bin/pip; $PIP install``), and a bare ``pip
+    install`` in an image whose ``ENV PATH`` was repointed at a non-runtime
+    environment. The latter is reported rather than missed -- an ambient install
+    is assumed to be a runtime install -- so the author's recourse is the
+    documented ``# lbx-allow-raw-install:`` opt-out.
+    """
+    if any(
+        PurePosixPath(token).name in _CONDA_COMMANDS and "run" in tokens[index:]
+        for index, token in enumerate(tokens)
+    ):
+        return False
+    if not _invokes_pip_install(tokens):
+        return False
+    targets = _pip_install_targets(tokens)
+    # No explicit target means the ambient interpreter, which on every base
+    # image is the runtime venv (its bin dir leads ENV PATH).
+    return not targets or any(_is_runtime_target(target) for target in targets)
+
+
+def _is_runtime_target(target: str) -> bool:
+    """Whether an explicit pip target resolves to the agent-visible runtime venv.
+
+    True for the runtime prefix itself, for the system bin dirs the bases alias
+    into it, and for a bare name (``--python python3.13``, or what the
+    ``$(which python)`` rewrite leaves behind), which resolves through a PATH
+    the bases lead with the venv's bin dir. False only for a self-contained
+    prefix of its own, such as ``/opt/solver-envs/meep/bin/pip``, which has no
+    channel to move to.
+    """
+    if target == _RUNTIME_PREFIX or target.startswith(_RUNTIME_PREFIX + "/"):
+        return True
+    if not target.startswith("/"):
+        return True
+    return PurePosixPath(target).parent.as_posix() in _SYSTEM_BIN_DIRS
+
+
+def _invokes_pip_install(tokens: list[str]) -> bool:
+    """Whether a command runs a pip install, however it spells the invocation.
+
+    Each form allows flags between its parts, so `uv --quiet pip install` and
+    `python -m pip --no-cache-dir install` are recognised the same as the bare
+    spellings.
+    """
+    for index, token in enumerate(tokens):
+        name = PurePosixPath(token).name
+        rest = tokens[index + 1 :]
+        if _PIP_COMMAND_RE.match(name) and "install" in rest:
+            return True
+        if (
+            name in {"uv", "uvx"}
+            and "pip" in rest
+            and "install" in rest[rest.index("pip") + 1 :]
+        ):
+            return True
+        # `<interpreter> -m pip ... install` for any interpreter name, not just
+        # python*: a task can install through a shim it created earlier in the
+        # same Dockerfile under any name it likes.
+        if token == "-m" and rest[:1] == ["pip"] and "install" in rest[1:]:
+            return True
+    return False
+
+
+def _pip_install_targets(tokens: list[str]) -> list[str]:
+    """Interpreter/prefix paths a pip invocation explicitly installs into."""
+    targets: list[str] = []
+    for index, token in enumerate(tokens):
+        name = PurePosixPath(token).name
+        # An absolute pip/python path, or any absolute command run as
+        # `<cmd> -m pip ... install`, names the environment the install lands in.
+        if token.startswith("/") and (
+            _PIP_COMMAND_RE.match(name)
+            or name.startswith("python")
+            or tokens[index + 1 : index + 3] == ["-m", "pip"]
+        ):
+            targets.append(token)
+        for flag in ("--python", "--prefix"):
+            if token == flag and index + 1 < len(tokens):
+                targets.append(tokens[index + 1])
+            elif token.startswith(flag + "="):
+                targets.append(token.split("=", 1)[1])
+    return targets
 
 
 def _file_digest(path: Path) -> bytes:
@@ -4900,6 +6050,31 @@ def _name_tokens(name: str) -> list[str]:
     if current:
         tokens.append("".join(current))
     return tokens
+
+
+def _image_dependency_issues(
+    base_ref: str, image_tag: str, problem_dir: Path, repo_root: Path
+) -> list[str]:
+    """Authoritative dependency-channel gate: what the build produced vs the base.
+
+    This, not ``_dockerfile_raw_install_issues``, is what guarantees a task's
+    dependencies are declared. It compares installed package sets between the
+    base and the built image, so it holds regardless of how the Dockerfile
+    spelled the install. A probe failure is reported rather than swallowed --
+    an unenforceable gate must not look like a passing one.
+    """
+    try:
+        base_packages = image_deps.base_packages_cached(
+            base_ref, cache_dir=repo_root / _BASE_PACKAGE_CACHE_DIR
+        )
+        task_packages = image_deps.probe_image_packages(
+            image_tag, declared_roots=image_deps.declared_roots(problem_dir)
+        )
+    except (image_deps.ProbeError, subprocess.SubprocessError, OSError) as exc:
+        return [f"could not compare task image dependencies against the base: {exc}"]
+    return image_deps.undeclared_package_issues(
+        base_packages, task_packages, problem_dir
+    )
 
 
 def _run_private_layout_image_probe(image_tag: str) -> str | None:

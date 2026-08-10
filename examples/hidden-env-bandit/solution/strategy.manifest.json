@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "role": "reference",
+  "kind": "committed_artifact",
+  "inference_entrypoint": "solve.sh",
+  "artifacts": [
+    {
+      "path": "policy.py",
+      "sha256": "b2307ee5bb1aa30f69b6adb9362f2f63f7b1b9ce5b25c499517f4a083f3dbe92"
+    }
+  ]
+}

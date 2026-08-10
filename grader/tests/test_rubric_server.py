@@ -24,7 +24,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
+from grading import runtime_hardening
 from rubric import server
 
 
@@ -549,6 +549,27 @@ def test_grade_problem_uses_extra_field_timeout() -> None:
     assert grade.env_internal_failure is True
 
 
+@pytest.mark.parametrize("extra_fields", [None, {}, {"test_file": ""}])
+def test_grade_problem_without_test_file_is_an_infra_failure(extra_fields) -> None:
+    """A missing test_file is a caller fault, so it must not read as a real 0.0.
+
+    Without this, any regrade or monitoring lane that omits test_file records a
+    clean zero that is indistinguishable from a failed agent attempt.
+    """
+    grade = asyncio.run(
+        server.grade_problem(
+            problem_id="missing-test-file-probe",
+            transcript="",
+            extra_fields=extra_fields,
+        )
+    )
+
+    assert grade.subscores == {"score": 0.0}
+    assert grade.env_internal_failure is True
+    assert grade.env_internal_failure_logs
+    assert "test_file" in grade.metadata["error"]
+
+
 def test_agent_fault_scores_zero_without_env_internal_failure() -> None:
     grade = server._evaluate(
         textwrap.dedent("""
@@ -564,6 +585,139 @@ def test_agent_fault_scores_zero_without_env_internal_failure() -> None:
     assert grade.subscores == {"score": 0.0}
     assert grade.env_internal_failure is False
     assert grade.metadata["agent_fault"] == "missing submission"
+
+
+def test_pre_grade_quiesce_failure_is_infrastructure_failure(monkeypatch) -> None:
+    def fail_quiesce(_output_dir):
+        raise server.ProcessQuiesceError("respawning agent processes")
+
+    monkeypatch.setattr(server, "pre_grade_cleanup", fail_quiesce)
+    grade = server._evaluate("def compute_score():\n    return 1.0\n")
+
+    assert _reward(grade) == 0.0
+    assert grade.env_internal_failure is True
+    assert "quiesce failed" in grade.metadata["error"]
+
+
+def test_respawning_agent_quiesce_failure_is_kept_zero(monkeypatch) -> None:
+    def fail_quiesce(_output_dir):
+        raise server.AgentProcessQuiesceError("respawning agent processes")
+
+    monkeypatch.setattr(server, "pre_grade_cleanup", fail_quiesce)
+    grade = server._evaluate("def compute_score():\n    return 1.0\n")
+
+    assert _reward(grade) == 0.0
+    assert grade.env_internal_failure is False
+    assert grade.metadata["agent_fault"] == "respawning agent processes"
+
+
+def _fake_statvfs(*, free_bytes: int, total_inodes: int, free_inodes: int):
+    frsize = 4096
+    blocks = free_bytes // frsize
+    return SimpleNamespace(
+        f_bfree=blocks,
+        f_frsize=frsize,
+        f_files=total_inodes,
+        f_ffree=free_inodes,
+    )
+
+
+def test_staging_enospc_is_authoritative_zero(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server, "_pre_grade_resource_cleanup", lambda: (None, {}, False)
+    )
+    monkeypatch.setattr(
+        server,
+        "sample_resource_exhaustion",
+        lambda *a, **k: runtime_hardening.ResourceExhaustion(
+            disk=False, shmem=False, meminfo_kib={}
+        ),
+    )
+    monkeypatch.setattr(server, "_stage_result_file", lambda: (None, True))
+
+    grade = server._evaluate("def compute_score():\n    return 1.0\n")
+
+    assert _reward(grade) == 0.0
+    assert grade.env_internal_failure is False
+    assert grade.metadata["agent_fault"] == "disk_exhausted"
+
+
+def test_tmpfs_flood_is_authoritative_zero(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server,
+        "_pre_grade_resource_cleanup",
+        lambda: (1000, {"pre_grade_agent_tmpfs_flood": True}, True),
+    )
+
+    grade = server._evaluate("def compute_score():\n    return 1.0\n")
+
+    assert _reward(grade) == 0.0
+    assert grade.env_internal_failure is False
+    assert grade.metadata["agent_fault"] == "agent_tmpfs_flood"
+
+
+def test_grader_timeout_on_a_full_disk_is_charged_to_the_agent(monkeypatch) -> None:
+    """A disk-full hang is the agent's zero, not a voided episode.
+
+    Boreal's timeout path used to consult shared memory only, so an agent that
+    filled the filesystem and hung the grader got the attempt discarded and
+    retried. Harbor already charged it; both paths now share one verdict.
+    """
+    monkeypatch.setattr(
+        server, "_pre_grade_resource_cleanup", lambda: (None, {}, False)
+    )
+    monkeypatch.setattr(
+        server,
+        "sample_resource_exhaustion",
+        lambda *a, **k: runtime_hardening.ResourceExhaustion(
+            disk=True, shmem=False, meminfo_kib={}
+        ),
+    )
+    monkeypatch.setattr(server, "_evaluate_timeout", lambda _t: 0.05)
+
+    grade = server._evaluate(
+        "import time\n\ndef compute_score():\n    time.sleep(30)\n    return 1.0\n"
+    )
+
+    assert _reward(grade) == 0.0
+    assert grade.env_internal_failure is False
+    assert grade.metadata["agent_fault"] == "disk_exhausted"
+
+
+def test_recorded_meminfo_describes_the_failure_not_the_recovery() -> None:
+    """A disputed zero has to be filed with the reading that justified it.
+
+    Re-reading /proc/meminfo when the grade is built would describe the box
+    after cleanup released the agent's /dev/shm entries, i.e. a healthy machine
+    next to an accusation of exhausting it.
+    """
+    at_failure = {"MemTotal": 16_000_000, "MemAvailable": 100_000, "Shmem": 15_000_000}
+
+    grade = server._agent_resource_grade(
+        "shared_memory_exhausted",
+        "agent exhausted shared memory during grading",
+        {},
+        meminfo=at_failure,
+    )
+
+    assert grade.metadata["meminfo_kib_at_failure"] == at_failure
+
+
+def test_oom_score_adjustments_are_best_effort(tmp_path: Path) -> None:
+    self_target = tmp_path / "self-oom-score"
+    self_target.write_text("0")
+    server._protect_grader_from_oom(str(self_target))
+    assert self_target.read_text() == "-1000"
+
+    proc_dir = tmp_path / "4242"
+    proc_dir.mkdir()
+    child_target = proc_dir / "oom_score_adj"
+    child_target.write_text("0")
+    server._bias_agent_child_toward_oom(4242, proc_root=str(tmp_path))
+    assert child_target.read_text() == str(server._AGENT_OOM_SCORE_ADJ)
+
+    server._protect_grader_from_oom(str(tmp_path / "missing" / "score"))
+    server._bias_agent_child_toward_oom(999999, proc_root=str(tmp_path))
 
 
 def test_boreal_runner_invokes_declarative_task_directly() -> None:

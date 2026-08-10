@@ -5,17 +5,36 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import pwd
 import signal
 import stat
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from grading.faults import AgentFault, InfrastructureFault
+from grading.secure_io import open_directory_fd
 
 logger = logging.getLogger(__name__)
 
 _NON_SYSTEM_UID_THRESHOLD = 1000
 _QUIESCE_MAX_PASSES = 32
 _QUIESCE_CONSECUTIVE_ZEROS = 2
+
+
+class ProcessQuiesceError(InfrastructureFault):
+    """The runtime could not prove that all agent processes stopped."""
+
+
+class AgentProcessQuiesceError(AgentFault):
+    """Agent-owned processes kept respawning and prevented quiescence."""
+
+
+class AgentTmpfsFloodError(AgentProcessQuiesceError):
+    """Agent-owned shared-memory entries exceeded the cleanup budget."""
+
+
 _AGENT_PERM_BITS = (
     stat.S_IRGRP
     | stat.S_IWGRP
@@ -54,6 +73,27 @@ _CACHE_ENV_KEYS = (
     "TORCH_HOME",
     "HF_HOME",
 )
+_AGENT_TMPFS_ROOTS: tuple[Path, ...] = (Path("/dev/shm"),)
+_AGENT_TMPFS_MAX_ENTRIES = 200_000
+_AGENT_TMPFS_MAX_WALK_S = 20.0
+_FS_MIN_FREE_BYTES = 4 * 1024 * 1024
+_FS_MIN_FREE_INODES = 256
+_SHMEM_EXHAUSTED_MIN_KIB = 512 * 1024
+_SHMEM_EXHAUSTED_MIN_FRACTION = 0.50
+_MEMAVAILABLE_EXHAUSTED_MAX_KIB = 512 * 1024
+_DISK_FULL_MARKERS = (
+    f"[errno {errno.ENOSPC}]",
+    f"[errno {errno.EDQUOT}]",
+    "no space left on device",
+    "disk quota exceeded",
+)
+_MEMORY_PRESSURE_MARKERS = (
+    "killed",
+    "out of memory",
+    "cannot allocate memory",
+    "oom-kill",
+    "oom killed",
+)
 
 
 @dataclass(frozen=True)
@@ -79,6 +119,213 @@ def classify_failure(returncode: int, stderr_tail: str) -> FailureClassification
     return FailureClassification(
         False, f"grader subprocess failed with exit {returncode}"
     )
+
+
+def filesystem_exhausted(path: str | Path) -> bool:
+    """Conservatively detect exhausted blocks or inodes on a known filesystem."""
+    try:
+        fs = os.statvfs(path)
+    except OSError:
+        return False
+    free_bytes = fs.f_bfree * fs.f_frsize
+    inodes_exhausted = fs.f_files > 0 and fs.f_ffree < _FS_MIN_FREE_INODES
+    return free_bytes < _FS_MIN_FREE_BYTES or inodes_exhausted
+
+
+def stderr_shows_disk_full(stderr_tail: str | None) -> bool:
+    lowered = (stderr_tail or "").lower()
+    return any(marker in lowered for marker in _DISK_FULL_MARKERS)
+
+
+def stderr_shows_memory_pressure(stderr_tail: str | None) -> bool:
+    lowered = (stderr_tail or "").lower()
+    return any(marker in lowered for marker in _MEMORY_PRESSURE_MARKERS)
+
+
+def meminfo_kib(path: str | Path = "/proc/meminfo") -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    try:
+                        values[parts[0][:-1]] = int(parts[1])
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return values
+
+
+def shared_memory_exhausted(mem: dict[str, int] | None = None) -> bool:
+    values = mem if mem is not None else meminfo_kib()
+    total = values.get("MemTotal", 0)
+    shmem = values.get("Shmem", 0)
+    available = values.get("MemAvailable")
+    return bool(
+        total > 0
+        and shmem > 0
+        and available is not None
+        and available < _MEMAVAILABLE_EXHAUSTED_MAX_KIB
+        and shmem
+        >= max(_SHMEM_EXHAUSTED_MIN_KIB, int(total * _SHMEM_EXHAUSTED_MIN_FRACTION))
+    )
+
+
+@dataclass(frozen=True)
+class ResourceExhaustion:
+    """Whether the agent exhausted disk or shared memory, sampled at one instant.
+
+    This is a value rather than a pair of predicates because the sample has to
+    be taken *before* cleanup runs. ``pre_grade_cleanup`` reaps the agent's
+    ``/dev/shm`` entries and tears down the staging tree, which is precisely the
+    evidence these checks read, so a post-cleanup sample reports a healthy box
+    and the episode is voided as infrastructure instead of being kept as the
+    agent's zero. Both grading paths have made that mistake; holding the verdict
+    in a value makes the ordering explicit at the call site.
+    """
+
+    disk: bool
+    shmem: bool
+    meminfo_kib: dict[str, int]
+
+    def agent_fault_kind(
+        self, *, returncode: int | None = None, stderr: str | None = None
+    ) -> str | None:
+        """The agent-fault kind to charge, or None when resources were fine.
+
+        ``returncode=None`` means the grader was still running when we gave up
+        on it (a timeout), so there is no exit status to corroborate memory
+        pressure and the meminfo verdict stands alone. With an exit status we
+        additionally require a SIGKILL or an explicit pressure marker, since a
+        grader can exit non-zero for reasons that have nothing to do with the
+        box being full.
+        """
+        if self.disk:
+            return "disk_exhausted"
+        if not self.shmem:
+            return None
+        if returncode is None:
+            return "shared_memory_exhausted"
+        killed = returncode in {-signal.SIGKILL, 128 + signal.SIGKILL}
+        if killed or stderr_shows_memory_pressure(stderr):
+            return "shared_memory_exhausted"
+        return None
+
+
+def sample_resource_exhaustion(
+    stderr: str | None = None, *, tmpdir: str | Path | None = None
+) -> ResourceExhaustion:
+    """Snapshot disk/shared-memory exhaustion. Call before any cleanup."""
+    mem = meminfo_kib()
+    return ResourceExhaustion(
+        disk=filesystem_exhausted(tempfile.gettempdir() if tmpdir is None else tmpdir)
+        or stderr_shows_disk_full(stderr),
+        shmem=shared_memory_exhausted(mem),
+        meminfo_kib=mem,
+    )
+
+
+def _agent_uid() -> int | None:
+    raw = os.environ.get("RUBRIC_AGENT_UID")
+    if raw:
+        try:
+            uid = int(raw)
+        except ValueError:
+            return None
+        return uid if uid > 0 else None
+    try:
+        return pwd.getpwnam(os.environ.get("RUBRIC_AGENT_USER", "agent")).pw_uid
+    except KeyError:
+        return None
+
+
+def _remove_owned_path(path: Path, uid: int) -> bool:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if info.st_uid != uid:
+        return False
+    try:
+        os.rmdir(path) if stat.S_ISDIR(info.st_mode) else os.unlink(path)
+        return True
+    except OSError:
+        return False
+
+
+def cleanup_agent_tmpfs(
+    agent_uid: int | None = None,
+    *,
+    roots: tuple[Path, ...] = _AGENT_TMPFS_ROOTS,
+    max_entries: int = _AGENT_TMPFS_MAX_ENTRIES,
+    max_seconds: float = _AGENT_TMPFS_MAX_WALK_S,
+) -> tuple[int, bool]:
+    """Remove agent-owned tmpfs entries without following links or walking forever."""
+    uid = _agent_uid() if agent_uid is None else agent_uid
+    if uid is None:
+        return 0, False
+    removed = 0
+    visited = 0
+    deadline = time.monotonic() + max_seconds if max_seconds > 0 else None
+
+    def over_budget() -> bool:
+        return (max_entries > 0 and visited >= max_entries) or (
+            deadline is not None and time.monotonic() >= deadline
+        )
+
+    for root in roots:
+        try:
+            if not stat.S_ISDIR(os.lstat(root).st_mode):
+                continue
+        except OSError:
+            continue
+        stack = [root]
+        directories: list[Path] = []
+        while stack:
+            if over_budget():
+                return removed, True
+            current = stack.pop()
+            try:
+                scanner = os.scandir(current)
+            except OSError:
+                continue
+            with scanner:
+                while True:
+                    if over_budget():
+                        return removed, True
+                    try:
+                        entry = next(scanner)
+                    except StopIteration:
+                        break
+                    except OSError:
+                        break
+                    visited += 1
+                    path = Path(entry.path)
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        is_dir = False
+                    if is_dir:
+                        stack.append(path)
+                        directories.append(path)
+                    elif _remove_owned_path(path, uid):
+                        removed += 1
+        for directory in reversed(directories):
+            if over_budget():
+                return removed, True
+            if _remove_owned_path(directory, uid):
+                removed += 1
+    return removed, False
+
+
+def protect_current_process_from_oom(path: str = "/proc/self/oom_score_adj") -> None:
+    try:
+        with open(path, "w") as handle:
+            handle.write("-1000")
+    except OSError:
+        pass
 
 
 def isolated_grader_environ(*, cache_root: str | Path | None = None) -> dict[str, str]:
@@ -123,8 +370,7 @@ def prepare_grader_cache(
             root = fallback
         except OSError:
             logger.warning(
-                "[GRADING] could not prepare private grader cache %s: %s; "
-                "omitting grader cache env vars",
+                "[GRADING] could not prepare private grader cache %s: %s; omitting grader cache env vars",
                 root,
                 exc,
             )
@@ -150,7 +396,12 @@ def kill_pre_grade_agent_processes(
     max_passes: int = _QUIESCE_MAX_PASSES,
     required_zero_passes: int = _QUIESCE_CONSECUTIVE_ZEROS,
 ) -> int:
-    """SIGKILL uid>=1000 processes before root-side grading reads outputs."""
+    """SIGKILL uid>=1000 processes before root-side grading reads outputs.
+
+    Raises :class:`ProcessQuiesceError` when runtime inspection/termination
+    fails, or :class:`AgentProcessQuiesceError` when confirmed agent processes
+    keep respawning. Grading never proceeds through either state.
+    """
     self_pid = os.getpid()
     parent_pid = os.getppid()
     protected = {self_pid, parent_pid, 1}
@@ -161,10 +412,9 @@ def kill_pre_grade_agent_processes(
         try:
             proc_entries = os.listdir("/proc")
         except OSError as exc:
-            logger.warning(
-                "[GRADING] could not enumerate /proc during quiesce: %s", exc
-            )
-            return total_killed
+            raise ProcessQuiesceError(
+                f"could not enumerate /proc during pre-grade quiesce: {exc}"
+            ) from exc
 
         eligible: list[tuple[int, int, str]] = []
         for entry in proc_entries:
@@ -176,8 +426,12 @@ def kill_pre_grade_agent_processes(
             proc_path = f"/proc/{entry}"
             try:
                 uid = os.stat(proc_path).st_uid
-            except (FileNotFoundError, OSError):
+            except FileNotFoundError:
                 continue
+            except OSError as exc:
+                raise ProcessQuiesceError(
+                    f"could not inspect {proc_path} during pre-grade quiesce: {exc}"
+                ) from exc
             if uid < min_uid or _read_proc_state(proc_path) == "Z":
                 continue
             cmd = "<unknown>"
@@ -209,20 +463,13 @@ def kill_pre_grade_agent_processes(
             except ProcessLookupError:
                 continue
             except (PermissionError, OSError) as exc:
-                logger.warning(
-                    "[GRADING] could not SIGKILL pid=%d uid=%d cmd=%r: %s",
-                    pid,
-                    uid,
-                    cmd,
-                    exc,
-                )
+                raise ProcessQuiesceError(
+                    f"could not SIGKILL pid={pid} uid={uid} cmd={cmd!r}: {exc}"
+                ) from exc
 
-    logger.error(
-        "[GRADING] pre-grade quiesce did not converge after %d passes; killed %d process(es)",
-        max_passes,
-        total_killed,
+    raise AgentProcessQuiesceError(
+        f"pre-grade quiesce did not converge after {max_passes} passes; killed {total_killed} process(es)"
     )
-    return total_killed
 
 
 _NVIDIA_DEVICE_PREFIX = "/dev/nvidia"
@@ -403,57 +650,205 @@ def scrub_nonregular_files(output_dir: str | Path) -> int:
     return removed
 
 
+def ensure_agent_output_directory(output_dir: str | Path) -> bool:
+    """Restore and root-pin one agent-writable output directory.
+
+    Call only after process quiescence. A missing, symlink, or non-directory
+    leaf is replaced with a root-owned mode-0777 directory so later root-side
+    publication cannot be redirected and future agent runs can still write
+    inside it. Returns whether the leaf had to be replaced.
+    """
+
+    output = Path(output_dir)
+    if not output.name:
+        raise ProcessQuiesceError(f"invalid agent output directory: {output}")
+    try:
+        parent_fd = open_directory_fd(output.parent)
+    except OSError as exc:
+        raise ProcessQuiesceError(
+            f"could not pin output parent {output.parent}: {exc}"
+        ) from exc
+
+    directory_fd = -1
+    restored = False
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        try:
+            directory_fd = os.open(output.name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            os.mkdir(output.name, mode=0o777, dir_fd=parent_fd)
+            restored = True
+            directory_fd = os.open(output.name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            try:
+                info = os.stat(
+                    output.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as stat_exc:
+                raise ProcessQuiesceError(
+                    f"could not inspect output directory {output}: {stat_exc}"
+                ) from stat_exc
+            if stat.S_ISDIR(info.st_mode):
+                raise ProcessQuiesceError(
+                    f"could not securely open output directory {output}: {exc}"
+                ) from exc
+            os.unlink(output.name, dir_fd=parent_fd)
+            os.mkdir(output.name, mode=0o777, dir_fd=parent_fd)
+            restored = True
+            directory_fd = os.open(output.name, flags, dir_fd=parent_fd)
+
+        if os.geteuid() == 0:
+            os.fchown(directory_fd, 0, 0)
+        os.fchmod(directory_fd, 0o777)
+        return restored
+    except OSError as exc:
+        raise ProcessQuiesceError(
+            f"could not restore output directory {output}: {exc}"
+        ) from exc
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        os.close(parent_fd)
+
+
 def pre_grade_cleanup(output_dir: str | Path) -> dict[str, int]:
     """Quiesce agent processes, then scrub dangerous output entries."""
     killed = 0
-    if os.name == "posix" and os.geteuid() == 0 and Path("/proc").exists():
+    if os.name == "posix" and os.geteuid() == 0:
+        if not Path("/proc").is_dir():
+            raise ProcessQuiesceError(
+                "cannot prove pre-grade process quiescence because /proc is unavailable"
+            )
         killed = kill_pre_grade_agent_processes()
+    removed_tmpfs, tmpfs_flood = cleanup_agent_tmpfs()
+    if tmpfs_flood:
+        raise AgentTmpfsFloodError(
+            "agent flooded /dev/shm beyond the bounded cleanup budget"
+        )
+    restored = ensure_agent_output_directory(output_dir)
     symlinks = scrub_escaping_symlinks(output_dir)
     nonregular = scrub_nonregular_files(output_dir)
     return {
         "killed_processes": killed,
+        "removed_tmpfs_entries": removed_tmpfs,
+        "restored_output_directory": int(restored),
         "removed_symlinks": symlinks,
         "removed_nonregular": nonregular,
     }
 
 
-def lock_down_grader_private(paths: tuple[str | Path, ...]) -> None:
-    """Best-effort root ownership and no group/other bits for private trees."""
-    targets: list[Path] = []
+def _is_readonly_mount(path: Path) -> bool:
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except OSError:
+        return False
+
+
+def lock_down_grader_private(
+    paths: tuple[str | Path, ...],
+    *,
+    missing_ok: bool = False,
+    readonly_mount_ok: tuple[str | Path, ...] = (),
+) -> None:
+    """Enforce root ownership and no group/other bits for private trees.
+
+    ``readonly_mount_ok`` names roots that may legitimately arrive on a
+    read-only mount. Two cases hit this:
+
+    * grader CODE -- the harness mounts the host ``scorer/`` over
+      ``/mcp_server/grader:ro`` so an edit rescores without an image rebuild.
+    * held-out truth (``/mcp_server/data``) delivered as a Taiga
+      ``is_read_only`` squashfs mount. On firecracker (the CPU-QA lane) that
+      mount is genuinely read-only, so the ownership-reset chown fails with
+      EROFS; on gVisor the writable overlay lets the same chown succeed.
+
+    In both cases the read-only mount already delivers the tamper-proofing this
+    lockdown exists for: the bytes cannot be modified, and the baked
+    ``0700 root /mcp_server`` parent stops the uid-1000 agent from reading in.
+    So a tolerated root degrades to a ``[SETUP_GUARD]`` warning, **but only when
+    the filesystem really is read-only** (``_is_readonly_mount``). A writable,
+    non-root private tree is never tolerated and still fails hard.
+    """
+    require_root_owner = os.geteuid() == 0
+    tolerated_roots = {str(Path(raw)) for raw in readonly_mount_ok}
+    targets: list[tuple[Path, bool]] = []
     for raw_path in paths:
         path = Path(raw_path)
         if not path.exists() and not path.is_symlink():
-            continue
-        targets.append(path)
+            if missing_ok:
+                continue
+            raise InfrastructureFault(f"grader-private path is missing: {path}")
+        readonly_ok = str(path) in tolerated_roots and _is_readonly_mount(path)
+        targets.append((path, readonly_ok))
         if path.is_dir() and not path.is_symlink():
-            for dirpath, dirnames, filenames in os.walk(path):
-                targets.extend(Path(dirpath) / name for name in (*dirnames, *filenames))
 
-    for path in targets:
+            def fail_walk(exc: OSError) -> None:
+                raise InfrastructureFault(
+                    f"could not traverse grader-private path {path}: {exc}"
+                ) from exc
+
+            for dirpath, dirnames, filenames in os.walk(path, onerror=fail_walk):
+                targets.extend(
+                    (Path(dirpath) / name, readonly_ok)
+                    for name in (*dirnames, *filenames)
+                )
+
+    for path, readonly_ok in targets:
         try:
             info = os.lstat(path)
         except OSError as exc:
-            logger.warning(
-                "[SETUP_GUARD] could not stat grader-private path %s: %s", path, exc
-            )
-            continue
+            raise InfrastructureFault(
+                f"could not inspect grader-private path {path}: {exc}"
+            ) from exc
         if stat.S_ISLNK(info.st_mode):
-            continue
-        if info.st_uid != 0 or info.st_gid != 0:
+            raise InfrastructureFault(f"grader-private tree contains symlink: {path}")
+        if require_root_owner and (info.st_uid != 0 or info.st_gid != 0):
             try:
                 os.chown(path, 0, 0)
                 logger.warning("[SETUP_GUARD] reset root ownership on %s", path)
             except OSError as exc:
+                if not (readonly_ok and exc.errno in {errno.EROFS, errno.EPERM}):
+                    raise InfrastructureFault(
+                        f"could not reset root ownership on {path}: {exc}"
+                    ) from exc
                 logger.warning(
-                    "[SETUP_GUARD] could not reset root ownership on %s: %s", path, exc
+                    "[SETUP_GUARD] leaving %s owned by uid=%d gid=%d: "
+                    "read-only grader-private mount (%s)",
+                    path,
+                    info.st_uid,
+                    info.st_gid,
+                    exc,
                 )
         if info.st_mode & _AGENT_PERM_BITS:
             try:
                 os.chmod(path, info.st_mode & ~_AGENT_PERM_BITS)
                 logger.warning("[SETUP_GUARD] tightened group/other perms on %s", path)
             except OSError as exc:
+                if not (readonly_ok and exc.errno in {errno.EROFS, errno.EPERM}):
+                    raise InfrastructureFault(
+                        f"could not tighten grader-private permissions on {path}: {exc}"
+                    ) from exc
                 logger.warning(
-                    "[SETUP_GUARD] could not tighten perms on %s: %s", path, exc
+                    "[SETUP_GUARD] leaving mode %o on %s: "
+                    "read-only grader-private mount (%s)",
+                    stat.S_IMODE(info.st_mode),
+                    path,
+                    exc,
+                )
+        try:
+            verified = os.lstat(path)
+        except OSError as exc:
+            raise InfrastructureFault(
+                f"could not verify grader-private path {path}: {exc}"
+            ) from exc
+        if (
+            require_root_owner and (verified.st_uid != 0 or verified.st_gid != 0)
+        ) or verified.st_mode & _AGENT_PERM_BITS:
+            if not readonly_ok:
+                raise InfrastructureFault(
+                    f"grader-private path remains accessible after lockdown: {path}"
                 )
 
 

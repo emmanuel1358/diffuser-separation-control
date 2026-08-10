@@ -1,6 +1,6 @@
 ---
 name: hidden-env-tasks
-description: Author simulation / interaction based tasks where the agent must probe a BLACK-BOX environment (whose source/dynamics/reward it cannot read) over an RPC socket, then is graded on a submitted policy. Use when the task needs live interaction with hidden dynamics (a simulator, market, bandit, game opponent, adaptive system) -- i.e. [environment].hidden_env = "env"|"hybrid", the env_server, /tmp/env.sock, env.py / make_env, env_client.py, or load_submitted_policy. Do NOT use for static-data tasks.
+description: Authors simulation and interaction tasks where agents probe hidden dynamics over an RPC socket and submit a policy. Use for hidden_env env/hybrid, env_server, /tmp/env.sock, env.py, env_client.py, or load_submitted_policy; not static-data tasks.
 ---
 
 # Hidden-environment (simulation) tasks
@@ -22,7 +22,14 @@ ALL of:
 Do NOT use it for static-data tasks (ML on a fixed dataset, CFD/structures on a
 fixed case, a one-shot artifact) -- ship data under `data/` and grade the
 artifact; the env server is pure overhead there. `hidden_env` is **orthogonal to
-`task_type`**: an ml / mujoco / cfd / structures task can each opt in.
+`task_type`**: an ml / mujoco / cfd / structures / software_engineering task can
+opt in.
+
+For software tasks, do not use `hidden_env` as a substitute for a service graph.
+Multi-service tasks declare service-owned artifacts and an isolated verifier,
+then trusted tooling packages them as an outer capsule. Declared SSE MCP works
+on Taiga only through that capsule's audited service-DNS proxy; unbundled SSE is
+rejected.
 
 ## Author contract
 
@@ -63,6 +70,13 @@ def compute_score(workspace, trajectory, private):
     return score_from(env, action)
 ```
 
+If this grader uses `ContinuousTask.calibrated()` and generated locks (rather
+than `PolicyEvaluationTask` paired controls), declare task-specific committed
+no-op/fixed/open-loop/seeded-random output workspaces with
+`WorkspaceDegenerateProbes` under `baselines/degenerate/`. There is no generic
+hidden-env policy interface, so never ask the framework to infer these probes
+from `hidden_env` or `ml_task_type`.
+
 ## What runs where (don't fight it)
 
 - Boot: the rubric MCP server calls `supervise_if_enabled()`, reads
@@ -95,5 +109,8 @@ Reference runs start the env server inside the container before executing
 ```bash
 uv run lbx-rl-harness reference --problem-dir problems/<task_id>
 uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>
-lbx-rl-template validate --problem-dir problems/<task_id>   # blocking hidden_env stage
+uv run lbx-rl-template validate --problem-dir problems/<task_id>   # blocking hidden_env stage
 ```
+
+Read `reward-hacking-security` for submitted-policy loaders and fault
+classification.

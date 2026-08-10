@@ -84,9 +84,9 @@ def failed_criteria(grade_payload: dict[str, Any]) -> list[str]:
 def video_dimensions(path: Path) -> tuple[int, int]:
     ffprobe = shutil.which("ffprobe")
     if ffprobe is None:
-        raise RuntimeError(
-            "ffprobe is required to validate ground-truth video dimensions"
-        )
+        metadata = _bundled_video_metadata(path)
+        width, height = metadata["source_size"]
+        return int(width), int(height)
     completed = subprocess.run(
         [
             ffprobe,
@@ -121,7 +121,7 @@ def video_dimensions(path: Path) -> tuple[int, int]:
 def video_codec(path: Path) -> str:
     ffprobe = shutil.which("ffprobe")
     if ffprobe is None:
-        raise RuntimeError("ffprobe is required to validate ground-truth video codec")
+        return str(_bundled_video_metadata(path)["codec"])
     completed = subprocess.run(
         [
             ffprobe,
@@ -147,6 +147,25 @@ def video_codec(path: Path) -> str:
     if not codec:
         raise RuntimeError(f"could not determine video codec for {path}")
     return codec
+
+
+def _bundled_video_metadata(path: Path) -> dict[str, Any]:
+    """Read stream metadata with the binary bundled by imageio-ffmpeg."""
+    try:
+        import imageio_ffmpeg
+
+        frames = imageio_ffmpeg.read_frames(str(path))
+        try:
+            metadata = next(frames)
+        finally:
+            frames.close()
+    except (ImportError, OSError, RuntimeError, StopIteration) as exc:
+        raise RuntimeError(
+            f"could not inspect ground-truth video {path} with bundled ffmpeg: {exc}"
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise TypeError(f"bundled ffmpeg returned invalid metadata for {path}")
+    return metadata
 
 
 def validate_video_file(path: Path, logical_path: str) -> tuple[int, int]:

@@ -4,19 +4,17 @@ import json
 import shutil
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from alignerr_plugin import mlenvs
 from alignerr_plugin.local_runtime import ensure_local_base_image
 from alignerr_plugin.proof import write_build_proof
 
 from lbx_rl_tasks_harness.models import HarnessProblem
 
 TAIGA_PLATFORM = "linux/amd64"
-
-# Side-channel written by build_task_image, read by the manifest writer.
-FLAVOR_SIDECAR = Path(".alignerr") / "last_build_flavor.json"
+_ALLOWED_VERIFIER_CAPABILITIES = frozenset({"SYS_PTRACE"})
 
 
 @dataclass(frozen=True)
@@ -28,9 +26,6 @@ class StartedContainer:
 @dataclass(frozen=True)
 class TaskBuild:
     image_tag: str
-    image_flavor: str  # "heavy" | "slim" -- what actually built
-    flavor_requested: str  # "auto" | "heavy" | "slim"
-    flavor_fallback: bool  # heavy OOMed and we fell back to slim
 
 
 def _docker(
@@ -57,40 +52,18 @@ def _repo_root(problem_dir: Path) -> Path:
 def resolve_task_build(problem_dir: Path, repo_root: Path) -> tuple[Path, list[str]]:
     """Return (dockerfile, extra_build_args) for a task.
 
-    metadata-mode tasks build from the shared ``base/task.mlenvs.Dockerfile`` with
-    ``dependencies`` / ``apt_extras`` / ``env_dependencies`` forwarded as build
-    args; native tasks use their per-task ``environment/Dockerfile``.
-
-    ``env_dependencies`` install into the root-only ``/mcp_server/env_deps`` so a
-    hidden-env simulator stays server-only; ``grading_dependencies`` install into
-    the root-only ``/mcp_server/grading_deps`` so a grader-only scoring/reference
-    library stays invisible to the agent; ``dependencies`` install system-wide.
+    Every task builds from its own ``environment/Dockerfile``. Dependency
+    channels are declared as files under ``environment/`` and ``scorer/`` and
+    installed by ``/opt/lbx-runtime/install-task-deps.sh``, so no dependency
+    build args are forwarded here.
     """
-    if mlenvs.is_mlenvs_task(problem_dir):
-        dockerfile = repo_root / "base" / "task.mlenvs.Dockerfile"
-        meta = mlenvs.load_mlenvs_metadata(problem_dir)
-        # Bake hidden_env into task.toml so the runtime env-server gate activates
-        # for env/hybrid tasks (metadata mode ships no task.toml on disk).
-        hidden_env = mlenvs.hidden_env_for_task_type(meta["ml_task_type"])
-        extra = [
-            "--build-arg",
-            f"APT_EXTRAS={' '.join(meta.get('apt_extras', []) or [])}",
-            "--build-arg",
-            f"DEPENDENCIES={' '.join(meta.get('dependencies', []) or [])}",
-            "--build-arg",
-            f"ENV_DEPENDENCIES={' '.join(meta.get('env_dependencies', []) or [])}",
-            "--build-arg",
-            f"GRADING_DEPENDENCIES={' '.join(meta.get('grading_dependencies', []) or [])}",
-            "--build-arg",
-            f"HIDDEN_ENV={hidden_env}",
-        ]
-        return dockerfile, extra
+    from alignerr_plugin.utils import reject_legacy_layout
+
+    reject_legacy_layout(problem_dir)
     return problem_dir / "environment" / "Dockerfile", []
 
 
-def build_task_image(
-    problem: HarnessProblem, *, flavor: str = "auto", write_proof: bool = True
-) -> TaskBuild:
+def build_task_image(problem: HarnessProblem, *, write_proof: bool = True) -> TaskBuild:
     if problem.source_problem_dir is None:
         raise RuntimeError(
             "agent harness runtimes require --source-problem-dir for exported formats"
@@ -101,7 +74,7 @@ def build_task_image(
     if not dockerfile.exists():
         raise FileNotFoundError(f"task Dockerfile not found: {dockerfile}")
 
-    base = ensure_local_base_image(repo_root, problem_dir, flavor=flavor)
+    base = ensure_local_base_image(repo_root, problem_dir)
     rel_problem_dir = problem_dir.relative_to(repo_root)
     safe_id = problem.id.replace("/", "-").replace("_", "-")
     image_tag = f"lbx-rl-harness-{safe_id}:{int(time.time())}"
@@ -140,41 +113,40 @@ def build_task_image(
             alignerr_cli_version="0.1.0",
             duration_seconds=time.monotonic() - start,
         )
-    build = TaskBuild(
-        image_tag=image_tag,
-        image_flavor=base.flavor,
-        flavor_requested=flavor,
-        flavor_fallback=base.flavor_fallback,
-    )
-    _write_flavor_sidecar(problem_dir, build)
-    return build
+    return TaskBuild(image_tag=image_tag)
 
 
-def _write_flavor_sidecar(problem_dir: Path, build: TaskBuild) -> None:
-    path = problem_dir / FLAVOR_SIDECAR
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "image_flavor": build.image_flavor,
-                "flavor_requested": build.flavor_requested,
-                "flavor_fallback": build.flavor_fallback,
-            }
+def verifier_container_capabilities(problem: HarnessProblem) -> tuple[str, ...]:
+    verifier = problem.metadata.get("verifier")
+    raw = verifier.get("capabilities", []) if isinstance(verifier, dict) else []
+    if not isinstance(raw, list):
+        raise ValueError("verifier capabilities must be a list")
+    capabilities = tuple(str(item).strip().upper() for item in raw)
+    unsupported = sorted(set(capabilities) - _ALLOWED_VERIFIER_CAPABILITIES)
+    if any(not item for item in capabilities) or unsupported:
+        raise ValueError(
+            "unsupported verifier container capabilities; only SYS_PTRACE is allowed"
         )
-        + "\n"
-    )
+    return capabilities
 
 
-def read_flavor_sidecar(problem_dir: Path) -> dict | None:
-    """Read the flavor recorded by the last build_task_image (or None)."""
-    path = problem_dir / FLAVOR_SIDECAR
-    try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
+def docker_capability_args(capabilities: Sequence[str]) -> list[str]:
+    args: list[str] = []
+    for capability in capabilities:
+        normalized = str(capability).strip().upper()
+        if normalized not in _ALLOWED_VERIFIER_CAPABILITIES:
+            raise ValueError(
+                f"unsupported verifier container capability {capability!r}"
+            )
+        args.extend(["--cap-add", normalized])
+    return args
 
 
-def start_task_container(image_tag: str) -> StartedContainer:
+def start_task_container(
+    image_tag: str,
+    *,
+    verifier_capabilities: Sequence[str] = (),
+) -> StartedContainer:
     # ``--network none`` isolates the agent's code execution from the internet,
     # mirroring the Taiga sandbox. The model itself runs on the HOST (the
     # claude-code / deepagents loop drives the container over ``docker exec`` via
@@ -194,6 +166,7 @@ def start_task_container(image_tag: str) -> StartedContainer:
         "ANTHROPIC_API_KEY",
         "-e",
         "IS_SANDBOX=yes",
+        *docker_capability_args(verifier_capabilities),
         image_tag,
         "sleep",
         "infinity",

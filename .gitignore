@@ -35,6 +35,9 @@ examples/opensees-base-isolation/.alignerr/*
 !examples/opensees-base-isolation/.alignerr/build_proof.json
 !examples/opensees-base-isolation/.alignerr/ground_truth/
 !examples/opensees-base-isolation/.alignerr/ground_truth/**
+!examples/xfoil-rust-port/.alignerr/
+examples/xfoil-rust-port/.alignerr/*
+!examples/xfoil-rust-port/.alignerr/build_proof.json
 /.alignerr/
 .env.local
 .taiga_submit.json
@@ -43,3 +46,6 @@ problems/opensees-base-isolation.zip
 examples/opensees-base-isolation.zip
 .venv/
 __pycache__/
+
+# Base image package lists memoized by the dependency-channel image diff.
+.alignerr-cache/

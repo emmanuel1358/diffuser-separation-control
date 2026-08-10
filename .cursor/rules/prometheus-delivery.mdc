@@ -1,0 +1,24 @@
+---
+description: Prometheus CFD and structures delivery semantics
+globs: "{problems,examples}/**/task.toml,{problems,examples}/**/metadata.json"
+alwaysApply: false
+---
+
+# Prometheus Delivery
+
+- Prometheus is a delivery route, not a task type. Keep `task_type = "cfd"` or
+  `"structures"` and the normal solver/rubric quality gates.
+- Use `[delivery].platform = "prometheus"` and the correct
+  `prometheus-*`/`prometheus-eval-*` starter.
+- Keep `[agent].user = "agent"` and `[verifier].user = "root"`.
+- Trusted CI, deterministic oracle, prompt fairness, private-data isolation,
+  and numerical-solver requirements do not change.
+- Prometheus target average must be `<= 0.5`.
+- Eval rows follow the eval guide: trusted CI is the acceptance gate and Boreal
+  is coaching context.
+- Non-eval rows follow required Boreal QA and may not retain unresolved critical
+  findings.
+- Do not apply the software-engineering Boreal `<= 0.4` gate to Prometheus
+  CFD/structures.
+
+Read `prometheus-delivery` and the matching CFD/structures project guide.

@@ -1,0 +1,150 @@
+name: Python CI
+
+# Runs the shared Python suites and fast template example contracts on every pull
+# request. This is deliberately repository-local and credential-free; all
+# grading, Taiga, and adversarial dispatch belongs to the ISO mothership.
+#
+# That gap is why the last two defects here were found downstream first. Both
+# directories are copied wholesale into consumer repos by
+# sync-shared-from-template.yml, so a break here becomes their break on the next
+# sync, and the mothership ended up better tested than the repo its code comes from.
+#
+# Intentionally not path-filtered, matching the mothership's python-ci.yml. Both
+# suites read outside their own directories -- examples/, base/, configs/ and
+# .github/ -- so most changes in this repo can move a Python result. The whole run
+# is a couple of minutes, so filtering would save little and would risk recreating
+# the gap this closes.
+#
+# Tests only, deliberately: black and ruff are not in this repo's dev dependencies
+# and main is not clean under either, so a lint gate would fail on its first run and
+# force unrelated churn.
+
+on:
+  pull_request:
+
+concurrency:
+  group: python-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shared-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Enforce workflow trust boundary
+        run: python3 .github/scripts/check_workflow_boundary.py
+
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.13" }
+
+      # Host-side MuJoCo render tests use the same headless software backend as
+      # every grading base image. ubuntu-latest does not install libOSMesa by default.
+      - name: Install headless rendering runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libosmesa6
+
+      - name: Cache uv downloads
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          # Current uv installs to ~/.local/bin; older releases used ~/.cargo/bin,
+          # which the other workflows in this repo still reference.
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # --all-packages to match the command the README documents. A bare `uv sync`
+      # is enough in this repo, because the root project depends on every workspace
+      # member, but the README is synced into repos where it is not -- there a bare
+      # sync installs neither suite and both fail at collection -- so the two should
+      # not drift.
+      - name: Install dependencies
+        run: uv sync --all-packages
+
+      # One step per suite so a red X names the suite that broke, and `!cancelled()`
+      # so a failure in one still reports the other instead of masking it. Both
+      # suites are named explicitly rather than relying on `testpaths`, so the step
+      # names stay honest if `testpaths` ever changes.
+      #
+      # --no-sync: the install step above already resolved the environment.
+      #
+      # No `env -u GITHUB_ACTIONS` here, unlike the mothership's equivalent steps.
+      # That workaround exists downstream because the suites were not isolated from
+      # runner-injected variables; `grader/tests/conftest.py` and
+      # `harness/tests/conftest.py` now clear them in the suites themselves, which is
+      # what this workflow is here to keep verifying -- these steps run with
+      # GITHUB_ACTIONS set, exactly as a consumer repo does.
+      #
+      # -ra prints every skip reason. Expect only the handful of skips that need a
+      # root-owned process or a missing system binary; this repo has examples/, so
+      # the fixture-guard skips that are normal downstream should not appear. A wave
+      # of skips here means a guard is over-matching, not that fixtures are missing.
+      #
+      # These two steps are also what holds the calibration anchors to Linux, which
+      # is the platform Taiga actually grades on. No separate job asserts it, because
+      # the suites already do, in the checkout where examples/ exists:
+      # harness/tests/test_mle_tabular_calibration_example.py scores the committed
+      # reference and naive weights against examples/mle-tabular-classification's
+      # calibration.lock.json, and grader/tests/test_tabular_example_reward_hacking.py
+      # grades the same reference end to end through run_grader. Both are guarded by
+      # `requires_examples`, so downstream they skip and here they must not.
+      - name: Run grader tests
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync pytest -ra grader/tests
+
+      - name: Run harness tests
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync pytest -ra harness/tests
+
+      # The nested service runtime is copied into consumer repos alongside the
+      # grader and harness. Keep its own security/runtime tests in this shared
+      # lane so a sync cannot silently drop capsule or SSE proxy coverage.
+      - name: Run Taiga rubric runtime tests
+        if: ${{ !cancelled() }}
+        run: uv run --no-sync pytest -ra taiga_runtime/rubric/tests
+
+  # These fixtures intentionally remain in examples/ and are not part of the
+  # shared sync. Run them in a separate template-only lane so shared tooling CI
+  # does not weaken the trusted submission rule that a task PR contains exactly
+  # one task directory.
+  example-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.13" }
+
+      - name: Cache uv downloads
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: uv-${{ runner.os }}-
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: uv sync --all-packages
+
+      - name: Run fast service example contracts
+        run: |
+          uv run --no-sync pytest -ra \
+            examples/frontier-mcp-workspace/tests/test_frontier_mcp_workspace.py \
+            examples/frontier-service-cutover/tests/test_frontier_service_cutover.py

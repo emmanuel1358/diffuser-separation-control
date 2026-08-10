@@ -1,0 +1,25 @@
+---
+description: Oracle, baseline, proof, and reviewer-artifact requirements
+globs: "{problems,examples}/**/solution/**,{problems,examples}/**/baselines/**,{problems,examples}/**/task.toml,{problems,examples}/**/.alignerr/**"
+alwaysApply: false
+---
+
+# Ground Truth and Baselines
+
+- Every task has a trusted reference under `solution/` that derives its answer
+  from disclosed inputs and produces the same artifact shape as agents.
+- Deterministic-rubric oracle target is `1.0`; continuous reference target is
+  `0.5 ± 0.05`. Never lower the oracle target to make a task difficult.
+- Trusted CI/ground-truth runs inference only; continuous tasks commit an
+  inference entrypoint plus digest-bound strategy/model artifacts.
+- Add naive/no-op and, where required, degenerate baselines that are ready to
+  measure without training.
+- MuJoCo requires H.264 `rendering.mp4` at `1280x720`; any task may declare
+  reviewer media through `[ground_truth].render_outputs`.
+- Local `--runtime ground-truth` is development preflight. Trusted CI generates
+  authoritative proof/lock evidence from the immutable PR. Do not commit local
+  generated proof/lock files; commit declared reviewed media when required.
+- Regenerate the oracle, baselines, plan/calibration, and trusted evidence after
+  any grading-input change.
+
+Read `ground-truth-oracle` and `docs/GROUND_TRUTH.md`.

@@ -82,7 +82,6 @@ def _write_manifest(
     score: float | None,
     model: str | None = None,
     review_artifacts: list[dict[str, Any]] | None = None,
-    flavor_requested: str = "auto",
 ) -> None:
     manifest = {
         "problem_id": problem.id,
@@ -96,29 +95,9 @@ def _write_manifest(
         "review_artifacts": review_artifacts or [],
         "metadata": problem.metadata,
     }
-    manifest.update(_flavor_manifest_fields(problem, flavor_requested))
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, default=str) + "\n"
     )
-
-
-def _flavor_manifest_fields(
-    problem: HarnessProblem, flavor_requested: str
-) -> dict[str, Any]:
-    """Flavor telemetry from the build sidecar; falls back to the request alone."""
-    from lbx_rl_tasks_harness.docker import read_flavor_sidecar
-
-    fields: dict[str, Any] = {
-        "flavor_requested": flavor_requested,
-        "image_flavor": "heavy",
-        "flavor_fallback": False,
-    }
-    if problem.source_problem_dir is not None:
-        recorded = read_flavor_sidecar(problem.source_problem_dir.resolve())
-        if recorded:
-            fields["image_flavor"] = recorded.get("image_flavor", "heavy")
-            fields["flavor_fallback"] = bool(recorded.get("flavor_fallback", False))
-    return fields
 
 
 def _score_from_mcp_grade(payload: dict) -> float:
@@ -229,7 +208,7 @@ def _update_build_proof_result(
 def _grade_noop_baseline_in_container(problem: HarnessProblem, run_dir: Path) -> float:
     """Grade an EMPTY workspace inside the task image (zero-anchor probe).
 
-    In-container / ML_Envs graders cannot be no-op-probed on the host by the
+    In-container graders cannot be no-op-probed on the host by the
     task validator, so the ground-truth run grades an empty submission here and
     records the result as ``trivial_baseline_score`` in the build proof, where
     the validator enforces the anti-reward-hacking ceiling (and, for continuous
@@ -383,7 +362,6 @@ def run_harness(
     run_dir_base: Path,
     model: str | None = None,
     max_steps: int | None = None,
-    flavor: str = "auto",
     calibration_check: bool = False,
 ) -> HarnessResult:
     if runtime == "solution":
@@ -486,7 +464,6 @@ def run_harness(
                 transcript,
                 model_name=model,
                 max_steps=max_steps,
-                flavor=flavor,
             )
         )
         score = _score_from_mcp_grade(grade_payload)
@@ -497,7 +474,6 @@ def run_harness(
             runtime,
             score,
             model=manifest_model,
-            flavor_requested=flavor,
         )
         rubric_quality = _run_rubric_quality_check(
             problem, grade_payload=grade_payload, model=rubric_model
@@ -535,7 +511,7 @@ def run_harness(
             deterministic_epsilon=problem.ground_truth.score_epsilon,
             continuous_epsilon=problem.ground_truth.continuous_score_epsilon,
         )
-        # Zero-anchoring probe: in-container / ML_Envs graders cannot be
+        # Zero-anchoring probe: in-container graders cannot be
         # no-op-probed on the host, so grade an empty submission in the task
         # image here, enforce the anchor for continuous scoring functions, and
         # record the score in the build proof for the task validator.
@@ -576,7 +552,6 @@ def run_harness(
             score,
             model=model,
             review_artifacts=review_artifacts,
-            flavor_requested=flavor,
         )
         if not calibration_check:
             _update_build_proof_result(
@@ -621,7 +596,7 @@ def run_harness(
     )
     print_rubric_quality_review(rubric_quality)
     _write_manifest(
-        run_dir, problem, runtime, score, model=model, flavor_requested=flavor
+        run_dir, problem, runtime, score, model=model
     )
     _update_build_proof_result(
         problem,

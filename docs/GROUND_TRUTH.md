@@ -14,42 +14,47 @@ development evidence for feedback. The **oracle proof** is its
 
 | | Rubric tasks (`multi_deterministic_rubrics`) | ML / continuous tasks (`continuous_scoring_function`) |
 | --- | --- | --- |
-| **Typical `task_type`** | `mujoco`, `cfd`, `structures` | `ml` |
+| **Typical `task_type`** | `mujoco`, `cfd`, `structures`, `software_engineering` | `ml` |
 | **Expected oracle score** | **1.0** (within `[ground_truth].score_epsilon`) | **0.5 ± 0.05** (within `[ground_truth].continuous_score_epsilon`) |
 | **What proof means** | Reference is a perfect oracle under deterministic rubrics | Reference is a **calibrated anchor**: competent, not optimal; agents should beat it toward 1.0 |
 | **Reviewer video** | Required for `mujoco`; optional for other types if `[ground_truth].render_outputs` is declared | Usually none unless you explicitly declare render outputs |
-| **Static artifacts in `solution/`** | Common (MJCF, control JSON, policies) | **Required** trained weights + `model.manifest.json` + training provenance; inference-only `solve.sh`/`solution.py` |
+| **Static artifacts in `solution/`** | Common (MJCF, control JSON, policies) | Committed strategy + digest manifest; trained models include training provenance, hand-authored policies do not invent it |
 | **What ground-truth verifies** | Solve → grade → (render) → CI proof | Same pipeline: proves Dockerfile, grader, loaders, and **calibration** are correct — **inference only, never train** |
 
-For continuous ML tasks, oracle proof does **not** mean “we retrained the model
-in CI.” Authors **must** commit both reproducible training code and trained
-artifacts; Trusted CI / ground-truth / Taiga seal only load models and run
-inference to produce calibration anchors. Training code may live next to the
-inference entrypoint for provenance, but `solution.py` / `solve.sh` must stay
-inference-only. A committed `submission.csv` is an optional Tier-B additive
-artifact — never a substitute for missing `train.py` / weights / manifest.
+For continuous ML tasks, oracle proof never trains in CI. A trained strategy
+commits reproducible training code, digest-bound inputs, and trained artifacts.
+A hand-authored policy or static strategy declares
+`strategy.manifest.json: kind = "committed_artifact"` and does **not** add a
+fake training script or dummy dataset. Trusted CI / ground-truth / Taiga seal
+only run the declared inference entrypoint.
 
 Learnability (baselines scoring clearly below the reference) is validated
 separately by `lbx-rl-template validate`, not by the oracle score alone.
 
 ## Contract
 
-- `solution/solve.sh` is required for native (`task.toml`) layouts; ML_Envs uses
-  `reference_solution/solution.py` instead (see `docs/MLENVS_TASKS.md`).
+- `solution/` must hold the reference: `solve.sh` for script-driven task types,
+  or `solution.py` for a continuous ML strategy (see `docs/ML_TASKS.md`).
 - Running the inference entrypoint must create all required `[[outputs]]`
   artifacts.
+- `software_engineering` may use a simple single-image repository output or a
+  service/capsule graph. In the service path, the agent service owns the
+  repository artifact and an isolated verifier publishes the canonical result
+  under `/tmp/output`; trusted export tooling packages the graph as an outer
+  capsule. Declared SSE MCP is supported on Taiga only through that capsule's
+  audited service-DNS proxy, never as an arbitrary unbundled endpoint.
 - `[difficulty].reward_type = "multi_deterministic_rubrics"` tasks must score
   `1.0` within `[ground_truth].score_epsilon`.
 - `[difficulty].reward_type = "continuous_scoring_function"` tasks must score
-  `0.5 ± [ground_truth].continuous_score_epsilon` (default `0.05`). This is the
-  ML_Envs reference-solution convention: the checked-in reference is competent
-  but leaves headroom for better agents.
+  `0.5 ± [ground_truth].continuous_score_epsilon` (default `0.05`): the
+  checked-in reference is competent but leaves headroom for better agents.
 - For continuous ML (`task_type=ml` + `continuous_scoring_function`), the
-  committed-model hard contract is **mandatory** on `reference_solution/` (or
-  native `solution/`) and every calibration-declared baseline (`TASK.naive`):
-  training entrypoint, trained artifact(s), `model.manifest.json` with matching
-  digests, and an inference-only solve path. Validate fails closed if any piece
-  is missing or if the solve path looks like training.
+  committed-strategy contract is mandatory on `solution/` and every
+  calibration-declared baseline (`TASK.naive`). Use
+  `model.manifest.json` for the legacy trained-model schema or
+  `strategy.manifest.json` with explicit `trained_model` /
+  `committed_artifact` kind. Validate fails closed on missing/tampered artifacts
+  or an inference path that trains.
 - Training code is for provenance only; validation / Trusted CI / seal must use
   already-trained artifacts so the oracle run is deterministic and fast.
 - Every task must declare `[difficulty].task_type`, `[difficulty].domain`, and
@@ -71,15 +76,22 @@ solution/
 └── train.py              # optional: documents how the policy was produced
 ```
 
-Example layout (ML continuous / ML_Envs — **required** two-artifact contract):
+Example layouts (ML continuous):
 
 ```text
-reference_solution/          # or native solution/
+solution/
 ├── solution.py              # required: inference only; loads committed weights
 ├── train.py                 # required: provenance; NEVER run by CI / ground-truth
 ├── model.json / model.pt    # required: committed trained artifact(s)
 ├── model.manifest.json      # required: digests + seed + entrypoint pointers
 └── submission.csv           # optional Tier-B additive static artifact
+```
+
+```text
+solution/                    # hand-authored policy/static strategy
+├── solution.py              # inference only; copies/packages committed artifact
+├── policy.py                # committed artifact
+└── strategy.manifest.json   # kind=committed_artifact + artifact digest
 ```
 
 ## `task.toml`
@@ -88,7 +100,7 @@ Declare the task metadata for every task:
 
 ```toml
 [difficulty]
-task_type = "mujoco" # ml | mujoco | cfd | structures
+task_type = "mujoco" # ml | mujoco | cfd | structures | software_engineering
 domain = "model_environment_construction"  # enum scoped by task_type
 reward_type = "multi_deterministic_rubrics" # or continuous_scoring_function
 ```
@@ -98,12 +110,13 @@ sets are:
 
 | Field | Values |
 | --- | --- |
-| `task_type` | `ml`, `mujoco`, `cfd`, `structures` |
+| `task_type` | `ml`, `mujoco`, `cfd`, `structures`, `software_engineering` |
 | `reward_type` | `continuous_scoring_function`, `multi_deterministic_rubrics` |
 | `domain` for `ml` | Production taxonomy subjects/subdomains such as `physical_sciences`, `physical_chemistry`, `robotics_embodied_ai`, `robot_dynamics_system_identification`, `multimodal_vision_perception`, `world_models`, `online_system_identification`, etc. |
 | `domain` for `mujoco` | `policy_training_improvement`, `model_environment_construction`, `manipulation`, `locomotion`, `balance_recovery`, etc. |
 | `domain` for `cfd` | `aerodynamics`, `airfoil_design`, `flow_control`, `vortex_suppression`, `rans_simulation`, etc. |
 | `domain` for `structures` | `seismic_retrofit`, `structural_mechanics`, `topology_optimization`, `truss_design`, `modal_analysis`, etc. |
+| `domain` for `software_engineering` | `repo_debugging`, `data_database_systems`, and other repository/service engineering domains defined in `task_metadata` |
 
 For `mujoco` tasks, declare the render command and video output:
 
@@ -191,6 +204,15 @@ media:
 ```bash
 git add problems/<task_id>/.alignerr/ground_truth/
 ```
+
+### FAQ: do I commit `build_proof.json`?
+
+**No** for authored tasks under `problems/`. `.gitignore` ignores
+`problems/**/.alignerr/*` except `.alignerr/ground_truth/`. A local
+`--runtime ground-truth` run is development feedback only. Trusted CI runs
+ground-truth on the immutable PR revision, then verifies that CI-generated
+proof (G3 → G4). Some checked-in `examples/` intentionally vendor proofs via
+gitignore exceptions; do not copy that pattern into `problems/`.
 
 The template validation workflow checks that each committed video exists and
 matches the checksum in trusted CI's generated proof.

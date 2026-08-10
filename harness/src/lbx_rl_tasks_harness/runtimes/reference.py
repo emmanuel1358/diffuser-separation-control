@@ -3,26 +3,28 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from lbx_rl_tasks_harness.env import harness_subprocess_env
 from lbx_rl_tasks_harness.grading import grade_workspace
 from lbx_rl_tasks_harness.models import HarnessProblem
 from lbx_rl_tasks_harness.reference_config import (
     reference_cache_path,
+    reference_interpreter,
     reference_isolation_requirements,
     resolve_reference_execution,
     resolve_reference_proof_mode,
-    reference_interpreter,
     solution_script_rel,
 )
 from lbx_rl_tasks_harness.runtimes.solution import (
@@ -43,11 +45,10 @@ _CONTAINER_VENV_PATH = "export PATH=/opt/lbx-runtime/.venv/bin:$PATH"
 # silently passing here and breaking on Taiga. This is the dynamic complement to
 # the static M7 answer-key leak scan.
 #
-# The uid-1000 account is named ``agent`` on the native bases (created by
-# install-common.sh) but ``model`` on the mlenvs bases (which never run
-# install-common.sh). Resolve the name FROM THE IMAGE at run time by uid 1000
-# rather than hardcoding, so the same command works on both -- a hardcoded
-# ``agent`` yields ``su: user agent does not exist`` on every mlenvs task.
+# The flagship bases create the uid-1000 account as ``agent``, but a task image
+# may be built FROM something else. Resolve the name FROM THE IMAGE at run time
+# by uid 1000 rather than hardcoding it, so a differently-named account does not
+# fail with ``su: user agent does not exist``.
 _DROP_USER_BY_UID = '"$(getent passwd 1000 | cut -d: -f1)"'
 
 
@@ -108,7 +109,7 @@ def _run_streaming(
 ) -> tuple[int, str]:
     """Run ``cmd`` streaming combined stdout/stderr live while capturing it.
 
-    ML_Envs streams the solve + grader output to the operator during long runs
+    Stream the solve + grader output to the operator during long runs
     (``docker_exec_streaming``); ``subprocess.run(capture_output=True)`` instead
     leaves the operator staring at a blank terminal for a multi-hour training
     run. This tees each line to ``sys.stdout`` as it arrives and also returns the
@@ -155,7 +156,7 @@ def _run_streaming(
 def collect_host_info() -> dict:
     """Record the hardware a reference score was measured on.
 
-    Mirrors ML_Envs ``collect_host_info`` so a reviewer can tell whether a score
+    Records host info so a reviewer can tell whether a score
     was produced on comparable hardware. GPU info is best-effort via
     ``nvidia-smi``; absence is recorded as an empty list rather than failing.
     """
@@ -179,7 +180,7 @@ def collect_host_info() -> dict:
             proc = subprocess.run(
                 [
                     "nvidia-smi",
-                    "--query-gpu=name,memory.total",
+                    "--query-gpu=name,memory.total,driver_version,compute_cap",
                     "--format=csv,noheader,nounits",
                 ],
                 text=True,
@@ -189,14 +190,18 @@ def collect_host_info() -> dict:
             )
             if proc.returncode == 0:
                 for line in proc.stdout.strip().splitlines():
-                    name, _, mem = line.partition(",")
-                    name = name.strip()
-                    mem = mem.strip()
+                    fields = [part.strip() for part in line.split(",")]
+                    fields += [""] * (4 - len(fields))
+                    name, mem, driver, compute_cap = fields[:4]
                     if name:
                         gpus.append(
                             {
                                 "name": name,
                                 "memory_total_mib": int(mem) if mem.isdigit() else None,
+                                # Gates the CUDA major a base image may target:
+                                # CUDA 13.x needs >= r580, CUDA 12.x needs >= r525.
+                                "driver_version": driver or None,
+                                "compute_cap": compute_cap or None,
                             }
                         )
         except (OSError, subprocess.SubprocessError):
@@ -246,8 +251,8 @@ def _container_script_stop_env_server(
 def _as_model_user(command: str) -> str:
     """Run a shell command as the Taiga agent user inside a root-started container.
 
-    Resolves the uid-1000 account name from the image at run time (``agent`` on
-    native bases, ``model`` on mlenvs bases) so the drop works on both flavors.
+    Resolves the uid-1000 account name from the image at run time rather than
+    hardcoding ``agent``, so the drop does not depend on the account's name.
     """
     model_command = (
         "export PATH=/opt/lbx-runtime/.venv/bin:$PATH; "
@@ -492,9 +497,8 @@ def _container_grade_script() -> str:
             _CONTAINER_VENV_PATH,
             "mkdir -p /tmp/verifier",
             "rc=0",
-            # _CONTAINER_VENV_PATH prepends the native venv to PATH, so `python`
-            # resolves to the venv interpreter on native bases and to the system
-            # interpreter (/usr/local) on mlenvs bases, which have no
+            # _CONTAINER_VENV_PATH prepends the runtime venv to PATH, falling
+            # back to the system interpreter in an image without
             # /opt/lbx-runtime/.venv. Mirrors the solve phase + reference_interpreter.
             "python /runtime/run_grader.py "
             "--workspace /tmp/output --grader-dir /mcp_server/grader "
@@ -510,22 +514,83 @@ def _container_grade_script() -> str:
     )
 
 
-def _container_measure_script() -> str:
+def _container_measure_script(problem: HarnessProblem) -> str:
     """Build the raw-metric phase script used before a calibration lock exists."""
-    return "\n".join(
+    lines = _container_script_prefix(problem, skip_solve=False)
+    lines.extend(
         [
-            "set -e",
-            _CONTAINER_VENV_PATH,
-            "mkdir -p /tmp/verifier",
             "rc=0",
             "python -m grader_runner.raw_worker "
             "--workspace /tmp/output --grader-dir /mcp_server/grader "
             "--private-dir /mcp_server/data "
+            "--calibration-seed 0 "
             "--result-path /tmp/verifier/raw-metrics.json || rc=$?",
             "cp -a /tmp/verifier/. /host_out/verifier/ 2>/dev/null || true",
-            "exit $rc",
         ]
     )
+    lines.extend(_container_script_stop_env_server(problem, skip_solve=False))
+    lines.append("exit $rc")
+    return "\n".join(lines)
+
+
+_SUBSCORE_ERROR_PREFIX = re.compile(r"^\[[A-Za-z_][\w.]*\]")
+
+
+def _error_line(error_type: Any, message: Any) -> str:
+    etype = str(error_type or "").strip()
+    emsg = str(message or "").strip()
+    if not etype and not emsg:
+        return ""
+    return f"{etype or 'error'}: {emsg}".strip()
+
+
+def _grader_error_lines(details: dict) -> list[str]:
+    """Collect the grader's failure text from every shape it is written in.
+
+    ``Grade.to_dict()`` does not emit a top-level ``criterion_logs`` key: the
+    failure lands in ``metadata.grading_errors`` / ``metadata.rubric_breakdown``
+    and in ``structured_subscores[].reasoning``. Reading only ``criterion_logs``
+    left every container-grade infrastructure failure surfacing as an empty
+    ``stderr tail:`` with no cause.
+    """
+    lines: list[str] = []
+    for log in (details.get("criterion_logs") or {}).values():
+        if isinstance(log, dict):
+            lines.append(
+                _error_line(
+                    log.get("error_type"),
+                    log.get("error_message") or log.get("reasoning"),
+                )
+            )
+    metadata = details.get("metadata")
+    if isinstance(metadata, dict):
+        for entry in metadata.get("grading_errors") or []:
+            if isinstance(entry, dict):
+                lines.append(
+                    _error_line(entry.get("error_type"), entry.get("error_message"))
+                )
+        for entry in metadata.get("rubric_breakdown") or []:
+            if isinstance(entry, dict) and entry.get("error_type"):
+                lines.append(
+                    _error_line(
+                        entry.get("error_type"),
+                        entry.get("error_message") or entry.get("reasoning"),
+                    )
+                )
+    # A clean criterion's reasoning is ordinary judge prose; only the errored
+    # ones carry the "[error_type] message" prefix that Grade._structured_subscores
+    # stamps on, so taking every reasoning would report a healthy grade as broken.
+    for entry in details.get("structured_subscores") or []:
+        if not isinstance(entry, dict):
+            continue
+        reasoning = str(entry.get("reasoning") or "").strip()
+        if _SUBSCORE_ERROR_PREFIX.match(reasoning):
+            lines.append(reasoning)
+    unique: list[str] = []
+    for line in lines:
+        if line and line not in unique:
+            unique.append(line)
+    return unique
 
 
 def _grade_failure_detail(verifier_dir: Path) -> str:
@@ -533,8 +598,8 @@ def _grade_failure_detail(verifier_dir: Path) -> str:
 
     run_grader/worker write ``error_type`` + ``error_message`` (and a full
     ``metadata.traceback``) into reward-details.json even when the grade fails,
-    so surface it instead of leaving only the container stderr tail (which for
-    mlenvs bases is just setup warnings).
+    so surface it instead of leaving only the container stderr tail, which is
+    often just setup warnings.
     """
     details_path = verifier_dir / "reward-details.json"
     if not details_path.exists():
@@ -543,15 +608,11 @@ def _grade_failure_detail(verifier_dir: Path) -> str:
         details = json.loads(details_path.read_text())
     except (OSError, ValueError):
         return ""
-    parts: list[str] = []
-    for log in (details.get("criterion_logs") or {}).values():
-        if not isinstance(log, dict):
-            continue
-        etype = log.get("error_type")
-        emsg = log.get("error_message") or log.get("reasoning")
-        if etype or emsg:
-            parts.append(f"{etype or 'error'}: {emsg or ''}".strip())
-    tb = (details.get("metadata") or {}).get("traceback")
+    if not isinstance(details, dict):
+        return ""
+    parts = _grader_error_lines(details)
+    metadata = details.get("metadata")
+    tb = metadata.get("traceback") if isinstance(metadata, dict) else None
     detail = ""
     if parts:
         detail += "\ngrader error: " + "; ".join(parts)
@@ -606,6 +667,7 @@ def _docker_grade_command(
     script: str,
     *,
     calibration_lock: Path | None = None,
+    verifier_capabilities: Sequence[str] = (),
 ) -> list[str]:
     """GRADE phase: run as root (so the grader can read the root-only held-out
     truth) and bind-mount the HOST ``scorer/`` over ``/mcp_server/grader`` so an
@@ -615,12 +677,10 @@ def _docker_grade_command(
     ``--private-dir``; the host mount only supplies grader CODE. It is safe to
     expose here because this phase runs as root AFTER the unprivileged solve.
 
-    ML_Envs tasks have no host ``scorer/``: the grader is baked into the image
-    (``test_file.py`` -> ``/mcp_server/grader/compute_score.py``). Bind-mounting a
-    non-existent host path would make Docker create an EMPTY dir and mount it over
-    ``/mcp_server/grader``, shadowing the baked grader and failing with
-    "no grader source (compute_score.py) found". Only mount when the host
-    ``scorer/`` actually exists; otherwise use the baked grader.
+    Bind-mounting a non-existent host path would make Docker create an EMPTY dir
+    and mount it over ``/mcp_server/grader``, shadowing the baked grader and
+    failing with "no grader source (compute_score.py) found". Only mount when the
+    host ``scorer/`` actually exists; otherwise use the baked grader.
 
     The grade runs with ``--network none`` (like the solve phase and Taiga). A
     grader or submitted policy that reaches the internet at score time -- e.g.
@@ -628,6 +688,8 @@ def _docker_grade_command(
     on the network-isolated Taiga sandbox, giving an unrealistic reference
     calibration; isolating the grade keeps local scores representative.
     """
+    from lbx_rl_tasks_harness.docker import docker_capability_args
+
     cmd = [
         "docker",
         "run",
@@ -636,6 +698,7 @@ def _docker_grade_command(
         TAIGA_PLATFORM,
         "--network",
         "none",
+        *docker_capability_args(verifier_capabilities),
         "-v",
         f"{cache_dir}:/tmp/output",
     ]
@@ -668,7 +731,10 @@ def _run_container_reference(
     options: ReferenceRunOptions,
     cache_dir: Path,
 ) -> ReferenceRunResult:
-    from lbx_rl_tasks_harness.docker import build_task_image
+    from lbx_rl_tasks_harness.docker import (
+        build_task_image,
+        verifier_container_capabilities,
+    )
 
     if problem.source_problem_dir is None:
         raise ValueError("reference run requires a source problem directory")
@@ -727,6 +793,7 @@ def _run_container_reference(
             container_out,
             _container_grade_script(),
             calibration_lock=src / "calibration.lock.json",
+            verifier_capabilities=verifier_container_capabilities(problem),
         )
         grade_timeout = _verifier_timeout(problem) + 300
         grader_rc, grade_out = _run_streaming(
@@ -857,7 +924,7 @@ def measure_workspace_in_container(
         workspace,
         scorer_dir,
         container_out,
-        _container_measure_script(),
+        _container_measure_script(problem),
     )
     rc, output = _run_streaming(
         measure_cmd,
