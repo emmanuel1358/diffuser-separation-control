@@ -113,11 +113,18 @@ from grading.evaluation import (
 )
 
 TASK = ContinuousTask.model(
-    artifact=PythonPredictor("predictor.py"),
+    artifact=PythonPredictor(
+        "predictor.py",
+        predict_timeout_s=60,
+        first_call_timeout_s=120,
+        max_rows=100_000,
+        prediction_scope="row_independent",
+    ),
     challenge=PrivateTableChallenge(
         "challenge.parquet",
         feature_columns=["feature_1", "feature_2"],
-        sample_size=256,
+        # Omit sample_size to evaluate the full private bank. For a large bank,
+        # set sample_size=N and selection_policy="stable_subset".
     ),
     targets=[
         PopulationSRETarget.lower(
@@ -163,6 +170,25 @@ Rules:
   races, while `O_NOFOLLOW` protects only the leaf and still follows a swapped
   `/tmp/output` or nested parent directory. If no format loader fits, parse the
   immutable file object yielded by `open_submission_file_or_fault`.
+- **Make prediction semantics declarative.** `CsvRows` and `PythonPredictor`
+  accept per-column `value_domains` plus opt-in `OneHot([...])` and
+  `Simplex([...])` constraints. Use `prediction_scope="row_independent"` when
+  each output must depend only on its own row; the grader compares the full
+  batch with shuffled fresh-worker partitions.
+- **Declare the real inference budget.** `PythonPredictor` commits
+  `predict_timeout_s`, `first_call_timeout_s`, `max_rows`, and
+  `max_reply_bytes` into the task digest. Reference inference must retain
+  headroom under those exact limits.
+- **Use stable private selection.** `PrivateTableChallenge` evaluates the full
+  bank by default. For a bounded draw, set both `sample_size` and
+  `selection_policy="stable_subset"` so calibration and production score
+  identical rows. Existing sized challenges without that policy retain
+  artifact-bound selection until migrated.
+- **Never preserve undeclared CSV fields just to be permissive.** Use
+  `extra_columns="drop"` for safe tolerance, or `"reject"` (the default).
+  `"preserve"` is an explicit expert-only escape hatch. For keyed comparisons,
+  use `join_submission_to_truth_or_fault`, which projects declared columns
+  before merging.
 - **Run ground truth locally only when you need calibration feedback.** The
   framework measures committed reference/naive strategies, writes an ignored
   development lock/evidence bundle, and replays no-op/reference/oracle
@@ -174,6 +200,11 @@ Rules:
   work remains above floor and below reference. A baseline that genuinely ties
   the no-information floor needs an explicit `naive_at_floor` reviewed
   exception.
+- **Acknowledge floor-semantic divergence.** Generated locks expose both
+  `qualification_naive_score` and `runtime_naive_quality_score`. If their gap
+  exceeds the configured threshold, calibration fails until
+  `GeneratedCalibration(naive_semantic_gap_acknowledgement=...)` records a
+  reviewed exception.
 - **Metric names are not formulas.** Use exact versioned definitions such as
   `sre.rmse_over_population_std.v1`; documentation and the generated lock expose
   denominator, `ddof`, threshold, label, and averaging conventions.
@@ -232,6 +263,43 @@ refer to task-root-relative public simulator/config/data files (for example
 `solution/` must score `0.5 ± 0.05`. The declared naive baseline must
 normally earn a small positive score below the reference.
 
+Strict publication (`LBX_STRICT_RELEASE_GATES=1`) also requires at least three
+named baselines and `baselines/portfolio.json`:
+
+```json
+{
+  "schema_version": "baseline-portfolio.v1",
+  "required_families": ["no_op", "domain_heuristic", "simple_fitted"],
+  "baselines": [
+    {
+      "name": "naive",
+      "family": "no_op",
+      "path": "baselines/naive",
+      "rationale": "A no-information constant prediction baseline."
+    },
+    {
+      "name": "formula",
+      "family": "domain_heuristic",
+      "path": "baselines/formula",
+      "rationale": "The obvious domain formula available from the prompt."
+    },
+    {
+      "name": "linear",
+      "family": "simple_fitted",
+      "path": "baselines/linear",
+      "rationale": "A simple fitted model over the raw public features."
+    }
+  ]
+}
+```
+
+Declare every required family and add enough entries to reach the three-baseline
+minimum. Grade the portfolio through the production path. The shared
+`evaluate_baseline_portfolio`, `evaluate_score_panel`, and
+`evaluate_regrade_stability` gates block an obvious baseline reaching the
+reference band, score-panel ceiling saturation, or cross-nonce drift for an
+unchanged artifact.
+
 ### Non-tabular no-information probes
 
 Built-in constant/jitter/shuffle/row-index probes remain the default for
@@ -268,6 +336,14 @@ Each directory is copied as the complete `/tmp/output` workspace and measured
 twice under the same calibration seed. All files must be regular, bounded, and
 digest-bound; every probe must return a complete deterministic metric vector.
 Never put private truth in a probe or provide hand-written raw metrics.
+
+`PolicyEvaluationTask` additionally declares `required_control_families`
+(default: `no_op`, `constant`, `open_loop`). New and migrated tasks pass a
+`control_families` mapping to `grade(...)`; missing declared families then fail
+before candidate evaluation. Legacy calls without the mapping remain supported
+as unclassified controls. Override the required tuple only when a family is
+genuinely meaningless for the domain, and keep that choice reviewable in the
+task spec.
 
 If the honest naive exactly ties every effective no-information floor and no
 weak-positive baseline exists, opt in explicitly with

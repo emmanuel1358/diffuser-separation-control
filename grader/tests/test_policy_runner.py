@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from grading import policy_runner
+from grading.faults import AgentFault
 from grading.policy_runner import PolicyTimeoutError, PolicyWorker, PolicyWorkerError
 
 
@@ -197,6 +198,7 @@ def test_policy_worker_times_out(tmp_path: Path) -> None:
     assert isinstance(excinfo.value, PolicyTimeoutError)
     assert isinstance(excinfo.value, RuntimeError)
     assert isinstance(excinfo.value, PolicyWorkerError)
+    assert isinstance(excinfo.value, AgentFault)
 
 
 def test_policy_worker_first_call_gets_generous_budget(tmp_path: Path) -> None:
@@ -227,13 +229,16 @@ def test_policy_worker_can_restart_after_kill(tmp_path: Path) -> None:
         policy.close()
 
 
-def test_policy_worker_surfaces_policy_error(tmp_path: Path) -> None:
+def test_policy_worker_surfaces_policy_error_as_agent_fault(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
     policy_path.write_text("def act(obs):\n    raise RuntimeError('boom')\n")
 
-    with pytest.raises(PolicyWorkerError, match="boom"):
-        with PolicyWorker(policy_path) as policy:
-            policy.act({})
+    with (
+        pytest.raises(PolicyWorkerError, match="boom") as excinfo,
+        PolicyWorker(policy_path) as policy,
+    ):
+        policy.act({})
+    assert isinstance(excinfo.value, AgentFault)
 
 
 def test_policy_worker_tolerates_policy_prints(tmp_path: Path) -> None:
@@ -261,8 +266,7 @@ def test_policy_worker_bounds_no_newline_stderr(tmp_path: Path) -> None:
 
 def test_policy_worker_cannot_inspect_grader_locals(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
-    policy_path.write_text(
-        textwrap.dedent("""
+    policy_path.write_text(textwrap.dedent("""
             import inspect
 
             def act(obs):
@@ -270,8 +274,7 @@ def test_policy_worker_cannot_inspect_grader_locals(tmp_path: Path) -> None:
                     if "hidden_case" in frame.frame.f_locals:
                         return frame.frame.f_locals["hidden_case"]
                 return "not_visible"
-            """)
-    )
+            """))
 
     hidden_case = "secret schedule"
     with PolicyWorker(policy_path) as policy:
@@ -309,6 +312,8 @@ def _clear_agent_identity_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "RUBRIC_AGENT_UID",
         "RUBRIC_AGENT_GID",
         "RUBRIC_AGENT_HOME",
+        "RUBRIC_AGENT_MEMORY_LIMIT_BYTES",
+        "RUBRIC_POLICY_MEMORY_LIMIT_BYTES",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -418,16 +423,14 @@ def test_policy_worker_round_trips_numpy_arrays(tmp_path: Path) -> None:
     import numpy as np
 
     policy_path = tmp_path / "policy.py"
-    policy_path.write_text(
-        textwrap.dedent("""
+    policy_path.write_text(textwrap.dedent("""
             import numpy as np
 
             def act(obs):
                 assert isinstance(obs["ctrl"], np.ndarray), type(obs["ctrl"])
                 assert obs["ctrl"].dtype == np.float64
                 return {"action": obs["ctrl"] * 2, "shape": list(obs["ctrl"].shape)}
-            """)
-    )
+            """))
 
     ctrl = np.array([[1.0, 2.0], [3.0, 4.0]])
     with PolicyWorker(policy_path) as policy:
@@ -506,20 +509,20 @@ def test_agent_drop_kwargs_unshare_ipc_selects_preexec_path(
     assert "user" not in kwargs and "group" not in kwargs
 
 
-def test_agent_drop_kwargs_without_unshare_keeps_c_level_drop(
+def test_agent_drop_kwargs_without_unshare_keeps_drop_and_memory_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _configure_root_agent_identity(monkeypatch)
 
     kwargs = policy_runner._agent_drop_kwargs(unshare_ipc=False)
 
-    assert "preexec_fn" not in kwargs
+    assert callable(kwargs.get("preexec_fn"))
     assert kwargs["user"] == 1234
     assert kwargs["group"] == 1235
     assert kwargs["extra_groups"] == []
 
 
-def test_agent_drop_kwargs_non_root_never_unshares(
+def test_agent_drop_kwargs_non_root_still_applies_memory_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_agent_identity_env(monkeypatch)
@@ -527,8 +530,8 @@ def test_agent_drop_kwargs_non_root_never_unshares(
 
     kwargs = policy_runner._agent_drop_kwargs(unshare_ipc=True, ipc_status_fd=99)
 
-    # Non-root: early return, no preexec / no unshare -- unisolated like before.
-    assert "preexec_fn" not in kwargs
+    # Non-root cannot unshare IPC, but descendants still inherit RLIMIT_AS.
+    assert callable(kwargs.get("preexec_fn"))
     assert "user" not in kwargs
 
 
@@ -545,10 +548,16 @@ def _run_preexec_capturing_status(
     monkeypatch.setattr(policy_runner, "_CLONE_NEWIPC_ARG", 0x08000000)
     monkeypatch.setattr(policy_runner.ctypes, "set_errno", lambda v: None)
     monkeypatch.setattr(policy_runner.ctypes, "get_errno", lambda: errno_val)
+    monkeypatch.setattr(policy_runner, "apply_address_space_limit", lambda _limit: None)
 
     r, w = os.pipe()
     try:
-        policy_runner._agent_preexec(1234, 1235, ipc_status_fd=w)()
+        policy_runner._agent_preexec(
+            1234,
+            1235,
+            ipc_status_fd=w,
+            memory_limit_bytes=1024**3,
+        )()
         w = -1
         data = os.read(r, 1)
     finally:

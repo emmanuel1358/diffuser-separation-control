@@ -7,7 +7,6 @@ import json
 import numpy as np
 import pandas as pd
 import pytest
-
 from grading.evaluation import (
     AnchorRationale,
     BinaryF1Target,
@@ -50,7 +49,15 @@ def _task() -> ContinuousTask:
                 floor=_floor(0.0, "Binary F1 is bounded below by zero."),
             ),
         ],
-        calibration=GeneratedCalibration(),
+        calibration=GeneratedCalibration(
+            naive_semantic_gap_acknowledgement=AnchorRationale(
+                kind="reviewed_exception",
+                summary=(
+                    "This regression fixture intentionally separates the reviewed "
+                    "quality floor from its stronger no-information qualification."
+                ),
+            )
+        ),
         evidence=IIDPermutationEvidence(
             family_alpha=0.02,
             permutations=499,

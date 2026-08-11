@@ -3,8 +3,8 @@
 Called from the rubric MCP server's startup. If the task opts in via
 ``[environment].hidden_env = "env"|"hybrid"``, spawns the env server as a child
 process and restarts it on unexpected exit (up to a small budget). If it cannot
-stay up, the supervisor kills the MCP so the orchestrator surfaces the failure
-rather than leaving the agent connected to a broken socket.
+stay up, the supervisor leaves the MCP alive so the episode still reaches
+grading rather than letting an agent-triggered crash void the run.
 """
 
 from __future__ import annotations
@@ -22,6 +22,10 @@ from .config import SOCKET_PATH, EnvConfig, _is_env_task
 # kills the MCP so the failure is surfaced rather than served as a broken socket.
 _MAX_RESTARTS = 3
 _RESTART_COOLDOWN_S = 0.5
+_TRUSTED_ROOT_PATH = (
+    "/opt/lbx-runtime/.venv/bin:/opt/conda/bin:"
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,17 @@ logger = logging.getLogger(__name__)
 _proc_lock = threading.Lock()
 _current_proc: subprocess.Popen | None = None
 _stop_requested = threading.Event()
+
+
+def _isolated_env_server_environ() -> dict[str, str]:
+    """Environment for the root env server without import-path injection."""
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env["PATH"] = _TRUSTED_ROOT_PATH
+    env["PYTHONSAFEPATH"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
 
 
 def stop_env_server(timeout: float = 5.0) -> None:
@@ -82,19 +97,13 @@ def supervise_if_enabled(
     """Spawn + supervise the env server if this task opts in, else no-op.
 
     If the subprocess cannot stay up after ``max_restarts`` attempts,
-    ``on_give_up`` is called (default ``os._exit(1)`` so the container dies hard
-    and the orchestrator restarts it rather than serving a broken MCP). Returns
-    the supervisor thread, or None when the server was not started (task is not
-    env/hybrid).
-
-    ``os._exit(1)`` is deliberate (NOT ``sys.exit(1)``): a broken MCP should die
-    hard, skipping atexit handlers. Tests that need to assert the give-up path
-    pass an explicit ``on_give_up``.
+    ``on_give_up`` is called when provided. The MCP remains alive with the
+    training socket unavailable so the run still reaches grading; otherwise an
+    agent could deliberately exhaust the restart budget to erase a poor score.
+    Returns the supervisor thread, or None when the server was not started.
     """
     if not _is_env_task():
-        logger.debug(
-            "[ENV_SERVER] hidden_env not env/hybrid; env server not started"
-        )
+        logger.debug("[ENV_SERVER] hidden_env not env/hybrid; env server not started")
         return None
 
     try:
@@ -157,7 +166,10 @@ def supervise_if_enabled(
                 restarts + 1,
                 max_restarts + 1,
             )
-            # `python -m env_server` runs the package __main__.py -> serve().
+            # `python -P -m env_server` runs the installed package
+            # __main__.py -> serve() without putting the inherited cwd on
+            # sys.path. cwd=/ is root-owned, so an agent-planted
+            # /workdir/env_server package cannot execute as root on restart.
             # Both streams routed to the parent's stderr so the child never
             # writes to fd 1 -- the rubric MCP server uses stdio transport which
             # owns fd 1 for JSON-RPC framing; stray bytes there corrupt the wire.
@@ -165,23 +177,21 @@ def supervise_if_enabled(
                 if _stop_requested.is_set():
                     return
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "env_server"],
+                    [sys.executable, "-P", "-m", "env_server"],
+                    cwd="/",
                     stdout=sys.stderr,
                     stderr=sys.stderr,
+                    env=_isolated_env_server_environ(),
                 )
                 _current_proc = proc
             rc = proc.wait()
             with _proc_lock:
                 _current_proc = None
             if _stop_requested.is_set():
-                logger.info(
-                    "[ENV_SERVER] stop requested; env server not restarted"
-                )
+                logger.info("[ENV_SERVER] stop requested; env server not restarted")
                 return
             if rc == 0:
-                logger.info(
-                    "[ENV_SERVER] env server exited cleanly; not restarting"
-                )
+                logger.info("[ENV_SERVER] env server exited cleanly; not restarting")
                 return
             restarts += 1
             if restarts > max_restarts:
@@ -197,13 +207,12 @@ def supervise_if_enabled(
             threading.Event().wait(_RESTART_COOLDOWN_S)
 
         logger.error(
-            "[ENV_SERVER] env server failed %d times; giving up and killing MCP",
+            "[ENV_SERVER] env server failed %d times; leaving the MCP alive "
+            "with the training socket unavailable so grading can still run",
             max_restarts,
         )
         if on_give_up is not None:
             on_give_up()
-        else:
-            os._exit(1)
 
     thread = threading.Thread(target=_supervise, daemon=True, name="env_supervisor")
     thread.start()

@@ -118,11 +118,17 @@ TASK = ContinuousTask.model(
         "predictor.py",
         factory_name="load_predictor",
         method="predict",
+        predict_timeout_s=60,
+        first_call_timeout_s=120,
+        max_rows=100_000,
+        max_reply_bytes=64 * 1024 * 1024,
+        prediction_scope="row_independent",
     ),
     challenge=PrivateTableChallenge(
         "challenge.parquet",
         feature_columns=["x1", "x2", "x3"],
-        sample_size=400,
+        # Full-bank evaluation is the default. Use sample_size=400 only when
+        # the private bank is too large for the declared predictor budget.
     ),
     targets=[target],
     calibration=GeneratedCalibration("calibration.lock.json"),
@@ -134,39 +140,36 @@ def compute_score():
     return TASK.compute_score()
 ```
 
+This author surface serializes as `continuous-task.v3`. Default-only legacy
+locks remain readable, but adopting a new descriptor contract requires
+regenerating the sealed calibration lock.
+
 `scorer/data/challenge.parquet` is root-only and contains the declared feature
-columns plus every target truth column. It must have more rows than
-`sample_size`. The runtime:
+columns plus every target truth column. When a stable subset is requested it
+must have at least `sample_size` rows. The runtime:
 
 1. validates and hashes `predictor.py`;
-2. derives a private challenge selection;
+2. selects the full private bank or the declared subset policy;
 3. calls the predictor in the submitted-policy sandbox;
 4. validates target shapes/finiteness;
 5. evaluates quality and family-wide information evidence;
 6. returns a calibrated score and redacted receipt.
 
-#### The challenge selection follows the submitted bytes
+#### Challenge selection policies
 
-Step 2 seeds the row draw from `workspace_artifact_digest(workspace)` — a hash of
-every file the submission committed — so each submission is scored on its own
-`sample_size` rows. That is what stops an agent precomputing answers for a fixed
-subsample, and it has a consequence worth stating plainly:
+Full-bank evaluation is preferred. For a bounded draw, set `sample_size` with
+`selection_policy="stable_subset"`; the hidden indices then derive from the
+task/challenge identity rather than submitted bytes or the fresh nonce.
+Reference calibration and every candidate measure the same private rows.
+Existing sized descriptors without an explicit policy retain
+`artifact_digest` selection so their v3.0 locks remain usable during migration.
+The bank remains root-only under every policy.
 
-**Any change to the submitted bytes re-rolls the whole evaluation set, however
-small the change is numerically.** Editing one weight in its last representable
-bit draws a different subsample and moves the score by percent, not by ULPs. The
-score is a step function of the artifact's bytes, not a continuous function of the
-model it encodes.
-
-So a calibration lock's anchors describe exactly one artifact: the committed one it
-was generated from. Rebuilding a byte-different but numerically equivalent copy —
-retraining a model, regenerating weights on another machine — and expecting it to
-land on the anchor is a category error. The framework already forbids this in
-production: `validate_ml_strategy_contract` rejects a strategy whose inference
-entrypoint trains, and calibration runs that entrypoint over the committed weights
-rather than invoking `training_entrypoint`. Verify a retrained model against the
-committed weights numerically; verify the anchors against the committed weights
-themselves.
+The fresh private nonce is still committed after the artifact is hashed and is
+used for permutation evidence. Changing the nonce changes the public seed
+commitment but not the measured private rows. Root-side traces contain the nonce
+and artifact digest; `EvaluationContext.replay(...)` refuses a digest mismatch
+and reconstructs the exact evidence seed without claiming a new attestation.
 
 ### Agent artifact contract
 
@@ -186,7 +189,11 @@ target columns to equally sized lists, or a list of row mappings. Additional
 model files may be placed beside `predictor.py`.
 
 Predictors must be deterministic for the same rows and must not require network
-access.
+access. Declare `value_domains`, `OneHot`/`Simplex` grouped constraints, and
+`prediction_scope="row_independent"` when those semantics apply. The
+row-independent probe compares a full call against shuffled partitions loaded in
+fresh workers, so same-batch repeatability alone cannot hide transductive
+cross-row pooling.
 
 ## Tier-A policy challenge
 
@@ -201,6 +208,7 @@ TASK = PolicyEvaluationTask(
     scenarios=32,
     alpha=0.01,
     reference_quality=0.72,
+    required_control_families=("constant", "open_loop"),
 )
 
 
@@ -219,6 +227,10 @@ def compute_score(workspace, trajectory, private):
             "fixed_action": fixed_action_quality,
             "open_loop": open_loop_quality,
         },
+        control_families={
+            "fixed_action": "constant",
+            "open_loop": "open_loop",
+        },
     )
 ```
 
@@ -232,7 +244,8 @@ Policy tasks must:
 - use scenarios—not timesteps—as independent units;
 - floor every failed episode rather than skipping it;
 - impose hard worker-call deadlines;
-- include all task-relevant fixed/open-loop controls;
+- classify every trusted control and include every declared task-relevant
+  no-op/constant/open-loop family;
 - reject a task whose reference cannot reliably beat those controls.
 
 See `examples/hidden-env-bandit`.

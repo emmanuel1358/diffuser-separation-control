@@ -7,7 +7,6 @@ import json
 import numpy as np
 import pandas as pd
 import pytest
-
 from grading.evaluation import (
     AnchorRationale,
     BinaryF1Target,
@@ -46,7 +45,15 @@ def _task() -> ContinuousTask:
                 floor=_floor(0.0, "Binary F1 is bounded below by zero."),
             ),
         ],
-        calibration=GeneratedCalibration(),
+        calibration=GeneratedCalibration(
+            naive_semantic_gap_acknowledgement=AnchorRationale(
+                kind="reviewed_exception",
+                summary=(
+                    "The qualification floor intentionally excludes majority-class "
+                    "F1 while runtime quality retains weak informative progress."
+                ),
+            )
+        ),
     )
 
 
@@ -84,6 +91,30 @@ def test_ceiling_is_audited_but_reviewed_quality_floor_is_preserved() -> None:
     assert set(lock.payload["qualification"]["degenerate_scores"]) == set(
         _DEGENERATE_METRICS
     )
+    qualification = lock.payload["qualification"]
+    assert qualification["qualification_naive_score"] == pytest.approx(
+        qualification["naive_score"]
+    )
+    assert (
+        qualification["runtime_naive_quality_score"]
+        > qualification["qualification_naive_score"]
+    )
+    assert qualification["naive_semantic_gap_acknowledgement"]["kind"] == (
+        "reviewed_exception"
+    )
+
+
+def test_lock_validation_rejects_missing_semantic_gap_acknowledgement(
+    tmp_path,
+) -> None:
+    task = _task()
+    payload = json.loads(json.dumps(_lock().payload))
+    payload["qualification"]["naive_semantic_gap_acknowledgement"] = None
+    path = tmp_path / "missing-gap-ack.lock.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="naive_semantic_gap_acknowledgement"):
+        load_calibration_lock(path, task_spec_sha256=task.spec_sha256)
 
 
 def test_constant_quality_can_be_positive_but_evidence_zeros_it(
@@ -135,6 +166,22 @@ def test_reference_and_weak_informative_quality_mapping_is_stable() -> None:
 
     weak_score, _, _ = task.score_metrics({"value": 0.6, "label": 0.6}, lock)
     assert 0.0 < weak_score < 0.5
+
+
+def test_large_qualification_runtime_gap_requires_reviewed_acknowledgement() -> None:
+    task = ContinuousTask.static(
+        artifact=CsvRows("submission.csv", columns=["value", "label"]),
+        targets=_task().targets,
+        calibration=GeneratedCalibration(),
+    )
+
+    with pytest.raises(ValueError, match="naive_semantic_gap_acknowledgement"):
+        task.build_lock(
+            reference_metrics=_REFERENCE_METRICS,
+            naive_metrics=_NAIVE_METRICS,
+            degenerate_metrics=_DEGENERATE_METRICS,
+            input_digests={},
+        )
 
 
 def test_no_information_ceiling_crossing_perfect_fails_fast() -> None:

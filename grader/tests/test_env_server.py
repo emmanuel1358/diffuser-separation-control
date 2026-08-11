@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+import errno
+import threading
 from pathlib import Path
 
 import numpy as np
 import pytest
-
-from env_server import _is_env_task, hidden_env_mode
+from env_server import _is_env_task, hidden_env_mode, supervisor
 from env_server import server as env_server_module
 from env_server.config import EnvConfig
 from env_server.protocol import _pack, _unpack
 from env_server.server import EnvServer, _prepend_env_deps, _reject_private_paths
-
 
 _ENV_SOURCE = """
 class Env:
@@ -68,9 +68,7 @@ def test_protocol_round_trips_rich_types() -> None:
 def test_create_call_destroy(tmp_path: Path) -> None:
     srv = _server(tmp_path)
     assert srv._handle({"method": "__create__", "instance_id": 0, "args": {}})["ok"]
-    reply = srv._handle(
-        {"method": "step", "instance_id": 0, "args": {"action": 2}}
-    )
+    reply = srv._handle({"method": "step", "instance_id": 0, "args": {"action": 2}})
     assert reply["ok"] and reply["result"]["obs"] == [2, 1]
     assert srv._handle({"method": "__destroy__", "instance_id": 0, "args": {}})["ok"]
 
@@ -94,7 +92,11 @@ def test_allowed_env_kwargs_enforced(tmp_path: Path) -> None:
     srv = _server(tmp_path, allowed=["seed"])
     with pytest.raises(ValueError, match="allowed_env_kwargs"):
         srv._handle(
-            {"method": "__create__", "instance_id": 0, "args": {"env_kwargs": {"scale": 9}}}
+            {
+                "method": "__create__",
+                "instance_id": 0,
+                "args": {"env_kwargs": {"scale": 9}},
+            }
         )
 
 
@@ -169,6 +171,85 @@ def test_socket_round_trip_with_client(tmp_path: Path) -> None:
             os.unlink(sock_path)
 
 
+@pytest.mark.parametrize(
+    "resource_errno",
+    [errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM],
+)
+def test_accept_resource_exhaustion_backs_off_without_crashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resource_errno: int,
+) -> None:
+    srv = _server(tmp_path)
+
+    class ExhaustedListener:
+        def __init__(self) -> None:
+            self.accept_calls = 0
+            self.closed = False
+
+        def accept(self):
+            self.accept_calls += 1
+            if self.accept_calls == 1:
+                raise OSError(resource_errno, "temporary accept resource pressure")
+            srv._shutdown.set()
+            raise OSError(errno.EBADF, "stopped")
+
+        def close(self) -> None:
+            self.closed = True
+
+    listener = ExhaustedListener()
+    monkeypatch.setattr(srv, "_bind_socket", lambda: listener)
+
+    srv.serve_forever()
+
+    assert listener.accept_calls == 2
+    assert listener.closed is True
+
+
+def test_supervisor_restart_uses_safe_import_path_and_keeps_mcp_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_py = tmp_path / "env.py"
+    env_py.write_text(_ENV_SOURCE)
+    config = EnvConfig(module_path=env_py, factory_name="make_env")
+    calls: list[tuple[list[str], dict]] = []
+
+    class FailedProcess:
+        def wait(self) -> int:
+            return 1
+
+    def fake_popen(args, **kwargs):
+        calls.append((list(args), kwargs))
+        return FailedProcess()
+
+    monkeypatch.setattr(supervisor, "_is_env_task", lambda: True)
+    monkeypatch.setattr(supervisor.EnvConfig, "load", lambda: config)
+    monkeypatch.setattr("grading.env_loading.load_env_module", lambda *a, **k: None)
+    monkeypatch.setattr(supervisor.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(supervisor, "_stop_requested", threading.Event())
+    monkeypatch.setattr(
+        supervisor.os,
+        "_exit",
+        lambda _code: (_ for _ in ()).throw(
+            AssertionError("runtime restart exhaustion must not kill the MCP")
+        ),
+    )
+    monkeypatch.setenv("PYTHONPATH", "/workdir")
+
+    thread = supervisor.supervise_if_enabled(max_restarts=0)
+    assert thread is not None
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[1:] == ["-P", "-m", "env_server"]
+    assert kwargs["cwd"] == "/"
+    assert "PYTHONPATH" not in kwargs["env"]
+    assert kwargs["env"]["PYTHONSAFEPATH"] == "1"
+    assert kwargs["env"]["PATH"] == supervisor._TRUSTED_ROOT_PATH
+
+
 def test_activation_reads_task_toml(tmp_path: Path) -> None:
     toml = tmp_path / "task.toml"
     toml.write_text('[environment]\nhidden_env = "env"\n')
@@ -220,7 +301,9 @@ def test_prepend_env_deps_noop_when_absent(tmp_path: Path, monkeypatch) -> None:
     assert sys.path == before
 
 
-def test_load_env_module_resolves_env_only_dependency(tmp_path: Path, monkeypatch) -> None:
+def test_load_env_module_resolves_env_only_dependency(
+    tmp_path: Path, monkeypatch
+) -> None:
     """An env.py that imports a server-only dep (living ONLY in /mcp_server/env_deps)
     must load via load_env_module -- the choke point the env-server subprocess, the
     supervisor pre-flight, AND the grade-time in-process load all funnel through.
@@ -253,12 +336,16 @@ def test_load_env_module_resolves_env_only_dependency(tmp_path: Path, monkeypatc
         # proving the dep is not otherwise reachable and the test is meaningful.
         monkeypatch.setattr(env_config_module, "ENV_DEPS_DIR", tmp_path / "absent")
         with pytest.raises(ModuleNotFoundError):
-            load_env_module(env_py, trusted_roots=(task_dir,), module_name="env_dep_neg")
+            load_env_module(
+                env_py, trusted_roots=(task_dir,), module_name="env_dep_neg"
+            )
 
         # Positive: point ENV_DEPS_DIR at the dir holding the simulator; the load
         # now succeeds and make_env is callable.
         monkeypatch.setattr(env_config_module, "ENV_DEPS_DIR", deps_dir)
-        mod = load_env_module(env_py, trusted_roots=(task_dir,), module_name="env_dep_pos")
+        mod = load_env_module(
+            env_py, trusted_roots=(task_dir,), module_name="env_dep_pos"
+        )
         assert mod.make_env() == 7
         assert str(deps_dir) in sys.path
     finally:

@@ -194,11 +194,13 @@ def test_naive_floor_exception_requires_zero_min_and_reviewed_rationale() -> Non
         )
 
 
-def test_default_calibration_and_naive_range_serialization_is_unchanged() -> None:
+def test_default_calibration_and_naive_range_serialization() -> None:
     task = _task()
+    assert task.spec_dict()["schema_version"] == "continuous-task.v3"
     assert GeneratedCalibration().spec_dict() == {
-        "type": "generated_lock.v1",
+        "type": "generated_lock.v2",
         "filename": "calibration.lock.json",
+        "max_unacknowledged_naive_score_gap": 0.05,
     }
     assert task.spec_dict()["naive_score_range"] == {
         "exclusive_min": 1e-6,

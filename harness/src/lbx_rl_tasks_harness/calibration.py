@@ -322,13 +322,28 @@ def _measure_tabular_degenerate_family(
         if task.challenge is None:
             raise ValueError("PythonPredictor calibration requires a challenge")
         sample_size = task.challenge.sample_size
-        if len(truth) < sample_size:
+        if sample_size is not None and len(truth) < sample_size:
             raise ValueError(
                 f"private challenge has {len(truth)} rows, needs {sample_size}"
             )
-        rng = np.random.default_rng(_DEGENERATE_SEED)
-        indices = rng.choice(len(truth), size=sample_size, replace=False)
-        truth = truth.iloc[indices].reset_index(drop=True)
+        if task.challenge.selection_policy == "stable_subset":
+            from grading.evaluation.context import EvaluationContext
+
+            assert sample_size is not None
+            context = EvaluationContext.create_from_artifact_digest(
+                task_digest=task.challenge_sha256,
+                candidate_digest="calibration-degenerate-family",
+            )
+            rng = np.random.default_rng(
+                context.selection_seed("private-table-selection")
+            )
+            indices = rng.choice(len(truth), size=sample_size, replace=False)
+            truth = truth.iloc[indices].reset_index(drop=True)
+        elif task.challenge.selection_policy == "artifact_digest":
+            assert sample_size is not None
+            rng = np.random.default_rng(_DEGENERATE_SEED)
+            indices = rng.choice(len(truth), size=sample_size, replace=False)
+            truth = truth.iloc[indices].reset_index(drop=True)
     is_classification = {
         target.truth_column: is_classification_target(target) for target in task.targets
     }

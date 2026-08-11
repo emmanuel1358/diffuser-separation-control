@@ -249,7 +249,51 @@ class EvaluationContext:
     ) -> "EvaluationContext":
         nonce = os.environ.get(EVALUATION_NONCE_ENV)
         attested = bool(nonce and os.environ.get(EVALUATION_PLAN_ATTESTED_ENV) == "1")
+        return cls._create_with_nonce(
+            task_digest=task_digest,
+            candidate_digest=candidate_digest,
+            nonce=nonce,
+            attested=attested,
+        )
 
+    @classmethod
+    def replay(
+        cls,
+        *,
+        task_digest: str,
+        candidate_digest: str,
+        replay: Mapping[str, Any],
+    ) -> EvaluationContext:
+        """Rebuild an exact private context from a root-side trace record.
+
+        Replay is refused when the committed artifact digest differs from the
+        trace. A replay reproduces the seed commitment but is intentionally not
+        itself marked as a fresh attested evaluation.
+        """
+        recorded_digest = replay.get("artifact_digest")
+        nonce = replay.get("nonce")
+        if recorded_digest != candidate_digest:
+            raise ValueError(
+                "replay artifact digest does not match the committed candidate"
+            )
+        if not isinstance(nonce, str) or not nonce:
+            raise ValueError("replay record is missing a non-empty nonce")
+        return cls._create_with_nonce(
+            task_digest=task_digest,
+            candidate_digest=candidate_digest,
+            nonce=nonce,
+            attested=False,
+        )
+
+    @classmethod
+    def _create_with_nonce(
+        cls,
+        *,
+        task_digest: str,
+        candidate_digest: str,
+        nonce: str | None,
+        attested: bool,
+    ) -> EvaluationContext:
         # A fresh private nonce is generated only after the artifact has been
         # committed. It therefore provides challenge unpredictability without a
         # long-lived shared secret. Local fallback remains deterministic and is
@@ -276,10 +320,24 @@ class EvaluationContext:
         )
 
     def seed(self, label: str) -> int:
+        """Nonce-bound seed for permutation evidence and other fresh probes."""
         material = hmac.new(
             self.seed_material,
             label.encode("utf-8"),
             hashlib.sha256,
+        ).digest()
+        return int.from_bytes(material[:8], byteorder="big", signed=False)
+
+    def selection_seed(self, label: str) -> int:
+        """Task-bound seed for stable hidden challenge selection.
+
+        Candidate bytes and the fresh evaluation nonce deliberately do not enter
+        this seed. Calibration, production, and exact replays therefore measure
+        the same hidden rows, while ``seed()`` remains nonce-bound for
+        unpredictable permutation evidence.
+        """
+        material = hashlib.sha256(
+            (f"lbx-challenge-selection.v1\0{self.task_digest}\0{label}").encode()
         ).digest()
         return int.from_bytes(material[:8], byteorder="big", signed=False)
 

@@ -234,6 +234,11 @@ def test_executable_isolates_ipc_before_using_configured_uid_gid(
             },
         )(),
     )
+    monkeypatch.setattr(
+        policy_runner,
+        "apply_address_space_limit",
+        lambda limit: calls.append(("rlimit", limit)),
+    )
 
     ipc_status_r, ipc_status_w = os.pipe()
     try:
@@ -252,6 +257,7 @@ def test_executable_isolates_ipc_before_using_configured_uid_gid(
             os.close(ipc_status_w)
 
     assert calls == [
+        ("rlimit", policy_runner.child_memory_limit_bytes()),
         ("unshare", None),
         ("groups", []),
         ("gid", 2346),

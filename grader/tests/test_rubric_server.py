@@ -300,12 +300,28 @@ def test_agent_python_isolation_is_opt_in_for_shims(
     assert shim_env.get("PYTHONSAFEPATH") == "1"
 
 
+def test_terminal_artifact_snapshot_records_digest_or_missing(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+
+    assert server._snapshot_output_artifact(output) == {
+        "artifact_snapshot_state": "artifact_missing"
+    }
+
+    (output / "policy.py").write_text("def act(obs): return 0\n")
+    snapshot = server._snapshot_output_artifact(output)
+
+    assert snapshot["artifact_snapshot_state"] == "artifact_committed"
+    assert len(snapshot["artifact_digest"]) == 64
+
+
 def _clear_agent_identity_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "RUBRIC_AGENT_USER",
         "RUBRIC_AGENT_UID",
         "RUBRIC_AGENT_GID",
         "RUBRIC_AGENT_HOME",
+        "RUBRIC_AGENT_MEMORY_LIMIT_BYTES",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -370,6 +386,7 @@ def test_agent_subprocess_kwargs_uses_configured_numeric_identity(
     assert kwargs["user"] == 1234
     assert kwargs["group"] == 1235
     assert kwargs["extra_groups"] == []
+    assert callable(kwargs["preexec_fn"])
     assert kwargs["env"]["HOME"] == "/tmp/worker-home"
     assert kwargs["env"]["USER"] == "worker"
     assert kwargs["env"]["LOGNAME"] == "worker"
@@ -568,6 +585,8 @@ def test_grade_problem_without_test_file_is_an_infra_failure(extra_fields) -> No
     assert grade.env_internal_failure is True
     assert grade.env_internal_failure_logs
     assert "test_file" in grade.metadata["error"]
+    assert grade.metadata["grading_state"] == "grade_skipped"
+    assert grade.metadata["grade_attempted"] is False
 
 
 def test_agent_fault_scores_zero_without_env_internal_failure() -> None:
@@ -585,6 +604,7 @@ def test_agent_fault_scores_zero_without_env_internal_failure() -> None:
     assert grade.subscores == {"score": 0.0}
     assert grade.env_internal_failure is False
     assert grade.metadata["agent_fault"] == "missing submission"
+    assert grade.metadata["grading_state"] == "graded"
 
 
 def test_pre_grade_quiesce_failure_is_infrastructure_failure(monkeypatch) -> None:
@@ -597,6 +617,7 @@ def test_pre_grade_quiesce_failure_is_infrastructure_failure(monkeypatch) -> Non
     assert _reward(grade) == 0.0
     assert grade.env_internal_failure is True
     assert "quiesce failed" in grade.metadata["error"]
+    assert grade.metadata["grading_state"] == "grader_infra"
 
 
 def test_respawning_agent_quiesce_failure_is_kept_zero(monkeypatch) -> None:

@@ -22,7 +22,8 @@ from grading.evaluation.metrics import (
     validate_metric_vector,
 )
 
-CALIBRATION_LOCK_SCHEMA = "3.0"
+CALIBRATION_LOCK_SCHEMA = "3.1"
+LEGACY_CALIBRATION_LOCK_SCHEMA = "3.0"
 CALIBRATION_POLICY = "continuous-pwl-v3"
 DEFAULT_LOCK_FILENAME = "calibration.lock.json"
 CALIBRATION_LOCK_PATH_ENV = "LBX_CALIBRATION_LOCK_PATH"
@@ -164,6 +165,8 @@ def build_calibration_lock(
     naive_score_min: float = 1e-6,
     naive_score_max: float = 0.10,
     naive_at_floor: Mapping[str, Any] | None = None,
+    max_unacknowledged_naive_score_gap: float = 0.05,
+    naive_semantic_gap_acknowledgement: Mapping[str, Any] | None = None,
 ) -> CalibrationLock:
     """Build a canonical quality lock plus auditable no-information probes.
 
@@ -226,6 +229,28 @@ def build_calibration_lock(
     naive_quality_progress = _aggregate_progress(targets, naive)
     naive_progress = _aggregate_progress(qualification_targets, naive)
     naive_score = curve.score(naive_progress)
+    naive_quality_score = curve.score(naive_quality_progress)
+    naive_semantic_gap = abs(naive_quality_score - naive_score)
+    if (
+        not math.isfinite(max_unacknowledged_naive_score_gap)
+        or not 0 <= max_unacknowledged_naive_score_gap < 0.5
+    ):
+        raise ValueError(
+            "max_unacknowledged_naive_score_gap must be finite in [0, 0.5)"
+        )
+    semantic_gap_acknowledgement = _validate_naive_at_floor_rationale(
+        naive_semantic_gap_acknowledgement
+    )
+    if (
+        naive_semantic_gap > max_unacknowledged_naive_score_gap
+        and semantic_gap_acknowledgement is None
+    ):
+        raise ValueError(
+            "qualification and runtime naive scores diverge by "
+            f"{naive_semantic_gap:.6g}, above the unacknowledged threshold "
+            f"{max_unacknowledged_naive_score_gap:.6g}; add a reviewed "
+            "naive_semantic_gap_acknowledgement"
+        )
     floor_rationale = _validate_naive_at_floor_rationale(naive_at_floor)
     if floor_rationale is not None:
         lower_ok = (
@@ -284,6 +309,11 @@ def build_calibration_lock(
             "naive_progress": naive_progress,
             "naive_quality_progress": naive_quality_progress,
             "naive_score": naive_score,
+            "qualification_naive_score": naive_score,
+            "runtime_naive_quality_score": naive_quality_score,
+            "naive_semantic_gap": naive_semantic_gap,
+            "max_unacknowledged_naive_score_gap": (max_unacknowledged_naive_score_gap),
+            "naive_semantic_gap_acknowledgement": (semantic_gap_acknowledgement),
             "naive_score_range": naive_score_range,
             "reference_score": curve.score(x_ref),
             "oracle_score": curve.score(1.0),
@@ -423,21 +453,31 @@ def validate_calibration_lock(
     payload: Mapping[str, Any],
     *,
     task_spec_sha256: str | None = None,
+    compatible_task_spec_sha256s: tuple[str, ...] = (),
 ) -> CalibrationLock:
-    if payload.get("schema_version") != CALIBRATION_LOCK_SCHEMA:
+    schema_version = payload.get("schema_version")
+    if schema_version not in {
+        CALIBRATION_LOCK_SCHEMA,
+        LEGACY_CALIBRATION_LOCK_SCHEMA,
+    }:
         raise ValueError(
             "unsupported calibration lock schema "
-            f"{payload.get('schema_version')!r}; expected {CALIBRATION_LOCK_SCHEMA!r}"
+            f"{schema_version!r}; expected {CALIBRATION_LOCK_SCHEMA!r}"
         )
     if payload.get("policy") != CALIBRATION_POLICY:
         raise ValueError(f"unsupported calibration policy {payload.get('policy')!r}")
-    if (
-        task_spec_sha256 is not None
-        and payload.get("task_spec_sha256") != task_spec_sha256
+    accepted_task_digests = {
+        digest
+        for digest in (task_spec_sha256, *compatible_task_spec_sha256s)
+        if digest is not None
+    }
+    if accepted_task_digests and payload.get("task_spec_sha256") not in (
+        accepted_task_digests
     ):
         raise ValueError(
             "calibration lock is stale for this TASK registration: expected "
-            f"{task_spec_sha256}, got {payload.get('task_spec_sha256')}"
+            f"one of {sorted(accepted_task_digests)}, got "
+            f"{payload.get('task_spec_sha256')}"
         )
     evaluation_plan = payload.get("evaluation_plan")
     evaluation_plan_sha = payload.get("evaluation_plan_sha256")
@@ -586,7 +626,32 @@ def validate_calibration_lock(
     expected_qualification["naive_score"] = curve_obj.score(
         expected_qualification["naive_progress"]
     )
-    for field, expected in expected_qualification.items():
+    expected_qualification["qualification_naive_score"] = expected_qualification[
+        "naive_score"
+    ]
+    expected_qualification["runtime_naive_quality_score"] = curve_obj.score(
+        expected_qualification["naive_quality_progress"]
+    )
+    expected_qualification["naive_semantic_gap"] = abs(
+        expected_qualification["runtime_naive_quality_score"]
+        - expected_qualification["qualification_naive_score"]
+    )
+    stored_qualification = (
+        expected_qualification
+        if schema_version == CALIBRATION_LOCK_SCHEMA
+        else {
+            field: expected_qualification[field]
+            for field in (
+                "reference_score",
+                "oracle_score",
+                "null_score",
+                "naive_progress",
+                "naive_quality_progress",
+                "naive_score",
+            )
+        }
+    )
+    for field, expected in stored_qualification.items():
         try:
             actual = float(qualification[field])
         except (KeyError, TypeError, ValueError) as exc:
@@ -594,6 +659,36 @@ def validate_calibration_lock(
                 f"calibration lock qualification is missing {field}"
             ) from exc
         _close(actual, expected, field=f"qualification.{field}")
+    if schema_version == CALIBRATION_LOCK_SCHEMA:
+        try:
+            semantic_gap_threshold = float(
+                qualification["max_unacknowledged_naive_score_gap"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "calibration lock qualification is missing "
+                "max_unacknowledged_naive_score_gap"
+            ) from exc
+        if (
+            not math.isfinite(semantic_gap_threshold)
+            or not 0 <= semantic_gap_threshold < 0.5
+        ):
+            raise ValueError(
+                "calibration lock naive semantic gap threshold must lie in [0, 0.5)"
+            )
+        semantic_gap_acknowledgement = qualification.get(
+            "naive_semantic_gap_acknowledgement"
+        )
+        if (
+            expected_qualification["naive_semantic_gap"] > semantic_gap_threshold
+            and semantic_gap_acknowledgement is None
+        ):
+            raise ValueError(
+                "calibration lock naive semantic gap exceeds its threshold without "
+                "a naive_semantic_gap_acknowledgement"
+            )
+        if semantic_gap_acknowledgement is not None:
+            _validate_naive_at_floor_rationale(semantic_gap_acknowledgement)
     _validate_naive_score_range(
         qualification,
         targets,
@@ -677,6 +772,7 @@ def load_calibration_lock(
     *,
     filename: str = DEFAULT_LOCK_FILENAME,
     task_spec_sha256: str | None = None,
+    compatible_task_spec_sha256s: tuple[str, ...] = (),
 ) -> CalibrationLock:
     resolved = path or resolve_calibration_lock_path(filename)
     try:
@@ -696,7 +792,11 @@ def load_calibration_lock(
         ) from exc
     if not isinstance(payload, dict):
         raise RuntimeError(f"calibration lock at {resolved} must be a JSON object")
-    return validate_calibration_lock(payload, task_spec_sha256=task_spec_sha256)
+    return validate_calibration_lock(
+        payload,
+        task_spec_sha256=task_spec_sha256,
+        compatible_task_spec_sha256s=compatible_task_spec_sha256s,
+    )
 
 
 def write_calibration_lock_atomic(path: Path, lock: CalibrationLock) -> None:

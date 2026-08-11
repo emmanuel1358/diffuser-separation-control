@@ -6,8 +6,10 @@ import errno
 import logging
 import os
 import pwd
+import resource
 import signal
 import stat
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ from grading.secure_io import open_directory_fd
 
 logger = logging.getLogger(__name__)
 
+SHARED_RUNTIME_SECURITY_REVISION = "2026-08-10.1"
 _NON_SYSTEM_UID_THRESHOLD = 1000
 _QUIESCE_MAX_PASSES = 32
 _QUIESCE_CONSECUTIVE_ZEROS = 2
@@ -94,6 +97,13 @@ _MEMORY_PRESSURE_MARKERS = (
     "oom-kill",
     "oom killed",
 )
+_DEFAULT_AGENT_MEMORY_LIMIT_BYTES = 56 * 1024**3
+_AGENT_MEMORY_LIMIT_FRACTION = 0.75
+_CGROUP_MEMORY_LIMIT_PATHS = (
+    Path("/sys/fs/cgroup/memory.max"),
+    Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+)
+_UNBOUNDED_CGROUP_MEMORY_BYTES = 1 << 60
 
 
 @dataclass(frozen=True)
@@ -156,6 +166,86 @@ def meminfo_kib(path: str | Path = "/proc/meminfo") -> dict[str, int]:
     except OSError:
         pass
     return values
+
+
+def _read_cgroup_memory_limit(
+    paths: tuple[Path, ...] = _CGROUP_MEMORY_LIMIT_PATHS,
+) -> int | None:
+    """Return the finite container memory limit, if cgroups expose one."""
+    for path in paths:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not raw or raw == "max":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if 0 < value < _UNBOUNDED_CGROUP_MEMORY_BYTES:
+            return value
+    return None
+
+
+def child_memory_limit_bytes(
+    *,
+    explicit_bytes: int | None = None,
+    env_keys: tuple[str, ...] = ("RUBRIC_AGENT_MEMORY_LIMIT_BYTES",),
+    cgroup_paths: tuple[Path, ...] = _CGROUP_MEMORY_LIMIT_PATHS,
+) -> int:
+    """Resolve the hard address-space cap for untrusted child processes.
+
+    An explicit API value wins, followed by the first configured environment
+    key. Otherwise the cap is 75% of the container limit (leaving room for the
+    root MCP/grader), bounded by a conservative 56 GiB fallback for runtimes
+    that do not expose cgroup limits.
+    """
+    if explicit_bytes is not None:
+        if explicit_bytes <= 0:
+            raise ValueError("child memory limit must be positive")
+        return int(explicit_bytes)
+
+    for key in env_keys:
+        raw = os.environ.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{key} must be a positive integer byte count") from exc
+        if value <= 0:
+            raise ValueError(f"{key} must be a positive integer byte count")
+        return value
+
+    cgroup_limit = _read_cgroup_memory_limit(cgroup_paths)
+    if cgroup_limit is None:
+        return _DEFAULT_AGENT_MEMORY_LIMIT_BYTES
+    return min(
+        _DEFAULT_AGENT_MEMORY_LIMIT_BYTES,
+        max(1, int(cgroup_limit * _AGENT_MEMORY_LIMIT_FRACTION)),
+    )
+
+
+def apply_address_space_limit(limit_bytes: int) -> None:
+    """Apply an inherited hard RLIMIT_AS to the current child process."""
+    if limit_bytes <= 0:
+        raise ValueError("address-space limit must be positive")
+    current_soft, current_hard = resource.getrlimit(resource.RLIMIT_AS)
+    target = int(limit_bytes)
+    if current_hard != resource.RLIM_INFINITY:
+        target = min(target, current_hard)
+    if current_soft != resource.RLIM_INFINITY:
+        target = min(target, current_soft)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (target, target))
+    except (OSError, ValueError):
+        # Darwin reports RLIMIT_AS but rejects lowering it below the process's
+        # enormous reserved VM map ("current limit exceeds maximum limit").
+        # Production grading is Linux; keep local authoring/tests usable.
+        if sys.platform == "darwin":
+            return
+        raise
 
 
 def shared_memory_exhausted(mem: dict[str, int] | None = None) -> bool:

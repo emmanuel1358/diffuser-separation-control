@@ -27,6 +27,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 
 from grading.faults import AgentFault, InfrastructureFault
+from grading.runtime_hardening import child_memory_limit_bytes
 from rubric.capsule_runtime import (
     CapsuleBundle,
     CapsuleRuntimeError,
@@ -1661,9 +1662,16 @@ class TaskServiceRuntime:
                     returncode=1,
                     stderr="main service is not running",
                 )
+            try:
+                memory_limit_kib = child_memory_limit_bytes() // 1024
+            except ValueError as exc:
+                raise ServiceRuntimeError(
+                    f"invalid nested agent memory limit: {exc}"
+                ) from exc
+            limited_command = f"ulimit -v {memory_limit_kib} && " + command
             return self._exec_service_argv(
                 self.config.main_service,
-                (self.config.agent_shell, "-lc", command),
+                (self.config.agent_shell, "-lc", limited_command),
                 user=self.config.agent_user,
                 workdir=self.config.agent_workdir,
                 timeout_s=timeout_s or self.config.command_timeout_s,

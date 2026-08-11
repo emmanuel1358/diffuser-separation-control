@@ -6,6 +6,10 @@ Trusted CI and post-merge integration live in
 [`lbx-rl-tasks-iso-mothership`](https://github.com/Alignerr-Code-Labeling/lbx-rl-tasks-iso-mothership);
 you do not need mothership access to author tasks.
 
+Before upgrading or regenerating a task, review the
+[`Task Author Changelog`](docs/CHANGELOG.md) for migrations, schema changes,
+and required image or calibration rebuilds.
+
 ## Quick start
 
 ```bash
@@ -300,6 +304,7 @@ harness + `lbx-rl-template` + trusted CI.
 
 | Audience | Start here |
 | --- | --- |
+| Shared framework changes | [`docs/CHANGELOG.md`](docs/CHANGELOG.md) |
 | First task | [`docs/AUTHORING.md`](docs/AUTHORING.md), [`problems/README.md`](problems/README.md) |
 | Grading / rubrics | [`docs/GRADING.md`](docs/GRADING.md), [`docs/RUBRIC_EVALUATION.md`](docs/RUBRIC_EVALUATION.md), [`docs/RUBRIC_GUIDANCE.md`](docs/RUBRIC_GUIDANCE.md) |
 | Ground truth / proof | [`docs/GROUND_TRUTH.md`](docs/GROUND_TRUTH.md) |

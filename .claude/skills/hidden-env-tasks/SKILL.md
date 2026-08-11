@@ -80,7 +80,9 @@ from `hidden_env` or `ml_task_type`.
 ## What runs where (don't fight it)
 
 - Boot: the rubric MCP server calls `supervise_if_enabled()`, reads
-  `[environment].hidden_env` from `/task/task.toml`, spawns `python -m env_server`.
+  `[environment].hidden_env` from `/task/task.toml`, and spawns
+  `python -P -m env_server` from root-owned `/` with inherited Python import
+  paths removed and a root-owned executable `PATH`.
 - Rollout: agent -> `/data/env_client.py` -> `/tmp/env.sock` -> `make_env()` instance.
 - Grade: `stop_env_server()` closes the socket FIRST (no grade-time env access),
   then the grader loads the held-out env in-process and runs the policy.

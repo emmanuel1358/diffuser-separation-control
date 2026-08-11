@@ -4326,6 +4326,63 @@ def test_baseline_trio_clean_with_full_trio(tmp_path: Path) -> None:
     assert validator_module.baseline_trio_warnings(problem_dir) == []
 
 
+def test_strict_release_requires_named_baseline_portfolio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    problem_dir = tmp_path / "ml-strict-baselines"
+    _write_problem(
+        problem_dir, task_type="ml", reward_type="continuous_scoring_function"
+    )
+    for name in ("naive", "linear", "gbt"):
+        path = problem_dir / "baselines" / name
+        path.mkdir(parents=True)
+        (path / "submission.csv").write_text("prediction\n0\n")
+    monkeypatch.setenv("LBX_STRICT_RELEASE_GATES", "1")
+
+    missing = TaskValidator()._conditional(problem_dir)
+    assert missing.passed is False
+    assert any("portfolio.json" in issue for issue in missing.issues)
+
+    (problem_dir / "baselines" / "portfolio.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "baseline-portfolio.v1",
+                "required_families": ["no_op", "simple_fitted", "domain_heuristic"],
+                "baselines": [
+                    {
+                        "name": "naive",
+                        "family": "no_op",
+                        "path": "baselines/naive",
+                        "rationale": "A no-information constant prediction baseline.",
+                    },
+                    {
+                        "name": "linear",
+                        "family": "simple_fitted",
+                        "path": "baselines/linear",
+                        "rationale": "A simple linear model over the raw public features.",
+                    },
+                    {
+                        "name": "gbt",
+                        "family": "domain_heuristic",
+                        "path": "baselines/gbt",
+                        "rationale": "An obvious low-effort library baseline for comparison.",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert validator_module.baseline_portfolio_manifest_issues(problem_dir) == []
+
+    portfolio_path = problem_dir / "baselines" / "portfolio.json"
+    root_workspace = json.loads(portfolio_path.read_text())
+    root_workspace["baselines"][0]["path"] = "baselines"
+    portfolio_path.write_text(json.dumps(root_workspace))
+
+    issues = validator_module.baseline_portfolio_manifest_issues(problem_dir)
+    assert any("must stay under baselines/" in issue for issue in issues)
+
+
 def test_baseline_trio_counts_flat_scripts(tmp_path: Path) -> None:
     problem_dir = tmp_path / "ml-flat-baselines"
     _write_problem(

@@ -292,7 +292,10 @@ def test_custom_naive_path_uses_naive_manifest_role(tmp_path: Path) -> None:
 def test_container_script_bootstraps_hidden_env() -> None:
     problem = _problem(metadata={"environment": {"hidden_env": "env"}})
     prefix = _container_script_prefix(problem, skip_solve=False)
-    assert "python -m env_server &" in prefix
+    assert any("python -P -m env_server &" in line for line in prefix)
+    assert "cd /" in prefix
+    assert any("env -u PYTHONPATH -u PYTHONHOME" in line for line in prefix)
+    assert any("PATH=/opt/lbx-runtime/.venv/bin:" in line for line in prefix)
     assert _container_script_stop_env_server(problem, skip_solve=False)
     assert _hidden_env_mode(problem) == "env"
 
@@ -301,7 +304,7 @@ def test_raw_measurement_bootstraps_hidden_env() -> None:
     problem = _problem(metadata={"environment": {"hidden_env": "hybrid"}})
     script = _container_measure_script(problem)
 
-    assert "python -m env_server &" in script
+    assert "python -P -m env_server &" in script
     assert "grader_runner.raw_worker" in script
     assert 'kill "$ENV_PID"' in script
 
@@ -309,7 +312,7 @@ def test_raw_measurement_bootstraps_hidden_env() -> None:
 def test_container_script_skips_env_server_on_skip_solve() -> None:
     problem = _problem(metadata={"environment": {"hidden_env": "env"}})
     prefix = _container_script_prefix(problem, skip_solve=True)
-    assert "python -m env_server" not in " ".join(prefix)
+    assert "env_server" not in " ".join(prefix)
     assert _container_script_stop_env_server(problem, skip_solve=True) == []
 
 
@@ -489,7 +492,7 @@ def test_container_solve_script_runs_env_server_as_root_then_solve_as_agent() ->
 
     script = _container_solve_script(problem, sol_rel="solution/solve.sh", render=False)
 
-    assert "python -m env_server &" in script
+    assert "python -P -m env_server &" in script
     # uid-1000 account is resolved from the image rather than hardcoded, so the
     # drop works whatever the base flavor names that account.
     assert 'su -s /bin/bash "$(getent passwd 1000 | cut -d: -f1)" -c' in script

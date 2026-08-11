@@ -16,6 +16,7 @@ from grading.evaluation import (
     SRETarget,
     write_calibration_lock_atomic,
 )
+from grading.evaluation.lock import canonical_json_bytes, validate_calibration_lock
 
 LOW = FloorAnchor(
     0.0, AnchorRationale("metric_bound", "Binary F1 is bounded below by zero.")
@@ -189,6 +190,56 @@ def test_v2_calibration_stage_accepts_generated_lock_and_evidence(tmp_path) -> N
 
     assert result.passed is True
     assert result.issues == []
+
+
+def test_calibration_stage_accepts_paired_legacy_lock_and_evidence(tmp_path) -> None:
+    task_dir = _write_v2_task(tmp_path)
+    task = ContinuousTask.calibrated(
+        targets=[
+            SRETarget.lower("value", weight=0.5, floor=HIGH),
+            BinaryF1Target.higher("label", weight=0.5, floor=LOW),
+        ],
+        calibration=GeneratedCalibration(),
+    )
+    assert task.legacy_spec_sha256 is not None
+    assert task.legacy_evaluation_plan is not None
+
+    lock_path = task_dir / "calibration.lock.json"
+    payload = json.loads(lock_path.read_text())
+    payload["schema_version"] = "3.0"
+    payload["task_spec_sha256"] = task.legacy_spec_sha256
+    payload["evaluation_plan"] = task.legacy_evaluation_plan.to_dict()
+    payload["evaluation_plan_sha256"] = task.legacy_evaluation_plan.sha256
+    for field in (
+        "qualification_naive_score",
+        "runtime_naive_quality_score",
+        "naive_semantic_gap",
+        "max_unacknowledged_naive_score_gap",
+        "naive_semantic_gap_acknowledgement",
+    ):
+        payload["qualification"].pop(field)
+    legacy_lock = validate_calibration_lock(
+        payload,
+        task_spec_sha256=task.spec_sha256,
+        compatible_task_spec_sha256s=(task.legacy_spec_sha256,),
+    )
+    lock_path.write_bytes(canonical_json_bytes(legacy_lock.payload))
+
+    evidence_path = task_dir / ".alignerr" / "calibration.evidence.json"
+    evidence = json.loads(evidence_path.read_text())
+    evidence.update(
+        lock_sha256=legacy_lock.sha256,
+        task_spec_sha256=task.legacy_spec_sha256,
+        evaluation_plan_sha256=task.legacy_evaluation_plan.sha256,
+        qualification=legacy_lock.payload["qualification"],
+    )
+    evidence_path.write_text(json.dumps(evidence) + "\n")
+
+    result = TaskValidator()._continuous_calibration(task_dir)
+
+    assert result.passed is True
+    assert result.issues == []
+    assert not any("stale" in warning for warning in result.warnings)
 
 
 def test_calibration_stage_accepts_trusted_ci_bundle(

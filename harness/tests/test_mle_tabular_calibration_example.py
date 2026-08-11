@@ -9,14 +9,12 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-
+from _fixture_guard import requires_examples
 from grading.evaluation import (
     load_calibration_lock,
     load_task_registration,
     measure_task_module,
 )
-from _fixture_guard import requires_examples
-
 from grading.evaluation.author import load_task_module
 from grading.evaluation.context import workspace_artifact_digest
 from lbx_rl_tasks_harness.calibration import validate_committed_model_manifest
@@ -149,7 +147,13 @@ def test_committed_weights_score_to_the_calibration_lock(tmp_path, monkeypatch) 
     task = load_task_registration(EXAMPLE / "scorer" / "compute_score.py")
     assert task is not None
     lock_path = EXAMPLE / "calibration.lock.json"
-    lock = load_calibration_lock(lock_path, task_spec_sha256=task.spec_sha256)
+    assert task.legacy_spec_sha256 is not None
+    lock = load_calibration_lock(
+        lock_path,
+        task_spec_sha256=task.spec_sha256,
+        compatible_task_spec_sha256s=(task.legacy_spec_sha256,),
+    )
+    assert task.legacy_spec_sha256 == lock.payload["task_spec_sha256"]
     monkeypatch.setenv("LBX_CALIBRATION_LOCK_PATH", str(lock_path))
 
     reference_metrics = measure_task_module(
@@ -171,19 +175,7 @@ def test_committed_weights_score_to_the_calibration_lock(tmp_path, monkeypatch) 
 def test_challenge_subsample_follows_the_submitted_artifact_digest(
     tmp_path, monkeypatch
 ) -> None:
-    """Pin the amplifier that turns ULP noise in the weights into percent of score.
-
-    `ContinuousTask._load_model_challenge` seeds the private challenge draw from
-    `workspace_artifact_digest(workspace)`, so changing the submitted bytes at all
-    re-rolls which 400 of the 1000 challenge rows are scored. That is deliberate --
-    it stops an agent precomputing answers for a fixed subsample -- but it means the
-    committed weights are the only artifact for which the lock's anchors hold.
-
-    This is the negative control for
-    `test_committed_weights_score_to_the_calibration_lock`. If someone rewrites that
-    test to score a retrained model again, this one explains why the resulting
-    failure is not a calibration bug.
-    """
+    """Pin the legacy artifact-bound selection behavior during lock migration."""
 
     committed = json.loads(
         (EXAMPLE / "solution" / "model.json").read_text(encoding="utf-8")
@@ -230,8 +222,8 @@ def test_challenge_subsample_follows_the_submitted_artifact_digest(
         module, workspace=perturbed_output, private=private
     )
 
-    # A different subsample, so the metrics move by orders of magnitude more than the
-    # 2.2e-16 change to the weights can account for.
+    # A different artifact digest selects a different private subset, so the
+    # metrics move by far more than the one-ULP coefficient edit itself.
     for name in ("t1", "t2"):
         moved = abs(perturbed_metrics[name] - baseline_metrics[name])
         assert moved > 1e-3 * abs(baseline_metrics[name]), name

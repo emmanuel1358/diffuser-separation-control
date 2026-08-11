@@ -25,8 +25,11 @@ from typing import Any
 
 from grading.faults import InfrastructureFault
 from grading.runtime_hardening import (
+    SHARED_RUNTIME_SECURITY_REVISION,
     AgentProcessQuiesceError,
     ProcessQuiesceError,
+    apply_address_space_limit,
+    child_memory_limit_bytes,
     classify_failure,
     cleanup_agent_tmpfs,
     kill_nvproxy_fd_holders,
@@ -398,7 +401,15 @@ def _agent_subprocess_kwargs(*, isolate_python: bool = False) -> dict[str, Any]:
         if isolate_python
         else _scrubbed_environ()
     )
-    kwargs: dict[str, Any] = {"env": env}
+    try:
+        memory_limit_bytes = child_memory_limit_bytes()
+    except ValueError as exc:
+        raise RuntimeError(f"invalid agent memory limit: {exc}") from exc
+
+    def limit_resources() -> None:
+        apply_address_space_limit(memory_limit_bytes)
+
+    kwargs: dict[str, Any] = {"env": env, "preexec_fn": limit_resources}
     if os.geteuid() != 0:
         return kwargs
     uid, gid, home, name = _agent_identity()
@@ -1406,6 +1417,10 @@ def _failure_grade(
 ) -> Grade:
     if error:
         metadata["error"] = error
+    if metadata.get("grading_state") == "grade_attempted":
+        metadata["grading_state"] = (
+            "grader_infra" if env_internal_failure else "agent_fault"
+        )
     return Grade(
         subscores={"score": 0.0},
         weights={"score": 1.0},
@@ -1552,6 +1567,31 @@ def _read_result_payload(
     return payload
 
 
+def _snapshot_output_artifact(root: Path = OUTPUT_DIR) -> dict[str, Any]:
+    """Best-effort terminal output commitment for grading audit metadata."""
+    try:
+        if not root.is_dir() or not any(root.iterdir()):
+            return {"artifact_snapshot_state": "artifact_missing"}
+    except OSError as exc:
+        return {
+            "artifact_snapshot_state": "artifact_unreadable",
+            "artifact_snapshot_error": f"{type(exc).__name__}: {exc}",
+        }
+    try:
+        from grading.evaluation.context import workspace_artifact_digest
+
+        digest = workspace_artifact_digest(root)
+    except (OSError, ValueError) as exc:
+        return {
+            "artifact_snapshot_state": "artifact_invalid",
+            "artifact_snapshot_error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "artifact_snapshot_state": "artifact_committed",
+        "artifact_digest": digest,
+    }
+
+
 def _evaluate(
     test_file_source: str,
     transcript: str = "",
@@ -1560,6 +1600,13 @@ def _evaluate(
     trace_required: bool = False,
 ) -> Grade:
     agent_uid, resource_metadata, tmpfs_flood = _pre_grade_resource_cleanup()
+    resource_metadata.update(
+        {
+            "grade_attempted": False,
+            "grading_state": "grade_preflight",
+            "shared_runtime_security_revision": SHARED_RUNTIME_SECURITY_REVISION,
+        }
+    )
     if tmpfs_flood:
         return _agent_resource_grade(
             "agent_tmpfs_flood",
@@ -1612,11 +1659,16 @@ def _evaluate(
     runner_env[_RESULT_PATH_ENV] = result_path
     if trace_path:
         runner_env[_TRACE_PATH_ENV] = trace_path
-    metadata: dict[str, Any] = dict(resource_metadata)
+    metadata: dict[str, Any] = {
+        **resource_metadata,
+        "grade_attempted": True,
+        "grading_state": "grade_attempted",
+    }
     try:
         cleanup_failure = _cleanup_grade_processes(metadata, phase="pre")
         if cleanup_failure is not None:
             return cleanup_failure
+        metadata.update(_snapshot_output_artifact())
         _clear_persisted_evaluation_trace()
         # Cut the agent's grade-time access to the live hidden env before the
         # grader subprocess runs (closes free reset()-seed fingerprinting, a
@@ -1706,7 +1758,11 @@ def _evaluate(
                 except Exception:  # noqa: BLE001 - untrusted result boundary
                     grade = None
                 if grade is not None:
-                    grade.metadata = {**metadata, **(grade.metadata or {})}
+                    grade.metadata = {
+                        **metadata,
+                        **(grade.metadata or {}),
+                        "grading_state": "graded",
+                    }
                     return grade
             if not classification.is_infra:
                 metadata["critical_operator_alert"] = True
@@ -1782,7 +1838,11 @@ def _evaluate(
                 env_internal_failure=True,
                 env_internal_failure_logs=[message],
             )
-        grade.metadata = {**metadata, **(grade.metadata or {})}
+        grade.metadata = {
+            **metadata,
+            **(grade.metadata or {}),
+            "grading_state": "graded",
+        }
         if grade.env_internal_failure and exhaustion.disk:
             return _agent_resource_grade(
                 "disk_exhausted",
@@ -1884,7 +1944,11 @@ async def grade_problem(
         # record a false zero that is indistinguishable from a failed attempt.
         message = "grade_problem called without extra_fields.test_file"
         return _failure_grade(
-            {"failure_classification": "missing_test_file"},
+            {
+                "failure_classification": "missing_test_file",
+                "grade_attempted": False,
+                "grading_state": "grade_skipped",
+            },
             message,
             env_internal_failure=True,
             env_internal_failure_logs=[message],
@@ -1959,7 +2023,10 @@ def main() -> None:
         pass
     WORKDIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    os.chdir(WORKDIR)
+    # Keep the privileged MCP process itself in a root-owned directory. Agent
+    # tools already receive WORKDIR explicitly; inheriting agent-writable cwd
+    # here would make any future Python child/import boundary shadowable.
+    os.chdir("/")
     start_shmem_reaper()
     # Hidden-environment tasks ([environment].hidden_env = env/hybrid) spawn an
     # env_server subprocess the agent reaches over /tmp/env.sock. A no-op for

@@ -41,6 +41,10 @@ from typing import Any
 from env_server.protocol import _FRAME_HEADER, _frame, _pack, _unpack
 
 from grading.faults import AgentFault
+from grading.runtime_hardening import (
+    apply_address_space_limit,
+    child_memory_limit_bytes,
+)
 from grading.secure_io import read_regular_bytes
 
 logger = logging.getLogger(__name__)
@@ -50,7 +54,11 @@ class PolicyWorkerError(RuntimeError):
     """Raised when the submitted policy worker fails for non-agent reasons."""
 
 
-class PolicyTimeoutError(PolicyWorkerError, TimeoutError):
+class PolicyAgentFault(PolicyWorkerError, AgentFault):
+    """Submitted policy execution failed after the trusted worker was ready."""
+
+
+class PolicyTimeoutError(PolicyAgentFault, TimeoutError):
     """Raised when a submitted policy call (load or predict) exceeds its timeout.
 
     Subclasses BOTH ``PolicyWorkerError`` (a ``RuntimeError``) and the builtin
@@ -193,6 +201,7 @@ def _agent_preexec(
     ipc_status_fd: int | None = None,
     *,
     cwd_fd: int | None = None,
+    memory_limit_bytes: int,
 ) -> Callable[[], None]:
     """``preexec_fn`` that isolates IPC, enters a pinned cwd, and drops uid.
 
@@ -212,6 +221,7 @@ def _agent_preexec(
     """
 
     def _preexec() -> None:
+        apply_address_space_limit(memory_limit_bytes)
         status = 0
         unshare = getattr(_LIBC, "unshare", None)
         if unshare is not None and _CLONE_NEWIPC_ARG is not None:
@@ -279,7 +289,10 @@ def _warn_if_ipc_unisolated(
 
 
 def _agent_drop_kwargs(
-    *, unshare_ipc: bool = False, ipc_status_fd: int | None = None
+    *,
+    unshare_ipc: bool = False,
+    ipc_status_fd: int | None = None,
+    memory_limit_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Popen kwargs dropping a child to the unprivileged agent account.
 
@@ -294,14 +307,33 @@ def _agent_drop_kwargs(
     a warning when isolation did not take.
     """
     env = _isolated_python_environ()
-    kwargs: dict[str, Any] = {"env": env}
+    try:
+        limit = child_memory_limit_bytes(
+            explicit_bytes=memory_limit_bytes,
+            env_keys=(
+                "RUBRIC_POLICY_MEMORY_LIMIT_BYTES",
+                "RUBRIC_AGENT_MEMORY_LIMIT_BYTES",
+            ),
+        )
+    except ValueError as exc:
+        raise PolicyWorkerError(f"invalid policy memory limit: {exc}") from exc
+
+    def limit_resources() -> None:
+        apply_address_space_limit(limit)
+
+    kwargs: dict[str, Any] = {"env": env, "preexec_fn": limit_resources}
     if os.geteuid() != 0:
         return kwargs
     uid, gid, home, name = _agent_identity()
     env["HOME"] = home
     env["USER"] = env["LOGNAME"] = name
     if unshare_ipc:
-        kwargs["preexec_fn"] = _agent_preexec(uid, gid, ipc_status_fd)
+        kwargs["preexec_fn"] = _agent_preexec(
+            uid,
+            gid,
+            ipc_status_fd,
+            memory_limit_bytes=limit,
+        )
     else:
         kwargs.update(user=uid, group=gid, extra_groups=[])
     return kwargs
@@ -823,6 +855,7 @@ class PolicyWorker:
         cwd: Path | None = None,
         max_stderr_chars: int = 8000,
         max_reply_bytes: int = _MAX_POLICY_REPLY_BYTES,
+        memory_limit_bytes: int | None = None,
         drop_privileges: bool = True,
         unshare_ipc: bool = True,
         factory_name: str | None = None,
@@ -842,6 +875,16 @@ class PolicyWorker:
         if max_reply_bytes <= 0:
             raise ValueError("max_reply_bytes must be positive")
         self.max_reply_bytes = int(max_reply_bytes)
+        try:
+            self.memory_limit_bytes = child_memory_limit_bytes(
+                explicit_bytes=memory_limit_bytes,
+                env_keys=(
+                    "RUBRIC_POLICY_MEMORY_LIMIT_BYTES",
+                    "RUBRIC_AGENT_MEMORY_LIMIT_BYTES",
+                ),
+            )
+        except ValueError as exc:
+            raise PolicyWorkerError(f"invalid policy memory limit: {exc}") from exc
         if not drop_privileges:
             raise ValueError(
                 "drop_privileges=False is forbidden for submitted policy workers"
@@ -924,7 +967,11 @@ class PolicyWorker:
             ipc_status_r, ipc_status_w = os.pipe()
 
         popen_kwargs = (
-            _agent_drop_kwargs(unshare_ipc=self.unshare_ipc, ipc_status_fd=ipc_status_w)
+            _agent_drop_kwargs(
+                unshare_ipc=self.unshare_ipc,
+                ipc_status_fd=ipc_status_w,
+                memory_limit_bytes=self.memory_limit_bytes,
+            )
             if self.drop_privileges
             else {"env": _isolated_python_environ()}
         )
@@ -1114,17 +1161,24 @@ class PolicyWorker:
         try:
             self._write_frame(request)
         except BrokenPipeError as exc:
-            raise PolicyWorkerError(
-                self._error_context("policy worker exited")
-            ) from exc
+            raise PolicyAgentFault(self._error_context("policy worker exited")) from exc
         method = request.get("method") or request.get("op")
-        reply = self._read_reply(self._effective_timeout(), what=str(method))
+        try:
+            reply = self._read_reply(self._effective_timeout(), what=str(method))
+        except PolicyTimeoutError:
+            raise
+        except PolicyWorkerError as exc:
+            raise PolicyAgentFault(
+                self._error_context(
+                    f"submitted policy worker failed during {method}: {exc}"
+                )
+            ) from exc
         self._first_call_done = True
         if not isinstance(reply, dict) or not reply.get("ok"):
             err = (
                 reply.get("error") if isinstance(reply, dict) else None
             ) or "policy worker error"
-            raise PolicyWorkerError(str(err))
+            raise PolicyAgentFault(str(err))
         return reply
 
     def _write_frame(self, obj: Any) -> None:
@@ -1285,6 +1339,8 @@ def load_submitted_policy(
     sys_path_dirs: list[str | Path] | None = None,
     timeout_s: float = 5.0,
     first_call_timeout_s: float | None = None,
+    max_reply_bytes: int = _MAX_POLICY_REPLY_BYTES,
+    memory_limit_bytes: int | None = None,
     cwd: str | Path | None = None,
     drop_privileges: bool = True,
     unshare_ipc: bool = True,
@@ -1311,6 +1367,8 @@ def load_submitted_policy(
         Path(path),
         timeout_s=timeout_s,
         first_call_timeout_s=first_call_timeout_s,
+        max_reply_bytes=max_reply_bytes,
+        memory_limit_bytes=memory_limit_bytes,
         cwd=Path(cwd) if cwd is not None else None,
         drop_privileges=drop_privileges,
         unshare_ipc=unshare_ipc,

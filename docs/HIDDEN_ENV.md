@@ -43,7 +43,7 @@ audited service-DNS proxy; unbundled SSE remains unsupported.
 ```mermaid
 flowchart TD
   boot["rubric mcp boots"] --> sup["supervise_if_enabled() reads /task/task.toml"]
-  sup -->|"hidden_env = env/hybrid"| spawn["python -m env_server (root)"]
+  sup -->|"hidden_env = env/hybrid"| spawn["python -P -m env_server (root, cwd=/)"]
   sup -->|"unset"| off["no-op"]
   spawn --> sock["/tmp/env.sock (0666)"]
   agent["agent (uid 1000) imports /data/env_client.py"] -->|"msgpack RPC"| sock
@@ -56,7 +56,12 @@ flowchart TD
   `/mcp_server/data/env.py`. The agent (uid 1000) cannot read it.
 - At container boot the rubric MCP server calls `supervise_if_enabled()`, which
   reads `[environment].hidden_env` from the baked `/task/task.toml`. If `env` or
-  `hybrid`, it spawns `python -m env_server` (and restarts it on crash).
+  `hybrid`, it spawns `python -P -m env_server` from root-owned `/` (and
+  restarts it on crash). The child receives no inherited `PYTHONPATH` and uses
+  a root-owned executable `PATH`, so agent-planted `/workdir` content cannot
+  execute as root.
+- The privileged MCP process also keeps `/` as its own cwd; agent tools receive
+  `/workdir` explicitly instead of making it a root-process import root.
 - The agent connects to `/tmp/env.sock` using `data/env_client.py` (baked to
   `/data/env_client.py`) and calls methods on the env instance.
 - Before grading, `stop_env_server()` tears the socket down, so the agent has no
@@ -161,6 +166,12 @@ resolves under `/mcp_server` (so a rollout cannot redirect a privileged read).
   pipe, never stdout.
 - **No traceback leakage**: server error replies to the agent never include the
   server-side traceback (it is logged root-side only).
+- **Bounded connections**: at most 256 live connection handlers run at once;
+  excess sockets are closed, and `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` on
+  `accept()` backs off instead of crashing the root server.
+- **No crash-to-void channel**: exhausting the restart budget leaves the MCP
+  alive with the training socket unavailable, so the episode still reaches
+  grading instead of becoming an infrastructure discard.
 
 See [REWARD_HACKING.md](REWARD_HACKING.md) for the full catalog.
 

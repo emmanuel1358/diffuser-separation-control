@@ -104,6 +104,15 @@ black-box env over `/tmp/env.sock`; see `docs/HIDDEN_ENV.md`):
   `grading.load_env_module` (trusted-roots restricted to `/mcp_server`).
 - **No traceback leakage**: server error replies to the agent never include the
   server-side traceback (logged root-side only).
+- **Safe privileged restart**: the supervisor launches
+  `python -P -m env_server` with `cwd=/`, no inherited `PYTHONPATH`, and a
+  root-owned executable `PATH`. Agent-planted `/workdir` content therefore
+  cannot be imported or launched as root. The privileged MCP also keeps `/` as
+  its own cwd; tool subprocesses receive `/workdir` explicitly.
+- **Flood resistance**: connection handlers are capped, excess sockets are
+  closed, and `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` backs off without exiting.
+  Exhausting the restart budget leaves the MCP alive so a deliberate crash
+  cannot void grading.
 
 ## 4. Runtime hardening (automatic)
 
@@ -121,6 +130,11 @@ every grade) closes the classic exploits with no author action:
 - gives every submitted policy or executable worker a fresh best-effort IPC
   namespace, preventing persistent SysV shared memory, semaphore, and message
   queue state from relaying rollout data into grading or between candidate runs;
+- applies an inherited hard `RLIMIT_AS` to agent shell/editor descendants and
+  submitted policy/executable workers. The default is 75% of the detected
+  cgroup memory limit (capped at 56 GiB), leaving headroom for the root MCP and
+  grader; `RUBRIC_AGENT_MEMORY_LIMIT_BYTES` and
+  `RUBRIC_POLICY_MEMORY_LIMIT_BYTES` provide trusted deployment overrides;
 - scrubs escaping symlinks and non-regular files (FIFOs/sockets/devices) under
   the output dir (symlink-to-truth and FIFO-hang-to-discard defenses);
 - traps non-finite scores (`NaN`/`inf` cannot clamp up to `1.0`);

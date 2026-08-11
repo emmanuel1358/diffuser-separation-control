@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -9,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CURSOR_SKILLS = ROOT / ".cursor" / "skills"
 CLAUDE_SKILLS = ROOT / ".claude" / "skills"
 CURSOR_RULES = ROOT / ".cursor" / "rules"
+CHANGELOG = ROOT / "docs" / "CHANGELOG.md"
 
 EXPECTED_SKILLS = {
     "alignerr-task-authoring",
@@ -23,6 +25,7 @@ EXPECTED_SKILLS = {
     "rubric-design",
     "service-capsule-tasks",
     "software-engineering-tasks",
+    "task-author-changelog",
     "task-migration",
 }
 
@@ -40,6 +43,7 @@ ESSENTIAL_RULES = {
     "prompt-fairness.mdc",
     "reward-hacking.mdc",
     "software-engineering-tasks.mdc",
+    "shared-grader-changelog.mdc",
     "task-authoring.mdc",
     "task-delivery-gates.mdc",
     "task-dependencies.mdc",
@@ -112,3 +116,25 @@ def test_delivery_and_software_rules_encode_acceptance_bar() -> None:
         assert "trusted CI" in text
         assert "Boreal aggregate" in text
         assert "<= 0.4" in text
+
+
+def test_task_author_changelog_is_linked_and_reverse_chronological() -> None:
+    changelog = CHANGELOG.read_text()
+    raw_timestamps = re.findall(
+        r"^## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})\b",
+        changelog,
+        flags=re.MULTILINE,
+    )
+    assert raw_timestamps
+    timestamps = [datetime.fromisoformat(value) for value in raw_timestamps]
+    assert timestamps == sorted(timestamps, reverse=True)
+
+    assert "docs/CHANGELOG.md" in (ROOT / "README.md").read_text()
+    assert (
+        "docs/CHANGELOG.md"
+        in (CURSOR_SKILLS / "task-author-changelog" / "SKILL.md").read_text()
+    )
+    assert (
+        "docs/CHANGELOG.md"
+        in (CURSOR_RULES / "shared-grader-changelog.mdc").read_text()
+    )
