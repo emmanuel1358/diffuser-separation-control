@@ -171,6 +171,13 @@ training. You may write domain-specific accelerator guidance yourself; the
 exporter avoids duplicating notices when your prompt already mentions GPU/TPU or
 `tmux`.
 
+Agent shell/editor descendants and submitted policy workers inherit a hard
+address-space cap so a parallel sweep fails locally instead of killing the
+entire sandbox. The runtime defaults to 75% of the detected cgroup memory
+(capped at 56 GiB). Size worker counts and in-memory arrays within that budget;
+trusted deployments may lower it with `RUBRIC_AGENT_MEMORY_LIMIT_BYTES` and
+`RUBRIC_POLICY_MEMORY_LIMIT_BYTES`.
+
 ## Task Dependencies
 
 **Never add packages to `base/`.** The base images are shared by every task and

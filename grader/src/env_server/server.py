@@ -87,12 +87,14 @@ the env is then responsible for that method's thread-safety.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import signal
 import socket
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -102,6 +104,12 @@ from .protocol import _FRAME_HEADER, _MAX_FRAME_BYTES, _frame, _pack, _unpack
 
 _RECV_CHUNK_BYTES = 65536
 _LISTEN_BACKLOG = 16
+_MAX_CONNECTION_HANDLERS = 256
+_ACCEPT_RESOURCE_BACKOFF_S = 0.1
+_RESOURCE_WARNING_INTERVAL_S = 5.0
+_ACCEPT_RESOURCE_ERRNOS = frozenset(
+    {errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM}
+)
 
 _OP_CREATE = "__create__"
 _OP_DESTROY = "__destroy__"
@@ -144,7 +152,15 @@ class EnvServer:
     """Threaded Unix-socket server that proxies method calls to task-supplied
     env instances. Instantiable with custom paths for testability."""
 
-    def __init__(self, env_config: EnvConfig, socket_path: Path):
+    def __init__(
+        self,
+        env_config: EnvConfig,
+        socket_path: Path,
+        *,
+        max_connection_handlers: int = _MAX_CONNECTION_HANDLERS,
+    ):
+        if max_connection_handlers <= 0:
+            raise ValueError("max_connection_handlers must be positive")
         self.env_config = env_config
         self.socket_path = socket_path
         self._make_env = self._load_make_env()
@@ -154,6 +170,9 @@ class EnvServer:
         self._shutdown = threading.Event()
         self._listen_sock: socket.socket | None = None
         self._gen: str = uuid.uuid4().hex
+        self._max_connection_handlers = max_connection_handlers
+        self._handler_slots = threading.BoundedSemaphore(max_connection_handlers)
+        self._last_resource_warning = 0.0
 
     # ---- loading ------------------------------------------------------
 
@@ -219,9 +238,7 @@ class EnvServer:
                 )
         _reject_private_paths(env_kwargs)
 
-    def _handle(
-        self, msg: dict, created_instance_ids: set[int] | None = None
-    ) -> dict:
+    def _handle(self, msg: dict, created_instance_ids: set[int] | None = None) -> dict:
         if not isinstance(msg, dict):
             raise ValueError("request body must be a msgpack map")
         method = msg.get("method")
@@ -313,9 +330,7 @@ class EnvServer:
 
         raw_concurrent = getattr(instance, "_env_concurrent_methods", None)
         try:
-            concurrent = (
-                frozenset(raw_concurrent) if raw_concurrent else frozenset()
-            )
+            concurrent = frozenset(raw_concurrent) if raw_concurrent else frozenset()
         except TypeError:
             logger.warning(
                 "[ENV_SERVER] instance %d has non-iterable _env_concurrent_methods "
@@ -383,9 +398,7 @@ class EnvServer:
         except Exception as e:
             # Don't return the traceback to the agent: it carries /mcp_server
             # source lines (server runs as root over 0700). Log it server-side.
-            logger.warning(
-                "env RPC error: %s: %s", type(e).__name__, e, exc_info=True
-            )
+            logger.warning("env RPC error: %s: %s", type(e).__name__, e, exc_info=True)
             reply = {
                 "ok": False,
                 "error": {
@@ -469,6 +482,21 @@ class EnvServer:
             except OSError:
                 pass
 
+    def _run_connection(self, conn: socket.socket) -> None:
+        """Run one handler and always return its bounded concurrency slot."""
+        try:
+            self._handle_connection(conn)
+        finally:
+            self._handler_slots.release()
+
+    def _warn_resource_pressure(self, message: str, *args: object) -> None:
+        """Rate-limit warnings from an active connection flood."""
+        now = time.monotonic()
+        if now - self._last_resource_warning < _RESOURCE_WARNING_INTERVAL_S:
+            return
+        self._last_resource_warning = now
+        logger.warning(message, *args)
+
     # ---- socket / shutdown -------------------------------------------
 
     def _bind_socket(self) -> socket.socket:
@@ -503,14 +531,40 @@ class EnvServer:
             while not self._shutdown.is_set():
                 try:
                     conn, _ = self._listen_sock.accept()
-                except OSError:
+                except OSError as exc:
                     if self._shutdown.is_set():
                         break
+                    if exc.errno in _ACCEPT_RESOURCE_ERRNOS:
+                        self._warn_resource_pressure(
+                            "[ENV_SERVER] accept hit file-descriptor limit (%s); "
+                            "backing off without exiting",
+                            exc,
+                        )
+                        self._shutdown.wait(_ACCEPT_RESOURCE_BACKOFF_S)
+                        continue
                     raise
+                if not self._handler_slots.acquire(blocking=False):
+                    self._warn_resource_pressure(
+                        "[ENV_SERVER] rejecting connection at %d live-handler cap",
+                        self._max_connection_handlers,
+                    )
+                    conn.close()
+                    continue
                 t = threading.Thread(
-                    target=self._handle_connection, args=(conn,), daemon=True
+                    target=self._run_connection,
+                    args=(conn,),
+                    daemon=True,
+                    name="env_connection",
                 )
-                t.start()
+                try:
+                    t.start()
+                except (OSError, RuntimeError) as exc:
+                    conn.close()
+                    self._handler_slots.release()
+                    self._warn_resource_pressure(
+                        "[ENV_SERVER] could not start connection handler: %s",
+                        exc,
+                    )
         finally:
             try:
                 self._listen_sock.close()

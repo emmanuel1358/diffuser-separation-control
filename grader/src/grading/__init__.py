@@ -43,6 +43,7 @@ from grading.judge import LLMJudge, LLMJudgeError
 from grading.kfold import score_kfold_cv
 from grading.normalize import normalize_compute_score_return
 from grading.policy_runner import (
+    PolicyAgentFault,
     PolicyHandle,
     PolicyTimeoutError,
     PolicyWorker,
@@ -67,6 +68,7 @@ __all__ = [
     "LLMJudge",
     "LLMJudgeError",
     "PASS_THRESHOLD",
+    "PolicyAgentFault",
     "PolicyHandle",
     "PolicyTimeoutError",
     "PolicyWorker",

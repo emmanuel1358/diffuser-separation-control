@@ -8,11 +8,12 @@ import inspect
 import math
 import os
 import re
+import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal
 
 from grading.calibration import PiecewiseLinearCurve
 from grading.evaluation.context import EvaluationContext, workspace_artifact_digest
@@ -48,6 +49,11 @@ from grading.policy_runner import load_submitted_policy
 # disagree with itself in the last bits. Compare floats within this relative
 # tolerance and everything else exactly, so real nondeterminism still fails.
 REPEAT_CALL_RTOL = 1e-9
+DEFAULT_PREDICT_TIMEOUT_S = 60.0
+DEFAULT_FIRST_CALL_TIMEOUT_S = 120.0
+DEFAULT_MAX_PREDICT_ROWS = 100_000
+DEFAULT_MAX_PREDICT_REPLY_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_UNACKNOWLEDGED_NAIVE_SCORE_GAP = 0.05
 
 
 def _repeats_within_tolerance(first: Any, second: Any) -> bool:
@@ -73,18 +79,173 @@ def _repeats_within_tolerance(first: Any, second: Any) -> bool:
     return True
 
 
+def _normalize_value_domains(
+    value_domains: Mapping[str, list[Any] | tuple[Any, ...]] | None,
+) -> dict[str, tuple[Any, ...]]:
+    import numpy as np
+
+    normalized: dict[str, tuple[Any, ...]] = {}
+    for raw_column, raw_values in (value_domains or {}).items():
+        column = str(raw_column)
+        values = tuple(raw_values)
+        if not column or not values:
+            raise ValueError("value domains require non-empty columns and values")
+        for value in values:
+            if not isinstance(value, (str, bool, int, float)) or (
+                isinstance(value, (float, np.floating))
+                and not math.isfinite(float(value))
+            ):
+                raise ValueError(
+                    "value domain entries must be finite JSON scalar values"
+                )
+        normalized[column] = values
+    return dict(sorted(normalized.items()))
+
+
+@dataclass(frozen=True)
+class OneHot:
+    """Exactly one binary output is active in every prediction row."""
+
+    columns: tuple[str, ...]
+    tolerance: float = 1e-8
+
+    def __init__(
+        self,
+        columns: list[str] | tuple[str, ...],
+        *,
+        tolerance: float = 1e-8,
+    ) -> None:
+        normalized = tuple(str(column) for column in columns)
+        if len(normalized) < 2 or len(set(normalized)) != len(normalized):
+            raise ValueError("OneHot requires at least two unique columns")
+        if not math.isfinite(tolerance) or tolerance <= 0:
+            raise ValueError("OneHot tolerance must be positive and finite")
+        object.__setattr__(self, "columns", normalized)
+        object.__setattr__(self, "tolerance", float(tolerance))
+
+    def spec_dict(self) -> dict[str, Any]:
+        return {
+            "type": "one_hot.v1",
+            "columns": list(self.columns),
+            "tolerance": self.tolerance,
+        }
+
+
+@dataclass(frozen=True)
+class Simplex:
+    """Non-negative outputs whose values sum to one in every row."""
+
+    columns: tuple[str, ...]
+    tolerance: float = 1e-6
+
+    def __init__(
+        self,
+        columns: list[str] | tuple[str, ...],
+        *,
+        tolerance: float = 1e-6,
+    ) -> None:
+        normalized = tuple(str(column) for column in columns)
+        if len(normalized) < 2 or len(set(normalized)) != len(normalized):
+            raise ValueError("Simplex requires at least two unique columns")
+        if not math.isfinite(tolerance) or tolerance <= 0:
+            raise ValueError("Simplex tolerance must be positive and finite")
+        object.__setattr__(self, "columns", normalized)
+        object.__setattr__(self, "tolerance", float(tolerance))
+
+    def spec_dict(self) -> dict[str, Any]:
+        return {
+            "type": "simplex.v1",
+            "columns": list(self.columns),
+            "tolerance": self.tolerance,
+        }
+
+
+PredictionConstraint = OneHot | Simplex
+
+
+def _validate_prediction_contract(
+    frame: Any,
+    *,
+    value_domains: Mapping[str, tuple[Any, ...]],
+    constraints: tuple[PredictionConstraint, ...],
+) -> None:
+    import numpy as np
+
+    for column, allowed in value_domains.items():
+        if column not in frame.columns:
+            raise AgentFault(
+                f"prediction result is missing constrained column {column!r}"
+            )
+        invalid = ~frame[column].isin(allowed)
+        if bool(invalid.any()):
+            examples = frame.loc[invalid, column].head(3).tolist()
+            raise AgentFault(
+                f"prediction column {column!r} contains values outside its "
+                f"declared domain {list(allowed)!r}: {examples!r}"
+            )
+
+    for constraint in constraints:
+        missing = [column for column in constraint.columns if column not in frame]
+        if missing:
+            raise AgentFault(
+                f"prediction result is missing constrained columns: {missing}"
+            )
+        try:
+            values = frame[list(constraint.columns)].to_numpy(dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise AgentFault(
+                f"prediction constraint columns must be numeric: {exc}"
+            ) from exc
+        if not np.isfinite(values).all():
+            raise AgentFault("prediction constraint columns contain NaN or infinity")
+        if isinstance(constraint, OneHot):
+            binary = np.logical_or(
+                np.isclose(values, 0.0, atol=constraint.tolerance, rtol=0.0),
+                np.isclose(values, 1.0, atol=constraint.tolerance, rtol=0.0),
+            )
+            valid = binary.all(axis=1) & np.isclose(
+                values.sum(axis=1),
+                1.0,
+                atol=constraint.tolerance,
+                rtol=0.0,
+            )
+            kind = "one-hot"
+        else:
+            valid = (
+                (values >= -constraint.tolerance).all(axis=1)
+                & (values <= 1.0 + constraint.tolerance).all(axis=1)
+                & np.isclose(
+                    values.sum(axis=1),
+                    1.0,
+                    atol=constraint.tolerance,
+                    rtol=0.0,
+                )
+            )
+            kind = "simplex"
+        if not bool(valid.all()):
+            raise AgentFault(
+                f"prediction violates {kind} constraint over "
+                f"{list(constraint.columns)!r} in {int((~valid).sum())} row(s)"
+            )
+
+
 @dataclass(frozen=True)
 class CsvRows:
     path: str
     columns: tuple[str, ...]
-    allow_extra_columns: bool = False
+    extra_columns: Literal["reject", "drop", "preserve"] = "reject"
+    value_domains: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
+    constraints: tuple[PredictionConstraint, ...] = ()
 
     def __init__(
         self,
         path: str,
         *,
         columns: list[str] | tuple[str, ...],
-        allow_extra_columns: bool = False,
+        extra_columns: Literal["reject", "drop", "preserve"] | None = None,
+        allow_extra_columns: bool | None = None,
+        value_domains: Mapping[str, list[Any] | tuple[Any, ...]] | None = None,
+        constraints: list[PredictionConstraint] | tuple[PredictionConstraint, ...] = (),
     ) -> None:
         normalized = tuple(str(column) for column in columns)
         if not path or Path(path).is_absolute() or ".." in Path(path).parts:
@@ -93,16 +254,63 @@ class CsvRows:
             )
         if not normalized or any(not column for column in normalized):
             raise ValueError("CSV artifact columns must be non-empty")
+        if allow_extra_columns is not None:
+            if extra_columns is not None:
+                raise ValueError(
+                    "pass either extra_columns or allow_extra_columns, not both"
+                )
+            extra_policy = "preserve" if allow_extra_columns else "reject"
+        else:
+            extra_policy = extra_columns or "reject"
+        if extra_policy not in {"reject", "drop", "preserve"}:
+            raise ValueError("extra_columns must be 'reject', 'drop', or 'preserve'")
+        domains = _normalize_value_domains(value_domains)
+        normalized_constraints = tuple(constraints)
+        constrained_columns = set(domains)
+        for constraint in normalized_constraints:
+            if not isinstance(constraint, (OneHot, Simplex)):
+                raise TypeError("unsupported prediction constraint")
+            constrained_columns.update(constraint.columns)
+        undeclared = sorted(constrained_columns - set(normalized))
+        if undeclared:
+            raise ValueError(
+                f"prediction constraints reference undeclared CSV columns: {undeclared}"
+            )
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "columns", normalized)
-        object.__setattr__(self, "allow_extra_columns", bool(allow_extra_columns))
+        object.__setattr__(self, "extra_columns", extra_policy)
+        object.__setattr__(self, "value_domains", domains)
+        object.__setattr__(self, "constraints", normalized_constraints)
+
+    @property
+    def allow_extra_columns(self) -> bool:
+        """Compatibility view for legacy callers."""
+        return self.extra_columns == "preserve"
 
     def spec_dict(self) -> dict[str, Any]:
+        return {
+            "type": "csv_rows.v2",
+            "path": self.path,
+            "columns": list(self.columns),
+            "extra_columns": self.extra_columns,
+            "value_domains": {
+                column: list(values)
+                for column, values in sorted(self.value_domains.items())
+            },
+            "constraints": [constraint.spec_dict() for constraint in self.constraints],
+        }
+
+    def legacy_spec_dict(self) -> dict[str, Any] | None:
+        """V1 identity for default-only descriptors during lock migration."""
+        if self.extra_columns not in {"reject", "preserve"}:
+            return None
+        if self.value_domains or self.constraints:
+            return None
         return {
             "type": "csv_rows.v1",
             "path": self.path,
             "columns": list(self.columns),
-            "allow_extra_columns": self.allow_extra_columns,
+            "allow_extra_columns": self.extra_columns == "preserve",
         }
 
 
@@ -113,6 +321,14 @@ class PythonPredictor:
     path: str = "predictor.py"
     factory_name: str = "load_predictor"
     method: str = "predict"
+    predict_timeout_s: float = DEFAULT_PREDICT_TIMEOUT_S
+    first_call_timeout_s: float = DEFAULT_FIRST_CALL_TIMEOUT_S
+    max_rows: int = DEFAULT_MAX_PREDICT_ROWS
+    max_reply_bytes: int = DEFAULT_MAX_PREDICT_REPLY_BYTES
+    prediction_scope: Literal["batch_allowed", "row_independent"] = "batch_allowed"
+    row_independence_partitions: int = 3
+    value_domains: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
+    constraints: tuple[PredictionConstraint, ...] = ()
 
     def __post_init__(self) -> None:
         relative = Path(self.path)
@@ -124,8 +340,66 @@ class PythonPredictor:
             or not self.method
         ):
             raise ValueError("invalid Python predictor artifact descriptor")
+        if (
+            not math.isfinite(self.predict_timeout_s)
+            or self.predict_timeout_s <= 0
+            or not math.isfinite(self.first_call_timeout_s)
+            or self.first_call_timeout_s <= 0
+        ):
+            raise ValueError("predictor timeouts must be positive and finite")
+        if self.max_rows <= 0 or self.max_reply_bytes <= 0:
+            raise ValueError("predictor row and reply budgets must be positive")
+        if self.prediction_scope not in {"batch_allowed", "row_independent"}:
+            raise ValueError(
+                "prediction_scope must be 'batch_allowed' or 'row_independent'"
+            )
+        if self.row_independence_partitions < 2:
+            raise ValueError("row_independence_partitions must be at least two")
+        domains = _normalize_value_domains(self.value_domains)
+        constraints = tuple(self.constraints)
+        if any(not isinstance(item, (OneHot, Simplex)) for item in constraints):
+            raise TypeError("unsupported prediction constraint")
+        object.__setattr__(self, "predict_timeout_s", float(self.predict_timeout_s))
+        object.__setattr__(
+            self, "first_call_timeout_s", float(self.first_call_timeout_s)
+        )
+        object.__setattr__(self, "max_rows", int(self.max_rows))
+        object.__setattr__(self, "max_reply_bytes", int(self.max_reply_bytes))
+        object.__setattr__(self, "value_domains", domains)
+        object.__setattr__(self, "constraints", constraints)
 
     def spec_dict(self) -> dict[str, Any]:
+        return {
+            "type": "python_predictor.v2",
+            "path": self.path,
+            "factory_name": self.factory_name,
+            "method": self.method,
+            "predict_timeout_s": self.predict_timeout_s,
+            "first_call_timeout_s": self.first_call_timeout_s,
+            "max_rows": self.max_rows,
+            "max_reply_bytes": self.max_reply_bytes,
+            "prediction_scope": self.prediction_scope,
+            "row_independence_partitions": self.row_independence_partitions,
+            "value_domains": {
+                column: list(values)
+                for column, values in sorted(self.value_domains.items())
+            },
+            "constraints": [constraint.spec_dict() for constraint in self.constraints],
+        }
+
+    def legacy_spec_dict(self) -> dict[str, Any] | None:
+        """V1 identity when every newly declared contract keeps its default."""
+        if (
+            self.predict_timeout_s != DEFAULT_PREDICT_TIMEOUT_S
+            or self.first_call_timeout_s != DEFAULT_FIRST_CALL_TIMEOUT_S
+            or self.max_rows != DEFAULT_MAX_PREDICT_ROWS
+            or self.max_reply_bytes != DEFAULT_MAX_PREDICT_REPLY_BYTES
+            or self.prediction_scope != "batch_allowed"
+            or self.row_independence_partitions != 3
+            or self.value_domains
+            or self.constraints
+        ):
+            return None
         return {
             "type": "python_predictor.v1",
             "path": self.path,
@@ -140,14 +414,18 @@ class PrivateTableChallenge:
 
     filename: str
     feature_columns: tuple[str, ...]
-    sample_size: int
+    sample_size: int | None
+    selection_policy: Literal["artifact_digest", "full_bank", "stable_subset"]
 
     def __init__(
         self,
         filename: str,
         *,
         feature_columns: list[str] | tuple[str, ...],
-        sample_size: int,
+        sample_size: int | None = None,
+        selection_policy: (
+            Literal["artifact_digest", "full_bank", "stable_subset"] | None
+        ) = None,
     ) -> None:
         relative = Path(filename)
         columns = tuple(str(column) for column in feature_columns)
@@ -157,14 +435,42 @@ class PrivateTableChallenge:
             or ".." in relative.parts
             or not columns
             or any(not column for column in columns)
-            or sample_size < 32
         ):
             raise ValueError("invalid private table challenge descriptor")
+        policy = selection_policy or (
+            "full_bank" if sample_size is None else "artifact_digest"
+        )
+        if policy not in {"artifact_digest", "full_bank", "stable_subset"}:
+            raise ValueError(
+                "selection_policy must be 'artifact_digest', 'full_bank', "
+                "or 'stable_subset'"
+            )
+        if policy == "full_bank" and sample_size is not None:
+            raise ValueError("full_bank selection must not declare sample_size")
+        if policy in {"artifact_digest", "stable_subset"} and (
+            sample_size is None or sample_size < 32
+        ):
+            raise ValueError("subset selection requires sample_size of at least 32")
         object.__setattr__(self, "filename", filename)
         object.__setattr__(self, "feature_columns", columns)
-        object.__setattr__(self, "sample_size", int(sample_size))
+        object.__setattr__(
+            self, "sample_size", int(sample_size) if sample_size is not None else None
+        )
+        object.__setattr__(self, "selection_policy", policy)
 
     def spec_dict(self) -> dict[str, Any]:
+        return {
+            "type": "private_table.v2",
+            "filename": self.filename,
+            "feature_columns": list(self.feature_columns),
+            "sample_size": self.sample_size,
+            "selection_policy": self.selection_policy,
+        }
+
+    def legacy_spec_dict(self) -> dict[str, Any] | None:
+        """V1 identity for an explicitly sized challenge during migration."""
+        if self.sample_size is None or self.selection_policy != "artifact_digest":
+            return None
         return {
             "type": "private_table.v1",
             "filename": self.filename,
@@ -246,14 +552,54 @@ class WorkspaceDegenerateProbes:
 class GeneratedCalibration:
     filename: str = DEFAULT_LOCK_FILENAME
     degenerate_probes: WorkspaceDegenerateProbes | None = None
+    max_unacknowledged_naive_score_gap: float = (
+        DEFAULT_MAX_UNACKNOWLEDGED_NAIVE_SCORE_GAP
+    )
+    naive_semantic_gap_acknowledgement: AnchorRationale | None = None
 
     def __post_init__(self) -> None:
         if self.filename != DEFAULT_LOCK_FILENAME:
             raise ValueError(
                 f"generated calibration filename is fixed to {DEFAULT_LOCK_FILENAME!r}"
             )
+        if (
+            not math.isfinite(self.max_unacknowledged_naive_score_gap)
+            or not 0 <= self.max_unacknowledged_naive_score_gap < 0.5
+        ):
+            raise ValueError(
+                "max_unacknowledged_naive_score_gap must be finite in [0, 0.5)"
+            )
+        acknowledgement = self.naive_semantic_gap_acknowledgement
+        if acknowledgement is not None and acknowledgement.kind != "reviewed_exception":
+            raise ValueError(
+                "naive semantic gap acknowledgement must use "
+                "kind='reviewed_exception'"
+            )
 
     def spec_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "type": "generated_lock.v2",
+            "filename": self.filename,
+            "max_unacknowledged_naive_score_gap": (
+                self.max_unacknowledged_naive_score_gap
+            ),
+        }
+        if self.degenerate_probes is not None:
+            payload["degenerate_probes"] = self.degenerate_probes.spec_dict()
+        if self.naive_semantic_gap_acknowledgement is not None:
+            payload["naive_semantic_gap_acknowledgement"] = (
+                self.naive_semantic_gap_acknowledgement.spec_dict()
+            )
+        return payload
+
+    def legacy_spec_dict(self) -> dict[str, Any] | None:
+        """V1 identity when the new semantic-gap policy keeps its defaults."""
+        if (
+            self.max_unacknowledged_naive_score_gap
+            != DEFAULT_MAX_UNACKNOWLEDGED_NAIVE_SCORE_GAP
+            or self.naive_semantic_gap_acknowledgement is not None
+        ):
+            return None
         payload: dict[str, Any] = {
             "type": "generated_lock.v1",
             "filename": self.filename,
@@ -450,6 +796,27 @@ class ContinuousTask:
                     "private challenge features must not include target truth "
                     f"columns: {leaked}"
                 )
+        if isinstance(artifact, PythonPredictor):
+            prediction_columns = {
+                target.prediction_column for target in normalized_targets
+            }
+            constrained_columns = set(artifact.value_domains)
+            for constraint in artifact.constraints:
+                constrained_columns.update(constraint.columns)
+            undeclared = sorted(constrained_columns - prediction_columns)
+            if undeclared:
+                raise ValueError(
+                    "predictor constraints reference columns that are not target "
+                    f"predictions: {undeclared}"
+                )
+            if (
+                challenge is not None
+                and challenge.sample_size is not None
+                and challenge.sample_size > artifact.max_rows
+            ):
+                raise ValueError(
+                    "private challenge sample_size exceeds predictor max_rows"
+                )
         normalize_weights(normalized_targets)
         if not naive or Path(naive).is_absolute() or ".." in Path(naive).parts:
             raise ValueError("naive strategy path must be task-relative")
@@ -510,7 +877,7 @@ class ContinuousTask:
 
     def spec_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": "continuous-task.v2",
+            "schema_version": "continuous-task.v3",
             "artifact": self.artifact.spec_dict() if self.artifact else None,
             "challenge": self.challenge.spec_dict() if self.challenge else None,
             "targets": [target.spec_dict() for target in self.targets],
@@ -541,10 +908,56 @@ class ContinuousTask:
     def spec_sha256(self) -> str:
         return hashlib.sha256(canonical_json_bytes(self.spec_dict())).hexdigest()
 
+    def legacy_spec_dict(self) -> dict[str, Any] | None:
+        """Return the pre-v3 task identity when only default contracts changed."""
+        if self.artifact is None:
+            artifact_spec = None
+        else:
+            artifact_spec = self.artifact.legacy_spec_dict()
+            if artifact_spec is None:
+                return None
+        if self.challenge is None:
+            challenge_spec = None
+        else:
+            challenge_spec = self.challenge.legacy_spec_dict()
+            if challenge_spec is None:
+                return None
+        calibration_spec = self.calibration.legacy_spec_dict()
+        if calibration_spec is None:
+            return None
+
+        payload = self.spec_dict()
+        payload.update(
+            schema_version="continuous-task.v2",
+            artifact=artifact_spec,
+            challenge=challenge_spec,
+            calibration=calibration_spec,
+        )
+        return payload
+
+    @property
+    def legacy_spec_sha256(self) -> str | None:
+        payload = self.legacy_spec_dict()
+        if payload is None:
+            return None
+        return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
     @property
     def evaluation_plan(self) -> EvaluationPlan:
         return EvaluationPlan(
             task_spec_sha256=self.spec_sha256,
+            security_tier=self.security_tier,
+            evidence=self.evidence.spec_dict() if self.evidence else {"type": "custom"},
+            metric_ids=tuple(target.metric_id for target in self.targets),
+        )
+
+    @property
+    def legacy_evaluation_plan(self) -> EvaluationPlan | None:
+        legacy_digest = self.legacy_spec_sha256
+        if legacy_digest is None:
+            return None
+        return EvaluationPlan(
+            task_spec_sha256=legacy_digest,
             security_tier=self.security_tier,
             evidence=self.evidence.spec_dict() if self.evidence else {"type": "custom"},
             metric_ids=tuple(target.metric_id for target in self.targets),
@@ -556,6 +969,36 @@ class ContinuousTask:
         payload = {
             "artifact": self.artifact.spec_dict() if self.artifact else None,
             "challenge": self.challenge.spec_dict() if self.challenge else None,
+            "targets": [
+                {
+                    "name": target.name,
+                    "metric_id": target.metric_id,
+                    "prediction_column": target.prediction_column,
+                    "truth_column": target.truth_column,
+                }
+                for target in self.targets
+            ],
+            "evidence": self.evidence.spec_dict() if self.evidence else None,
+        }
+        return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+    @property
+    def legacy_challenge_sha256(self) -> str | None:
+        if self.artifact is None:
+            artifact_spec = None
+        else:
+            artifact_spec = self.artifact.legacy_spec_dict()
+            if artifact_spec is None:
+                return None
+        if self.challenge is None:
+            challenge_spec = None
+        else:
+            challenge_spec = self.challenge.legacy_spec_dict()
+            if challenge_spec is None:
+                return None
+        payload = {
+            "artifact": artifact_spec,
+            "challenge": challenge_spec,
             "targets": [
                 {
                     "name": target.name,
@@ -595,7 +1038,10 @@ class ContinuousTask:
         missing = sorted(required - set(bank.columns))
         if missing:
             raise RuntimeError(f"private challenge is missing columns: {missing}")
-        if len(bank) < self.challenge.sample_size:
+        if (
+            self.challenge.sample_size is not None
+            and len(bank) < self.challenge.sample_size
+        ):
             raise RuntimeError(
                 f"private challenge has {len(bank)} rows, needs "
                 f"{self.challenge.sample_size}"
@@ -606,38 +1052,40 @@ class ContinuousTask:
             committed_digest = workspace_artifact_digest(workspace)
         except (OSError, ValueError) as exc:
             raise AgentFault(f"could not commit submitted artifact: {exc}") from exc
+        challenge_digest = (
+            self.legacy_challenge_sha256
+            if self.challenge.selection_policy == "artifact_digest"
+            and self.legacy_challenge_sha256 is not None
+            else self.challenge_sha256
+        )
         context = EvaluationContext.create_from_artifact_digest(
-            task_digest=self.challenge_sha256,
+            task_digest=challenge_digest,
             candidate_digest=committed_digest,
         )
         import numpy as np
 
-        rng = np.random.default_rng(context.seed("private-table-selection"))
-        indices = rng.choice(
-            len(bank),
-            size=self.challenge.sample_size,
-            replace=False,
-        )
-        selected = bank.iloc[indices].reset_index(drop=True)
+        if self.challenge.selection_policy == "full_bank":
+            selected = bank.reset_index(drop=True)
+        else:
+            assert self.challenge.sample_size is not None
+            seed = (
+                context.selection_seed("private-table-selection")
+                if self.challenge.selection_policy == "stable_subset"
+                else context.seed("private-table-selection")
+            )
+            rng = np.random.default_rng(seed)
+            indices = rng.choice(
+                len(bank),
+                size=self.challenge.sample_size,
+                replace=False,
+            )
+            selected = bank.iloc[indices].reset_index(drop=True)
+        if len(selected) > self.artifact.max_rows:
+            raise RuntimeError(
+                f"private challenge selected {len(selected)} rows, exceeding "
+                f"predictor max_rows={self.artifact.max_rows}"
+            )
         features = selected[list(self.challenge.feature_columns)]
-
-        predictor = load_submitted_policy(
-            artifact_path,
-            factory_name=self.artifact.factory_name,
-            timeout_s=60.0,
-        )
-        try:
-            method = getattr(predictor, self.artifact.method)
-            raw = method(features.to_dict(orient="records"))
-            repeated_raw = method(features.to_dict(orient="records"))
-        except AgentFault:
-            raise
-        except Exception as exc:
-            raise AgentFault(
-                f"submitted predictor failed: {type(exc).__name__}: {exc}"
-            ) from exc
-        finally:
-            predictor.close()
 
         def _prediction_frame(value: Any):
             if isinstance(value, list) and value and isinstance(value[0], Mapping):
@@ -649,11 +1097,37 @@ class ContinuousTask:
                 "or a list of row mappings"
             )
 
+        def _load_predictor():
+            return load_submitted_policy(
+                artifact_path,
+                factory_name=self.artifact.factory_name,
+                timeout_s=self.artifact.predict_timeout_s,
+                first_call_timeout_s=self.artifact.first_call_timeout_s,
+                max_reply_bytes=self.artifact.max_reply_bytes,
+            )
+
+        records = features.to_dict(orient="records")
+        started = time.monotonic()
+        predictor = None
         try:
+            predictor = _load_predictor()
+            method = getattr(predictor, self.artifact.method)
+            raw = method(records)
+            repeated_raw = method(records)
             submission = _prediction_frame(raw)
             repeated = _prediction_frame(repeated_raw)
+        except AgentFault:
+            raise
         except Exception as exc:
-            raise AgentFault(f"predict() returned an invalid table: {exc}") from exc
+            elapsed = time.monotonic() - started
+            raise AgentFault(
+                "submitted predictor failed "
+                f"(artifact={committed_digest}, elapsed={elapsed:.3f}s): "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        finally:
+            if predictor is not None:
+                predictor.close()
         if not _repeats_within_tolerance(submission, repeated):
             raise AgentFault(
                 "predict() is not deterministic for an identical challenge batch"
@@ -678,6 +1152,76 @@ class ContinuousTask:
             if not np.isfinite(values).all():
                 raise AgentFault(
                     f"predict() target {column!r} contains NaN or infinity"
+                )
+
+        _validate_prediction_contract(
+            submission,
+            value_domains=self.artifact.value_domains,
+            constraints=self.artifact.constraints,
+        )
+
+        if self.artifact.prediction_scope == "row_independent":
+            permutation = np.random.default_rng(
+                context.selection_seed("row-independence-partitions")
+            ).permutation(len(features))
+            chunks = [
+                chunk
+                for chunk in np.array_split(
+                    permutation,
+                    min(self.artifact.row_independence_partitions, len(features)),
+                )
+                if len(chunk)
+            ]
+            partition_frames = []
+            for partition_index, positions in enumerate(chunks):
+                partition_records = features.iloc[positions].to_dict(orient="records")
+                partition_started = time.monotonic()
+                partition_predictor = None
+                try:
+                    partition_predictor = _load_predictor()
+                    partition_method = getattr(
+                        partition_predictor, self.artifact.method
+                    )
+                    partition = _prediction_frame(partition_method(partition_records))
+                except AgentFault:
+                    raise
+                except Exception as exc:
+                    elapsed = time.monotonic() - partition_started
+                    raise AgentFault(
+                        "submitted predictor failed row-independence probe "
+                        f"{partition_index} (artifact={committed_digest}, "
+                        f"elapsed={elapsed:.3f}s): {type(exc).__name__}: {exc}"
+                    ) from exc
+                finally:
+                    if partition_predictor is not None:
+                        partition_predictor.close()
+                if len(partition) != len(positions):
+                    raise AgentFault(
+                        "predict() returned the wrong row count for a "
+                        "row-independence partition"
+                    )
+                missing_partition = sorted(
+                    set(prediction_columns) - set(partition.columns)
+                )
+                if missing_partition:
+                    raise AgentFault(
+                        "predict() partition result is missing target columns: "
+                        f"{missing_partition}"
+                    )
+                projected = partition[prediction_columns].copy()
+                projected.index = positions
+                partition_frames.append(projected)
+            partitioned = (
+                pd.concat(partition_frames).sort_index().reset_index(drop=True)
+            )
+            if not _repeats_within_tolerance(
+                submission[prediction_columns].reset_index(drop=True),
+                partitioned,
+            ):
+                raise AgentFault(
+                    "predict() violates prediction_scope='row_independent': "
+                    "outputs changed when rows were shuffled into fresh-worker "
+                    "partitions"
                 )
         truth = selected[[target.truth_column for target in self.targets]].copy()
         return submission[prediction_columns], truth, context
@@ -714,7 +1258,12 @@ class ContinuousTask:
             required_columns=self.artifact.columns,
             numeric_columns=self.artifact.columns,
             n_rows=len(truth),
-            allow_extra_columns=self.artifact.allow_extra_columns,
+            extra_columns=self.artifact.extra_columns,
+        )
+        _validate_prediction_contract(
+            submission,
+            value_domains=self.artifact.value_domains,
+            constraints=self.artifact.constraints,
         )
         return submission, truth
 
@@ -810,6 +1359,14 @@ class ContinuousTask:
                 if self.naive_at_floor is not None
                 else None
             ),
+            max_unacknowledged_naive_score_gap=(
+                self.calibration.max_unacknowledged_naive_score_gap
+            ),
+            naive_semantic_gap_acknowledgement=(
+                self.calibration.naive_semantic_gap_acknowledgement.spec_dict()
+                if self.calibration.naive_semantic_gap_acknowledgement is not None
+                else None
+            ),
         )
 
     def score_metrics(
@@ -817,9 +1374,15 @@ class ContinuousTask:
         metrics: Mapping[str, Any],
         lock: CalibrationLock,
     ) -> tuple[float, dict[str, float], float]:
-        if lock.payload.get("task_spec_sha256") != self.spec_sha256:
+        accepted_task_digests = {self.spec_sha256}
+        if self.legacy_spec_sha256 is not None:
+            accepted_task_digests.add(self.legacy_spec_sha256)
+        if lock.payload.get("task_spec_sha256") not in accepted_task_digests:
             raise RuntimeError("calibration lock does not match the TASK registration")
-        if lock.payload.get("evaluation_plan_sha256") != self.evaluation_plan.sha256:
+        accepted_plan_digests = {self.evaluation_plan.sha256}
+        if self.legacy_evaluation_plan is not None:
+            accepted_plan_digests.add(self.legacy_evaluation_plan.sha256)
+        if lock.payload.get("evaluation_plan_sha256") not in accepted_plan_digests:
             raise RuntimeError(
                 "calibration lock does not match the current evaluation plan"
             )
@@ -910,6 +1473,11 @@ class ContinuousTask:
         lock = load_calibration_lock(
             filename=self.calibration.filename,
             task_spec_sha256=self.spec_sha256,
+            compatible_task_spec_sha256s=(
+                (self.legacy_spec_sha256,)
+                if self.legacy_spec_sha256 is not None
+                else ()
+            ),
         )
         _quality_score, quality_progress, _quality_aggregate = self.score_metrics(
             metrics, lock
@@ -1025,6 +1593,11 @@ class ContinuousTask:
         lock = load_calibration_lock(
             filename=self.calibration.filename,
             task_spec_sha256=self.spec_sha256,
+            compatible_task_spec_sha256s=(
+                (self.legacy_spec_sha256,)
+                if self.legacy_spec_sha256 is not None
+                else ()
+            ),
         )
         final, progress, aggregate = self.score_metrics(metrics, lock)
         return {

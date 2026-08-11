@@ -24,7 +24,7 @@ import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -404,18 +404,34 @@ def load_submission_or_fault(
     max_bytes: int = _DEFAULT_MAX_SUBMISSION_BYTES,
     max_uncompressed_bytes: int = _DEFAULT_MAX_CSV_UNCOMPRESSED_BYTES,
     read_csv_kwargs: dict[str, Any] | None = None,
-    allow_extra_columns: bool = False,
+    extra_columns: Literal["reject", "drop", "preserve"] | None = None,
+    allow_extra_columns: bool | None = None,
 ):
     """Read an agent CSV submission, raising ``AgentFault`` for bad outputs.
 
     This closes common free-veto paths: symlinks to hidden data, FIFOs that
     hang grading, oversized files that OOM the verifier, malformed CSV, missing
     columns, non-finite values, duplicate merge keys, and unexpected columns.
+
+    ``extra_columns="drop"`` is the safe tolerant mode: undeclared
+    agent-controlled fields are removed before the frame reaches trusted joins.
+    ``allow_extra_columns`` remains as a compatibility alias for
+    ``"preserve"``/``"reject"`` and cannot be combined with ``extra_columns``.
     """
     import pandas as pd
 
     if min(max_bytes, max_uncompressed_bytes) <= 0:
         raise ValueError("CSV byte limits must be positive")
+    if allow_extra_columns is not None:
+        if extra_columns is not None:
+            raise ValueError(
+                "pass either extra_columns or allow_extra_columns, not both"
+            )
+        extra_policy = "preserve" if allow_extra_columns else "reject"
+    else:
+        extra_policy = extra_columns or "reject"
+    if extra_policy not in {"reject", "drop", "preserve"}:
+        raise ValueError("extra_columns must be 'reject', 'drop', or 'preserve'")
     csv_kwargs = dict(read_csv_kwargs or {})
     try:
         with regular_file_snapshot(path, max_bytes=max_bytes) as snapshot:
@@ -476,23 +492,120 @@ def load_submission_or_fault(
                 f"column {unique_key_column!r}; expected one row per key"
             )
 
-    if not allow_extra_columns and (required is not None or numeric is not None):
-        expected: set[str] = set()
+    if required is not None or numeric is not None or unique_key_column is not None:
+        expected_order: list[str] = []
         if required is not None:
-            expected.update(required)
+            expected_order.extend(required)
         if numeric is not None:
-            expected.update(numeric)
+            expected_order.extend(numeric)
         if unique_key_column is not None:
-            expected.add(unique_key_column)
+            expected_order.append(unique_key_column)
+        expected_order = list(dict.fromkeys(expected_order))
+        expected = set(expected_order)
         extra = [column for column in df.columns if column not in expected]
-        if extra:
+        if extra and extra_policy == "reject":
             raise AgentFault(
                 f"submission has unexpected column(s) {extra}; expected "
-                f"exactly {sorted(expected)}. Pass allow_extra_columns=True "
-                "if extra columns are intended."
+                f"exactly {sorted(expected)}. Pass extra_columns='drop' to "
+                "ignore undeclared fields safely."
             )
+        if extra_policy == "drop":
+            df = df[expected_order].copy()
 
     return df
+
+
+def join_submission_to_truth_or_fault(
+    submission: Any,
+    truth: Any,
+    *,
+    key_column: str,
+    prediction_columns: Iterable[str],
+    truth_columns: Iterable[str],
+    truth_suffix: str = "_truth",
+):
+    """Safely join declared prediction fields to trusted truth by one key.
+
+    Both frames are projected before the merge, so an agent cannot introduce a
+    column that collides with a trusted field and changes suffix resolution.
+    Candidate key omissions, additions, and duplicates are ``AgentFault``;
+    malformed trusted truth is a ``GraderFault``.
+    """
+    import pandas as pd
+
+    predictions = list(dict.fromkeys(str(c) for c in prediction_columns))
+    trusted = list(dict.fromkeys(str(c) for c in truth_columns))
+    if not key_column or not predictions or not trusted:
+        raise ValueError(
+            "key_column, prediction_columns, and truth_columns must be non-empty"
+        )
+    if not truth_suffix:
+        raise ValueError("truth_suffix must be non-empty")
+
+    missing_submission = [
+        column
+        for column in (key_column, *predictions)
+        if column not in submission.columns
+    ]
+    if missing_submission:
+        raise AgentFault(f"submission missing join column(s): {missing_submission}")
+    missing_truth = [
+        column for column in (key_column, *trusted) if column not in truth.columns
+    ]
+    if missing_truth:
+        raise GraderFault(f"trusted truth missing join column(s): {missing_truth}")
+
+    candidate = submission[[key_column, *predictions]].copy()
+    expected = truth[[key_column, *trusted]].copy()
+    try:
+        pd.util.hash_pandas_object(candidate[key_column], index=False)
+    except (TypeError, ValueError) as exc:
+        raise AgentFault(
+            f"submission join key {key_column!r} is not safely hashable: {exc}"
+        ) from exc
+    try:
+        pd.util.hash_pandas_object(expected[key_column], index=False)
+    except (TypeError, ValueError) as exc:
+        raise GraderFault(
+            f"trusted truth join key {key_column!r} is not safely hashable: {exc}"
+        ) from exc
+    duplicate_candidates = int(candidate[key_column].duplicated().sum())
+    if duplicate_candidates:
+        raise AgentFault(
+            f"submission has {duplicate_candidates} duplicate join key(s) in "
+            f"{key_column!r}"
+        )
+    duplicate_truth = int(expected[key_column].duplicated().sum())
+    if duplicate_truth:
+        raise GraderFault(
+            f"trusted truth has {duplicate_truth} duplicate join key(s) in "
+            f"{key_column!r}"
+        )
+
+    try:
+        merged = pd.merge(
+            candidate,
+            expected,
+            on=key_column,
+            how="outer",
+            suffixes=("", truth_suffix),
+            validate="one_to_one",
+            indicator=True,
+            sort=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise AgentFault(f"submission prediction join failed: {exc}") from exc
+    except Exception as exc:
+        raise GraderFault(f"trusted prediction join failed: {exc}") from exc
+
+    missing_candidate = int((merged["_merge"] == "right_only").sum())
+    unexpected_candidate = int((merged["_merge"] == "left_only").sum())
+    if missing_candidate or unexpected_candidate:
+        raise AgentFault(
+            "submission join keys do not match trusted truth: "
+            f"{missing_candidate} missing, {unexpected_candidate} unexpected"
+        )
+    return merged.drop(columns="_merge")
 
 
 def _reject_npz_decompression_bomb(
@@ -963,12 +1076,24 @@ def _submitted_process_preexec(
 ):
     """Isolate IPC, enter a pinned cwd, and irreversibly drop privileges."""
     from grading.policy_runner import _agent_preexec
+    from grading.runtime_hardening import child_memory_limit_bytes
+
+    try:
+        memory_limit_bytes = child_memory_limit_bytes(
+            env_keys=(
+                "RUBRIC_POLICY_MEMORY_LIMIT_BYTES",
+                "RUBRIC_AGENT_MEMORY_LIMIT_BYTES",
+            )
+        )
+    except ValueError as exc:
+        raise GraderFault(f"invalid submitted-process memory limit: {exc}") from exc
 
     return _agent_preexec(
         uid,
         gid,
         ipc_status_fd=ipc_status_fd,
         cwd_fd=cwd_fd,
+        memory_limit_bytes=memory_limit_bytes,
     )
 
 
@@ -1755,6 +1880,7 @@ __all__ = [
     "file_contains",
     "file_exists",
     "jaccard",
+    "join_submission_to_truth_or_fault",
     "json_path",
     "kendall_tau",
     "load_json",

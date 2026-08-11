@@ -225,7 +225,11 @@ def _container_script_prefix(problem: HarnessProblem, *, skip_solve: bool) -> li
     if not skip_solve and _hidden_env_mode(problem) in {"env", "hybrid"}:
         lines.extend(
             [
-                "python -m env_server &",
+                "cd /",
+                "env -u PYTHONPATH -u PYTHONHOME "
+                "PATH=/opt/lbx-runtime/.venv/bin:/opt/conda/bin:"
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "
+                "PYTHONSAFEPATH=1 python -P -m env_server &",
                 "ENV_PID=$!",
                 "for _i in $(seq 1 120); do "
                 "[ -S /tmp/env.sock ] && break; sleep 0.25; done",

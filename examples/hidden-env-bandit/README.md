@@ -8,7 +8,7 @@ alongside [docs/HIDDEN_ENV.md](../../docs/HIDDEN_ENV.md).
 ## What it demonstrates
 
 - `[environment].hidden_env = "env"` activates the `env_server` (the rubric MCP
-  server spawns `python -m env_server` at boot).
+  server safely spawns `python -P -m env_server` from root-owned `/` at boot).
 - The hidden env lives at `scorer/data/env.py` (baked root-only to
   `/mcp_server/data/env.py`); the agent can call `make_env()` over
   `/tmp/env.sock` but cannot read the source or the per-arm means.

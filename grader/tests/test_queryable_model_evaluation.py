@@ -3,18 +3,21 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
-
 from grading.evaluation import (
     AnchorRationale,
     ContinuousTask,
     FloorAnchor,
     GeneratedCalibration,
     IIDPermutationEvidence,
+    OneHot,
     PopulationSRETarget,
     PrivateTableChallenge,
     PythonPredictor,
+    Simplex,
     write_calibration_lock_atomic,
 )
+from grading.evaluation.author import _validate_prediction_contract
+from grading.evaluation.context import EvaluationContext
 from grading.faults import AgentFault
 
 
@@ -25,6 +28,7 @@ def _task() -> ContinuousTask:
             "challenge.parquet",
             feature_columns=["x"],
             sample_size=120,
+            selection_policy="stable_subset",
         ),
         targets=[
             PopulationSRETarget.lower(
@@ -48,7 +52,7 @@ def _task() -> ContinuousTask:
     )
 
 
-def _prepare(tmp_path, monkeypatch):
+def _prepare(tmp_path, monkeypatch, *, task=None):
     private = tmp_path / "private"
     workspace = tmp_path / "workspace"
     private.mkdir()
@@ -57,7 +61,7 @@ def _prepare(tmp_path, monkeypatch):
     pd.DataFrame({"x": x, "target": 2.0 * x + 0.3}).to_parquet(
         private / "challenge.parquet", index=False
     )
-    task = _task()
+    task = task or _task()
     lock = task.build_lock(
         reference_metrics={"target": 0.05},
         naive_metrics={"target": 0.95},
@@ -183,8 +187,12 @@ def test_private_nonce_changes_challenge_commitment(tmp_path, monkeypatch) -> No
     monkeypatch.setenv("LBX_EVALUATION_PLAN_ATTESTED", "1")
     monkeypatch.setenv("LBX_EVALUATION_NONCE", "attempt-a")
     first = task.compute_score(workspace=workspace, private=private)
+    _, first_truth, _ = task._load_model_challenge(workspace=workspace, private=private)
     monkeypatch.setenv("LBX_EVALUATION_NONCE", "attempt-b")
     second = task.compute_score(workspace=workspace, private=private)
+    _, second_truth, _ = task._load_model_challenge(
+        workspace=workspace, private=private
+    )
 
     assert (
         first["metadata"]["evaluation"]["seed_commitment"]
@@ -192,6 +200,115 @@ def test_private_nonce_changes_challenge_commitment(tmp_path, monkeypatch) -> No
     )
     assert first["metadata"]["evaluation"]["attested"] is True
     assert second["metadata"]["evaluation"]["attested"] is True
+    pd.testing.assert_frame_equal(first_truth, second_truth)
+
+
+def test_evaluation_context_replay_verifies_artifact_and_reuses_nonce(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("LBX_EVALUATION_PLAN_ATTESTED", "1")
+    monkeypatch.setenv("LBX_EVALUATION_NONCE", "private-attempt")
+    original = EvaluationContext.create_from_artifact_digest(
+        task_digest="task", candidate_digest="artifact"
+    )
+
+    replay = EvaluationContext.replay(
+        task_digest="task",
+        candidate_digest="artifact",
+        replay={"nonce": "private-attempt", "artifact_digest": "artifact"},
+    )
+
+    assert replay.commitment == original.commitment
+    assert replay.attested is False
+    with pytest.raises(ValueError, match="artifact digest"):
+        EvaluationContext.replay(
+            task_digest="task",
+            candidate_digest="different",
+            replay={"nonce": "private-attempt", "artifact_digest": "artifact"},
+        )
+
+
+def test_grouped_prediction_constraints_reject_invalid_rows() -> None:
+    frame = pd.DataFrame(
+        {
+            "a": [1.0, 0.3],
+            "b": [0.0, 0.7],
+            "label": [0, 2],
+        }
+    )
+
+    with pytest.raises(AgentFault, match="one-hot"):
+        _validate_prediction_contract(
+            frame,
+            value_domains={},
+            constraints=(OneHot(["a", "b"]),),
+        )
+    with pytest.raises(AgentFault, match="declared domain"):
+        _validate_prediction_contract(
+            frame,
+            value_domains={"label": (0, 1)},
+            constraints=(),
+        )
+    _validate_prediction_contract(
+        frame,
+        value_domains={},
+        constraints=(Simplex(["a", "b"]),),
+    )
+
+
+def test_row_independent_scope_rejects_batch_transduction(
+    tmp_path, monkeypatch
+) -> None:
+    task = ContinuousTask.model(
+        artifact=PythonPredictor(prediction_scope="row_independent"),
+        challenge=PrivateTableChallenge(
+            "challenge.parquet",
+            feature_columns=["x"],
+            sample_size=120,
+            selection_policy="stable_subset",
+        ),
+        targets=_task().targets,
+        evidence=_task().evidence,
+    )
+    task, workspace, private = _prepare(tmp_path, monkeypatch, task=task)
+    (workspace / "predictor.py").write_text(
+        "def load_predictor():\n"
+        "    class Predictor:\n"
+        "        def predict(self, rows):\n"
+        "            mean = sum(r['x'] for r in rows) / len(rows)\n"
+        "            return {'target': [r['x'] - mean for r in rows]}\n"
+        "    return Predictor()\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentFault, match="row_independent"):
+        task.compute_score(workspace=workspace, private=private)
+
+
+def test_predictor_budgets_and_full_bank_policy_are_in_spec() -> None:
+    predictor = PythonPredictor(
+        predict_timeout_s=7,
+        first_call_timeout_s=11,
+        max_rows=321,
+        max_reply_bytes=4096,
+    )
+    challenge = PrivateTableChallenge(
+        "challenge.parquet",
+        feature_columns=["x"],
+    )
+
+    assert predictor.spec_dict()["predict_timeout_s"] == 7.0
+    assert predictor.spec_dict()["max_reply_bytes"] == 4096
+    assert challenge.spec_dict()["selection_policy"] == "full_bank"
+    assert challenge.spec_dict()["sample_size"] is None
+
+    legacy = PrivateTableChallenge(
+        "challenge.parquet",
+        feature_columns=["x"],
+        sample_size=120,
+    )
+    assert legacy.selection_policy == "artifact_digest"
+    assert legacy.legacy_spec_dict()["type"] == "private_table.v1"
 
 
 def test_private_truth_column_cannot_be_declared_as_feature() -> None:

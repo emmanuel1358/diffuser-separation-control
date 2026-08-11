@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -22,6 +23,7 @@ from grading.policy_runner import PolicyWorkerError, load_submitted_policy
 POLICY_CHALLENGE_PROTOCOL = "paired-policy-challenge.v1"
 PolicyRollout = Callable[[Any, int], float]
 ControlRollout = Callable[[int], float]
+_CONTROL_FAMILY_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 def _binomial_upper_tail(*, wins: int, trials: int) -> float:
@@ -49,6 +51,11 @@ class PolicyEvaluationTask:
     alpha: float = 0.01
     reference_quality: float = 0.95
     call_timeout_s: float = 2.0
+    required_control_families: tuple[str, ...] = (
+        "no_op",
+        "constant",
+        "open_loop",
+    )
 
     def __post_init__(self) -> None:
         relative = Path(self.policy_path)
@@ -67,16 +74,27 @@ class PolicyEvaluationTask:
             raise ValueError("reference_quality must lie in (0, 1)")
         if self.call_timeout_s <= 0.0:
             raise ValueError("call timeout must be positive")
+        families = tuple(str(family) for family in self.required_control_families)
+        if (
+            not families
+            or len(families) != len(set(families))
+            or any(not _CONTROL_FAMILY_RE.fullmatch(family) for family in families)
+        ):
+            raise ValueError(
+                "required_control_families must contain unique lowercase identifiers"
+            )
+        object.__setattr__(self, "required_control_families", families)
 
     def spec_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": "policy-evaluation-task.v1",
+            "schema_version": "policy-evaluation-task.v2",
             "policy_path": self.policy_path,
             "factory_name": self.factory_name,
             "scenarios": self.scenarios,
             "alpha": self.alpha,
             "reference_quality": self.reference_quality,
             "call_timeout_s": self.call_timeout_s,
+            "required_control_families": list(self.required_control_families),
             "protocol": POLICY_CHALLENGE_PROTOCOL,
         }
 
@@ -103,6 +121,24 @@ class PolicyEvaluationTask:
                 "policy_path": self.policy_path,
                 "factory_name": self.factory_name,
                 "scenarios": self.scenarios,
+                "required_control_families": list(self.required_control_families),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @property
+    def legacy_challenge_sha256(self) -> str:
+        """Pre-v2 scenario identity for unclassified legacy control calls."""
+        import json
+
+        payload = json.dumps(
+            {
+                "protocol": POLICY_CHALLENGE_PROTOCOL,
+                "policy_path": self.policy_path,
+                "factory_name": self.factory_name,
+                "scenarios": self.scenarios,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -118,7 +154,10 @@ class PolicyEvaluationTask:
                 "type": POLICY_CHALLENGE_PROTOCOL,
                 "scenarios": self.scenarios,
                 "alpha": self.alpha,
-                "controls": "author-registered-trusted",
+                "controls": {
+                    "type": "author-registered-trusted.v2",
+                    "required_families": list(self.required_control_families),
+                },
             },
             metric_ids=("paired.normalized_return.v1",),
         )
@@ -129,16 +168,56 @@ class PolicyEvaluationTask:
         workspace: Path,
         rollout: PolicyRollout,
         controls: Mapping[str, ControlRollout],
+        control_families: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         if not controls:
             raise RuntimeError("policy challenge requires at least one trusted control")
+        if control_families is None:
+            classified_control_families = {
+                name: "legacy_unclassified" for name in controls
+            }
+        else:
+            classified_control_families = dict(control_families)
+        if control_families is not None and set(classified_control_families) != set(
+            controls
+        ):
+            raise RuntimeError(
+                "control_families must classify every trusted control exactly once"
+            )
+        malformed_families = sorted(
+            {
+                str(family)
+                for family in classified_control_families.values()
+                if not _CONTROL_FAMILY_RE.fullmatch(str(family))
+            }
+        )
+        if malformed_families:
+            raise RuntimeError(
+                f"trusted controls use invalid family names: {malformed_families}"
+            )
+        if control_families is not None:
+            present_families = {
+                str(family) for family in classified_control_families.values()
+            }
+            missing_families = sorted(
+                set(self.required_control_families) - present_families
+            )
+            if missing_families:
+                raise RuntimeError(
+                    "policy challenge is missing required trusted control families: "
+                    f"{missing_families}"
+                )
         artifact = workspace / self.policy_path
         try:
             committed_digest = workspace_artifact_digest(workspace)
         except (OSError, ValueError) as exc:
             raise AgentFault(f"could not commit submitted policy: {exc}") from exc
         context = EvaluationContext.create_from_artifact_digest(
-            task_digest=self.challenge_sha256,
+            task_digest=(
+                self.legacy_challenge_sha256
+                if control_families is None
+                else self.challenge_sha256
+            ),
             candidate_digest=committed_digest,
         )
         seeds = [
@@ -199,6 +278,7 @@ class PolicyEvaluationTask:
             )
             accepted = accepted and passed
             trace[name] = {
+                "family": classified_control_families[name],
                 "p_value": p_value,
                 "mean_difference": mean_difference,
                 "wins": wins,

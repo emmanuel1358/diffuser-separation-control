@@ -1,0 +1,26 @@
+---
+description: Require task-author changelog updates for shared framework changes
+alwaysApply: true
+---
+
+# Shared grader changelog
+
+When changing shared grader or task framework behavior, determine whether task
+authors need to know about it before completing the work.
+
+Relevant surfaces include `grader/`, `harness/`, `alignerr_plugin/`,
+`taiga_runtime/rubric/`, `base/`, shared examples, and public authoring schemas.
+
+If a change affects an API, default, serialized schema, score, calibration,
+validation gate, artifact contract, fault classification, runtime resource,
+sandbox boundary, migration, image rebuild, or author workflow:
+
+1. Read and follow `.cursor/skills/task-author-changelog/SKILL.md`.
+2. Update `docs/CHANGELOG.md` in the same change set.
+3. Prepend new timestamped entries and preserve reverse chronological order.
+4. Include required migration, lock regeneration, plan refresh, or rebuild
+   steps.
+
+Do not require a changelog entry for behavior-preserving refactors, tests only,
+or editorial fixes. Do not finish an author-visible shared change with a stale
+changelog.

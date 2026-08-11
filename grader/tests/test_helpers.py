@@ -210,6 +210,73 @@ def test_load_submission_or_fault_rejects_extra_columns(tmp_path: Path) -> None:
         )
 
 
+def test_load_submission_or_fault_can_drop_extra_columns_safely(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "submission.csv"
+    path.write_text("id,y,is_ood\n1,0.5,attacker-controlled\n")
+
+    frame = helpers.load_submission_or_fault(
+        path,
+        required_columns=["id", "y"],
+        numeric_columns=["y"],
+        extra_columns="drop",
+    )
+
+    assert list(frame.columns) == ["id", "y"]
+
+
+def test_safe_prediction_join_projects_before_suffix_resolution() -> None:
+    import pandas as pd
+
+    submission = pd.DataFrame(
+        {
+            "case_id": [1, 2],
+            "viability": [0.3, 0.7],
+            "is_ood": ["forged", "forged"],
+        }
+    )
+    truth = pd.DataFrame(
+        {
+            "case_id": [1, 2],
+            "viability": [0.2, 0.8],
+            "is_ood": [False, True],
+        }
+    )
+
+    merged = helpers.join_submission_to_truth_or_fault(
+        submission,
+        truth,
+        key_column="case_id",
+        prediction_columns=["viability"],
+        truth_columns=["viability", "is_ood"],
+    )
+
+    assert list(merged.columns) == [
+        "case_id",
+        "viability",
+        "viability_truth",
+        "is_ood",
+    ]
+    assert merged["is_ood"].tolist() == [False, True]
+
+
+def test_safe_prediction_join_attributes_bad_candidate_keys_to_agent() -> None:
+    import pandas as pd
+
+    submission = pd.DataFrame({"case_id": [[1]], "prediction": [0.5]})
+    truth = pd.DataFrame({"case_id": [1], "target": [0.5]})
+
+    with pytest.raises(AgentFault, match="not safely hashable"):
+        helpers.join_submission_to_truth_or_fault(
+            submission,
+            truth,
+            key_column="case_id",
+            prediction_columns=["prediction"],
+            truth_columns=["target"],
+        )
+
+
 def test_run_trusted_solver_returns_typed_nonzero_and_timeout() -> None:
     failed = helpers.run_trusted_solver(
         [sys.executable, "-c", "print('bad case'); raise SystemExit(3)"],

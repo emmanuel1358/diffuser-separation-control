@@ -1071,7 +1071,13 @@ class TaskValidator:
         try:
             raw_payload = json.loads(lock_path.read_text())
             lock = load_calibration_lock(
-                lock_path, task_spec_sha256=registration.spec_sha256
+                lock_path,
+                task_spec_sha256=registration.spec_sha256,
+                compatible_task_spec_sha256s=(
+                    (registration.legacy_spec_sha256,)
+                    if registration.legacy_spec_sha256 is not None
+                    else ()
+                ),
             )
             if lock_path.read_bytes() != canonical_json_bytes(raw_payload):
                 issues.append(
@@ -1117,12 +1123,21 @@ class TaskValidator:
                         "continuous calibration evidence lock digest does not match "
                         f"{lock_path.name}"
                     )
-                if calibration.get("task_spec_sha256") != registration.spec_sha256:
+                accepted_task_digests = {registration.spec_sha256}
+                if registration.legacy_spec_sha256 is not None:
+                    accepted_task_digests.add(registration.legacy_spec_sha256)
+                if calibration.get("task_spec_sha256") not in accepted_task_digests:
                     evidence_findings.append(
                         "continuous calibration TASK digest is stale"
                     )
-                if calibration.get("evaluation_plan_sha256") != (
-                    registration.evaluation_plan.sha256
+                accepted_plan_digests = {registration.evaluation_plan.sha256}
+                if registration.legacy_evaluation_plan is not None:
+                    accepted_plan_digests.add(
+                        registration.legacy_evaluation_plan.sha256
+                    )
+                if (
+                    calibration.get("evaluation_plan_sha256")
+                    not in accepted_plan_digests
                 ):
                     evidence_findings.append(
                         "continuous evaluation plan digest is stale"
@@ -1677,7 +1692,17 @@ class TaskValidator:
 
         issues.extend(_preloaded_files_issues(problem_dir))
 
-        warnings = baseline_trio_warnings(problem_dir)
+        if os.environ.get("LBX_STRICT_RELEASE_GATES") == "1":
+            issues.extend(
+                warning.replace(
+                    "baseline trio advisory", "baseline portfolio gate"
+                ).replace("This is advisory, not a blocking gate.", "")
+                for warning in baseline_trio_warnings(problem_dir)
+            )
+            issues.extend(baseline_portfolio_manifest_issues(problem_dir))
+            warnings: list[str] = []
+        else:
+            warnings = baseline_trio_warnings(problem_dir)
 
         return StageResult(
             passed=not issues, issues=issues, warnings=warnings, duration_ms=0
@@ -4620,6 +4645,7 @@ def _grade_workspace_score(
 
 
 EXPECTED_BASELINE_TRIO = 3
+BASELINE_PORTFOLIO_SCHEMA = "baseline-portfolio.v1"
 
 
 def _committed_baseline_names(problem_dir: Path) -> set[str]:
@@ -4681,6 +4707,99 @@ def baseline_trio_warnings(problem_dir: Path) -> list[str]:
     ]
 
 
+def baseline_portfolio_manifest_issues(problem_dir: Path) -> list[str]:
+    """Validate the named baseline-family manifest used by strict releases."""
+    try:
+        task_toml = load_task_toml(problem_dir)
+    except Exception:  # noqa: BLE001 - schema stage reports the parse failure
+        return []
+    if (
+        task_toml.difficulty.task_type != "ml"
+        or task_toml.difficulty.reward_type != "continuous_scoring_function"
+    ):
+        return []
+
+    path = problem_dir / "baselines" / "portfolio.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        message = (
+            "strict release requires baselines/portfolio.json with named "
+            "baseline families measured through the production grader"
+        )
+        return [message]
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"could not read baselines/portfolio.json: {exc}"]
+    if not isinstance(payload, dict):
+        return ["baselines/portfolio.json must be a JSON object"]
+
+    issues: list[str] = []
+    if payload.get("schema_version") != BASELINE_PORTFOLIO_SCHEMA:
+        issues.append(
+            "baselines/portfolio.json schema_version must be "
+            f"{BASELINE_PORTFOLIO_SCHEMA!r}"
+        )
+    required = payload.get("required_families")
+    entries = payload.get("baselines")
+    if (
+        not isinstance(required, list)
+        or not required
+        or any(not isinstance(family, str) or not family.strip() for family in required)
+    ):
+        issues.append(
+            "baseline portfolio required_families must be a non-empty string list"
+        )
+        required = []
+    if not isinstance(entries, list) or len(entries) < EXPECTED_BASELINE_TRIO:
+        issues.append(
+            f"baseline portfolio must declare at least {EXPECTED_BASELINE_TRIO} entries"
+        )
+        entries = entries if isinstance(entries, list) else []
+
+    names: list[str] = []
+    families: set[str] = set()
+    for index, entry in enumerate(entries):
+        label = f"baseline portfolio entry {index}"
+        if not isinstance(entry, dict):
+            issues.append(f"{label} must be an object")
+            continue
+        name = entry.get("name")
+        family = entry.get("family")
+        relative = entry.get("path")
+        rationale = entry.get("rationale")
+        if not isinstance(name, str) or not name.strip():
+            issues.append(f"{label} name must be non-empty")
+        else:
+            names.append(name.strip())
+        if not isinstance(family, str) or not family.strip():
+            issues.append(f"{label} family must be non-empty")
+        else:
+            families.add(family.strip())
+        if (
+            not isinstance(relative, str)
+            or not relative.strip()
+            or PurePosixPath(relative).is_absolute()
+            or len(PurePosixPath(relative).parts) < 2
+            or ".." in PurePosixPath(relative).parts
+            or PurePosixPath(relative).parts[:1] != ("baselines",)
+        ):
+            issues.append(f"{label} path must stay under baselines/")
+        elif not (problem_dir / relative).is_dir():
+            issues.append(
+                f"{label} path must be an existing baseline workspace directory: "
+                f"{relative!r}"
+            )
+        if not isinstance(rationale, str) or len(rationale.strip()) < 20:
+            issues.append(f"{label} rationale must be at least 20 characters")
+
+    if len(names) != len(set(names)):
+        issues.append("baseline portfolio names must be unique")
+    missing = sorted(set(required) - families)
+    if missing:
+        issues.append(f"baseline portfolio is missing required families: {missing}")
+    return issues
+
+
 def _baseline_calibration_issues(
     problem_dir: Path,
     compute_score: Any,
@@ -4710,6 +4829,25 @@ def _baseline_calibration_issues(
         if baselines_dir.is_dir()
         else []
     )
+    strict_release = os.environ.get("LBX_STRICT_RELEASE_GATES") == "1"
+    if strict_release:
+        try:
+            portfolio = json.loads(
+                (baselines_dir / "portfolio.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            portfolio = {}
+        declared_roots = {
+            PurePosixPath(str(entry.get("path"))).parts[1]
+            for entry in portfolio.get("baselines", [])
+            if isinstance(entry, dict)
+            and isinstance(entry.get("path"), str)
+            and len(PurePosixPath(entry["path"]).parts) >= 2
+            and PurePosixPath(entry["path"]).parts[0] == "baselines"
+        }
+        baseline_dirs = [
+            directory for directory in baseline_dirs if directory.name in declared_roots
+        ]
     if not baseline_dirs:
         # Absence is a documented convention, not a hard failure: the no-op gate
         # (max_trivial_score) already anchors a trivial floor for every task.

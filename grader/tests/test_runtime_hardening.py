@@ -141,6 +141,53 @@ def test_shared_memory_exhaustion_requires_pressure_and_high_shmem() -> None:
     )
 
 
+def test_child_memory_limit_leaves_container_headroom(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("RUBRIC_AGENT_MEMORY_LIMIT_BYTES", raising=False)
+    memory_max = tmp_path / "memory.max"
+    memory_max.write_text(str(64 * 1024**3))
+
+    limit = runtime_hardening.child_memory_limit_bytes(cgroup_paths=(memory_max,))
+
+    assert limit == 48 * 1024**3
+
+
+def test_child_memory_limit_honors_explicit_environment_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RUBRIC_AGENT_MEMORY_LIMIT_BYTES", str(12 * 1024**3))
+
+    limit = runtime_hardening.child_memory_limit_bytes(
+        cgroup_paths=(tmp_path / "missing",)
+    )
+
+    assert limit == 12 * 1024**3
+
+
+def test_apply_address_space_limit_sets_inherited_hard_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(
+        runtime_hardening.resource,
+        "getrlimit",
+        lambda _kind: (
+            runtime_hardening.resource.RLIM_INFINITY,
+            runtime_hardening.resource.RLIM_INFINITY,
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_hardening.resource,
+        "setrlimit",
+        lambda kind, limits: applied.append((kind, limits)),
+    )
+
+    runtime_hardening.apply_address_space_limit(123_456)
+
+    assert applied == [(runtime_hardening.resource.RLIMIT_AS, (123_456, 123_456))]
+
+
 def test_exhaustion_without_an_exit_status_trusts_meminfo_alone() -> None:
     """A timeout has no exit code to corroborate, so meminfo has to stand alone.
 

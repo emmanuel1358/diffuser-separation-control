@@ -500,11 +500,9 @@ def test_command_proxy_uses_argv_and_unprivileged_main_user(
     assert "exec" in command
     assert command[command.index("--user") + 1] == "1000:1000"
     assert command[command.index("--workdir") + 1] == "/workspace"
-    assert command[-3:] == (
-        "/bin/bash",
-        "-lc",
-        "printf '%s' hello",
-    )
+    assert command[-3:-1] == ("/bin/bash", "-lc")
+    assert command[-1].startswith("ulimit -v ")
+    assert command[-1].endswith("&& printf '%s' hello")
     assert all("docker.sock" not in value for value in command)
 
 
