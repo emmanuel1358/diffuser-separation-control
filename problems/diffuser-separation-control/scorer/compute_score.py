@@ -20,14 +20,14 @@ from grading.evaluation import (
     JsonArtifact,
     NumericField,
     RubricCriterion,
+    RubricEvaluation,
     RubricTask,
 )
 
 
-def compute_score(workspace, trajectory=None, private=None):
-    """Grade a diffuser-design submission."""
-    ws = Path(workspace)
-
+def _evaluate(context):
+    """Evaluate diffuser design using RubricTask protocol."""
+    ws = context.workspace
     submission_path = ws / "output" / "diffuser_design.json"
     if not submission_path.exists():
         submission_path = ws / "diffuser_design.json"
@@ -43,6 +43,7 @@ def compute_score(workspace, trajectory=None, private=None):
     except (TypeError, ValueError) as exc:
         raise AgentFault(f"invalid numeric value: {exc}")
 
+    # Load public baseline / operating data
     data_dir = Path("/data")
     try:
         with open(data_dir / "baseline_diffuser.json") as fh:
@@ -58,9 +59,11 @@ def compute_score(workspace, trajectory=None, private=None):
     h2 = baseline.get("outlet_height_m", 0.2)
     AR = h2 / h1                     # Baseline area ratio = 2.0
 
+    # Physics surrogate
     Cp_ideal = 1.0 - (1.0 / AR ** 2)
     theta_rad = math.radians(angle)
 
+    # Loss is zero at and below the optimal 7 deg half-angle
     theta_opt = math.radians(7.0)
     deviation = max(0.0, theta_rad - theta_opt)
     K_loss = 0.08 * (math.tan(deviation)) ** 2 * (AR - 1.0) ** 2
@@ -69,46 +72,48 @@ def compute_score(workspace, trajectory=None, private=None):
     Cp = max(0.0, Cp_ideal - K_loss) * length_factor
     pressure_recovery = Cp / Cp_ideal if Cp_ideal > 0 else 0.0
 
+    # Separation penalty (raw: 0=good, 1=bad)
     theta_stall = 10.0
-    separation_penalty = (
+    separation_penalty_raw = (
         0.0 if angle <= theta_stall
         else min(1.0, (angle - theta_stall) / 5.0)
     )
 
+    # Outlet uniformity
     L_opt = 6.0
     uniformity = math.exp(-0.5 * ((length - L_opt) / 2.5) ** 2)
 
+    # Robustness
     robustness = max(0.0, 1.0 - abs(angle - 7.0) / 8.0)
 
+    # Inlet extension bonus
     inlet_bonus = min(1.0, inlet_ext / 0.5)
 
-    score = (
-        0.30 * pressure_recovery
-        + 0.25 * (1.0 - separation_penalty)
-        + 0.20 * uniformity
-        + 0.15 * robustness
-        + 0.10 * inlet_bonus
-    )
-    score = max(0.0, min(1.0, score))
-
-    return {
-        "score": round(score, 4),
-        "subscores": {
-            "pressure_recovery": round(pressure_recovery, 4),
-            "separation_penalty": round(separation_penalty, 4),
-            "outlet_uniformity": round(uniformity, 4),
-            "robustness": round(robustness, 4),
-            "inlet_extension_bonus": round(inlet_bonus, 4),
-        },
+    # Subscores in "higher is better" form.
+    # separation_penalty is inverted so 1.0 = no penalty (good).
+    subscores = {
+        "pressure_recovery": round(pressure_recovery, 4),
+        "separation_penalty": round(1.0 - separation_penalty_raw, 4),
+        "outlet_uniformity": round(uniformity, 4),
+        "robustness": round(robustness, 4),
+        "inlet_extension_bonus": round(inlet_bonus, 4),
     }
 
+    # Headline score (weighted sum -- oracle hits 1.0)
+    headline = (
+        0.30 * subscores["pressure_recovery"]
+        + 0.25 * subscores["separation_penalty"]
+        + 0.20 * subscores["outlet_uniformity"]
+        + 0.15 * subscores["robustness"]
+        + 0.10 * subscores["inlet_extension_bonus"]
+    )
 
-def _evaluate(context):
-    """Bridge RubricTask protocol to compute_score."""
-    return compute_score(
-        str(context.workspace),
-        getattr(context, "trajectory", None),
-        getattr(context, "private", None),
+    return RubricEvaluation(
+        subscores=subscores,
+        metadata={
+            "reported_final_score": round(headline, 4),
+            "scoring_mode": "weighted",
+        },
     )
 
 
