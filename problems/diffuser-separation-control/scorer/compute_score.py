@@ -1,10 +1,10 @@
 """
-Diffuser Separation Control — Grader
-====================================
+Diffuser Separation Control -- Grader
+=====================================
 
 Physics-based scoring for the diffuser-separation-control CFD task.
-The oracle (optimal design: 7° half-angle, length ratio 6.0,
-inlet extension ≥ 0.5 m) must score exactly 1.0 for ground-truth
+The oracle (optimal design: 7 deg half-angle, length ratio 6.0,
+inlet extension >= 0.5 m) must score exactly 1.0 for ground-truth
 validation.
 """
 
@@ -16,23 +16,26 @@ from pathlib import Path
 
 from grading.faults import AgentFault
 from grading.helpers import load_json
+from grading.evaluation import RubricTask
 
 
-def compute_score(workspace: str, trajectory=None, private=None) -> dict:
+def compute_score(workspace, trajectory=None, private=None):
     """Grade a diffuser-design submission.
 
     Parameters
     ----------
     workspace : str
         Absolute path to the agent workspace directory.
-    trajectory, private
-        Unused for this static task.
+    trajectory : str | None
+        Agent transcript (unused for this static task).
+    private : pathlib.Path | None
+        Path to grader-private fixtures (unused; all inputs are public).
 
     Returns
     -------
     dict
-        Normalized result with ``score`` in ``[0.0, 1.0]`` and
-        per-criterion ``subscores``.
+        Normalized result with ``score`` in [0.0, 1.0] and per-criterion
+        ``subscores``.
     """
     ws = Path(workspace)
 
@@ -61,7 +64,7 @@ def compute_score(workspace: str, trajectory=None, private=None) -> dict:
         with open(data_dir / "baseline_diffuser.json") as fh:
             baseline = json.load(fh)
         with open(data_dir / "public_operating_conditions.json") as fh:
-            ops = json.load(fh)          # noqa: F841 — reserved for future use
+            ops = json.load(fh)          # noqa: F841 -- reserved for future use
     except FileNotFoundError:
         baseline = {"inlet_height_m": 0.1, "outlet_height_m": 0.2}
         ops = {"inlet_velocity_m_per_s": 15.0,
@@ -77,7 +80,7 @@ def compute_score(workspace: str, trajectory=None, private=None) -> dict:
     Cp_ideal = 1.0 - (1.0 / AR ** 2)
     theta_rad = math.radians(angle)
 
-    # Loss is zero at and below the optimal 7° half-angle; it only
+    # Loss is zero at and below the optimal 7 deg half-angle; it only
     # accumulates when the angle exceeds the optimum (where stall risk
     # begins to dominate).
     theta_opt = math.radians(7.0)
@@ -99,14 +102,14 @@ def compute_score(workspace: str, trajectory=None, private=None) -> dict:
     L_opt = 6.0
     uniformity = math.exp(-0.5 * ((length - L_opt) / 2.5) ** 2)
 
-    # Robustness (proximity to 7° sweet-spot)
+    # Robustness (proximity to 7 deg sweet-spot)
     robustness = max(0.0, 1.0 - abs(angle - 7.0) / 8.0)
 
     # Inlet extension bonus
     inlet_bonus = min(1.0, inlet_ext / 0.5)
 
     # ------------------------------------------------------------------
-    # Aggregate — oracle must be able to reach exactly 1.0
+    # Aggregate -- oracle must be able to reach exactly 1.0
     # ------------------------------------------------------------------
     score = (
         0.30 * pressure_recovery
@@ -129,7 +132,11 @@ def compute_score(workspace: str, trajectory=None, private=None) -> dict:
     }
 
 
-if __name__ == "__main__":
-    import sys
-    _workspace = sys.argv[1] if len(sys.argv) > 1 else "/tmp"
-    print(json.dumps(compute_score(_workspace), indent=2))
+class _DiffuserRubricTask(RubricTask):
+    """Protocol wrapper required for multi_deterministic_rubrics."""
+
+    def grade(self, workspace, trajectory=None, private=None):
+        return compute_score(workspace, trajectory, private)
+
+
+TASK = _DiffuserRubricTask()
