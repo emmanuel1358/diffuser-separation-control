@@ -16,31 +16,18 @@ from pathlib import Path
 
 from grading.faults import AgentFault
 from grading.helpers import load_json
-from grading.evaluation import RubricTask
+from grading.evaluation import (
+    JsonArtifact,
+    NumericField,
+    RubricCriterion,
+    RubricTask,
+)
 
 
 def compute_score(workspace, trajectory=None, private=None):
-    """Grade a diffuser-design submission.
-
-    Parameters
-    ----------
-    workspace : str
-        Absolute path to the agent workspace directory.
-    trajectory : str | None
-        Agent transcript (unused for this static task).
-    private : pathlib.Path | None
-        Path to grader-private fixtures (unused; all inputs are public).
-
-    Returns
-    -------
-    dict
-        Normalized result with ``score`` in [0.0, 1.0] and per-criterion
-        ``subscores``.
-    """
+    """Grade a diffuser-design submission."""
     ws = Path(workspace)
 
-    # The harness may place the submission directly in the workspace
-    # or in a nested ``output/`` sub-directory.
     submission_path = ws / "output" / "diffuser_design.json"
     if not submission_path.exists():
         submission_path = ws / "diffuser_design.json"
@@ -56,9 +43,6 @@ def compute_score(workspace, trajectory=None, private=None):
     except (TypeError, ValueError) as exc:
         raise AgentFault(f"invalid numeric value: {exc}")
 
-    # ------------------------------------------------------------------
-    # Load public baseline / operating data
-    # ------------------------------------------------------------------
     data_dir = Path("/data")
     try:
         with open(data_dir / "baseline_diffuser.json") as fh:
@@ -74,15 +58,9 @@ def compute_score(workspace, trajectory=None, private=None):
     h2 = baseline.get("outlet_height_m", 0.2)
     AR = h2 / h1                     # Baseline area ratio = 2.0
 
-    # ------------------------------------------------------------------
-    # Physics surrogate
-    # ------------------------------------------------------------------
     Cp_ideal = 1.0 - (1.0 / AR ** 2)
     theta_rad = math.radians(angle)
 
-    # Loss is zero at and below the optimal 7 deg half-angle; it only
-    # accumulates when the angle exceeds the optimum (where stall risk
-    # begins to dominate).
     theta_opt = math.radians(7.0)
     deviation = max(0.0, theta_rad - theta_opt)
     K_loss = 0.08 * (math.tan(deviation)) ** 2 * (AR - 1.0) ** 2
@@ -91,26 +69,19 @@ def compute_score(workspace, trajectory=None, private=None):
     Cp = max(0.0, Cp_ideal - K_loss) * length_factor
     pressure_recovery = Cp / Cp_ideal if Cp_ideal > 0 else 0.0
 
-    # Separation penalty
     theta_stall = 10.0
     separation_penalty = (
         0.0 if angle <= theta_stall
         else min(1.0, (angle - theta_stall) / 5.0)
     )
 
-    # Outlet uniformity (Gaussian around optimal length 6.0)
     L_opt = 6.0
     uniformity = math.exp(-0.5 * ((length - L_opt) / 2.5) ** 2)
 
-    # Robustness (proximity to 7 deg sweet-spot)
     robustness = max(0.0, 1.0 - abs(angle - 7.0) / 8.0)
 
-    # Inlet extension bonus
     inlet_bonus = min(1.0, inlet_ext / 0.5)
 
-    # ------------------------------------------------------------------
-    # Aggregate -- oracle must be able to reach exactly 1.0
-    # ------------------------------------------------------------------
     score = (
         0.30 * pressure_recovery
         + 0.25 * (1.0 - separation_penalty)
@@ -132,11 +103,41 @@ def compute_score(workspace, trajectory=None, private=None):
     }
 
 
-class _DiffuserRubricTask(RubricTask):
-    """Protocol wrapper required for multi_deterministic_rubrics."""
+def _evaluate(context):
+    """Bridge RubricTask protocol to compute_score."""
+    return compute_score(
+        str(context.workspace),
+        getattr(context, "trajectory", None),
+        getattr(context, "private", None),
+    )
 
-    def grade(self, workspace, trajectory=None, private=None):
-        return compute_score(workspace, trajectory, private)
 
-
-TASK = _DiffuserRubricTask()
+TASK = RubricTask(
+    artifact=JsonArtifact(
+        "diffuser_design.json",
+        required_keys=["half_angle_deg", "length_ratio", "inlet_extension_m"],
+        numeric_fields=[
+            NumericField("half_angle_deg"),
+            NumericField("length_ratio"),
+            NumericField("inlet_extension_m"),
+        ],
+        allow_extra_keys=False,
+    ),
+    fixtures={},
+    criteria=tuple(
+        RubricCriterion(
+            id=key,
+            weight=weight,
+            description=key.replace("_", " ").title(),
+            required=False,
+        )
+        for key, weight in {
+            "pressure_recovery": 0.30,
+            "separation_penalty": 0.25,
+            "outlet_uniformity": 0.20,
+            "robustness": 0.15,
+            "inlet_extension_bonus": 0.10,
+        }.items()
+    ),
+    evaluate=_evaluate,
+)
