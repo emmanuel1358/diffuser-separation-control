@@ -172,11 +172,13 @@ exporter avoids duplicating notices when your prompt already mentions GPU/TPU or
 `tmux`.
 
 Agent shell/editor descendants and submitted policy workers inherit a hard
-address-space cap so a parallel sweep fails locally instead of killing the
-entire sandbox. The runtime defaults to 75% of the detected cgroup memory
-(capped at 56 GiB). Size worker counts and in-memory arrays within that budget;
-trusted deployments may lower it with `RUBRIC_AGENT_MEMORY_LIMIT_BYTES` and
-`RUBRIC_POLICY_MEMORY_LIMIT_BYTES`.
+**per-process** address-space cap. The runtime defaults to 75% of the detected
+cgroup memory (capped at 56 GiB); the local harness applies the same cap to tmux
+sessions. Every multiprocessing/joblib child inherits its own copy of that
+limit, so the limits do not add up to an aggregate process-tree budget. Size
+worker counts and in-memory arrays for the container's total memory; trusted
+deployments may lower the per-process cap with
+`RUBRIC_AGENT_MEMORY_LIMIT_BYTES` and `RUBRIC_POLICY_MEMORY_LIMIT_BYTES`.
 
 ## Task Dependencies
 

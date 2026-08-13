@@ -75,6 +75,9 @@ def run_seeds(
     policy_path: str = "/tmp/output/policy.py",
     policy_factory: str = "load_policy",
     policy_source: str | None = None,
+    call_timeout_s: float = 5.0,
+    first_call_timeout_s: float | None = None,
+    total_timeout_s: float | None = None,
     timeout_per_seed_s: float | None = None,
     on_error: str = "record",
 ) -> dict:
@@ -100,6 +103,12 @@ def run_seeds(
         policy_source: if given, load the policy from this source string
             (grader-supplied wrapper) instead of policy_path. See
             grading.policy_runner.load_submitted_policy.
+        call_timeout_s: hard wall-clock deadline for each submitted-policy RPC.
+        first_call_timeout_s: optional load/first-call deadline. The shared
+            worker uses its startup floor when omitted.
+        total_timeout_s: optional cumulative hard budget across all submitted
+            policy calls. Exceeding it raises an AgentFault before the outer
+            grader timeout can turn a slow policy into an infrastructure retry.
         timeout_per_seed_s: optional soft wall-clock budget for one seed.
             Observed AFTER the seed completes (the helper does NOT
             preemptively kill a running seed; that would require a third
@@ -150,17 +159,24 @@ def run_seeds(
             "elapsed_s":    float        wall-clock for the whole run.
     """
     if on_error not in {"record", "raise"}:
-        raise ValueError(
-            f"on_error must be 'record' or 'raise'; got {on_error!r}"
-        )
+        raise ValueError(f"on_error must be 'record' or 'raise'; got {on_error!r}")
 
     if policy_source is not None:
         policy = load_submitted_policy(
-            path=policy_path, source=policy_source, factory_name=policy_factory,
+            path=policy_path,
+            source=policy_source,
+            factory_name=policy_factory,
+            timeout_s=call_timeout_s,
+            first_call_timeout_s=first_call_timeout_s,
+            total_timeout_s=total_timeout_s,
         )
     else:
         policy = load_submitted_policy(
-            path=policy_path, factory_name=policy_factory,
+            path=policy_path,
+            factory_name=policy_factory,
+            timeout_s=call_timeout_s,
+            first_call_timeout_s=first_call_timeout_s,
+            total_timeout_s=total_timeout_s,
         )
 
     per_seed: list[dict] = []
@@ -193,9 +209,11 @@ def run_seeds(
         record.setdefault("seed", seed)
         elapsed = time.perf_counter() - seed_t0
         record.setdefault("seed_elapsed_s", elapsed)
-        if (timeout_per_seed_s is not None
-                and elapsed > timeout_per_seed_s
-                and "error" not in record):
+        if (
+            timeout_per_seed_s is not None
+            and elapsed > timeout_per_seed_s
+            and "error" not in record
+        ):
             logger.warning(
                 f"seed {seed}: roll exceeded soft timeout "
                 f"{timeout_per_seed_s:.1f}s ({elapsed:.1f}s); promoting to "

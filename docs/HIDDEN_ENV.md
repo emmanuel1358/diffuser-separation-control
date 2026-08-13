@@ -99,7 +99,10 @@ class MyEnv:
     def best_arm(self): ...   # grader-only; NOT reachable over the socket
 ```
 
-A malformed `_env_public_methods` fails **closed** (rejects everything).
+A malformed `_env_public_methods` fails **closed** (rejects everything). New
+env/hybrid tasks must declare it; socket-exposed methods must name their
+accepted keyword arguments explicitly rather than accepting unrestricted
+`**kwargs`.
 
 4. **Ship the client.** Copy the canonical
    [`grader/src/env_server/env_client.py`](../grader/src/env_server/env_client.py)
@@ -131,18 +134,26 @@ source mode (a grader wrapper for an agent data artifact), and multi-policy
 factories (a dict / list of proxies). It raises `AgentFault` for a missing /
 non-regular / oversized policy or a load-time crash.
 
-### Optional `env_config.json`
+### Required `env_config.json`
 
-Place `scorer/data/env_config.json` to override defaults:
+Place `scorer/data/env_config.json` beside the hidden env:
 
 ```json
-{ "module": "envs/__init__.py", "factory": "build_env",
-  "allowed_env_kwargs": ["seed", "split"] }
+{
+  "module": "envs/__init__.py",
+  "factory": "build_env",
+  "allowed_env_kwargs": ["seed", "split"],
+  "require_public_methods_allowlist": true,
+  "max_instances": 64,
+  "max_instances_per_connection": 16
+}
 ```
 
 `allowed_env_kwargs` pins the `env_kwargs` the agent may pass to `make_env` on
-`__create__`. Regardless, the server always rejects any kwarg string that
-resolves under `/mcp_server` (so a rollout cannot redirect a privileged read).
+`__create__` (use `[]` when none are accepted). The instance limits bound live
+env-object memory across connection floods. Regardless, the server always
+rejects any kwarg string that resolves under `/mcp_server` (so a rollout cannot
+redirect a privileged read).
 
 ## Reward-hacking closures (built in)
 
@@ -158,8 +169,11 @@ resolves under `/mcp_server` (so a rollout cannot redirect a privileged read).
   can import them but the agent must go through the RPC. See below.
 - **No private methods over the wire**: `_`-prefixed names and anything outside
   `_env_public_methods` are rejected.
-- **No path redirection**: `env_kwargs` resolving under `/mcp_server` are rejected;
-  optional `allowed_env_kwargs` pins the create contract.
+- **No path redirection or hidden-spec injection**: `env_kwargs` resolving under
+  `/mcp_server` are rejected, `allowed_env_kwargs` pins construction, and
+  socket-exposed methods may not accept unrestricted `**kwargs`.
+- **Bounded live state**: global and per-connection instance caps prevent
+  `__create__` floods from exhausting the privileged env process.
 - **No grade-time env access**: `stop_env_server()` closes the socket before the
   grader runs; the grader uses the in-process held-out env.
 - **No stdout score forging**: the policy worker returns values over a dedicated

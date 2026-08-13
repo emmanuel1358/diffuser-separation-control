@@ -156,7 +156,7 @@ def write_evaluation_plan_atomic(path: Path, plan: EvaluationPlan) -> None:
 
 
 def load_rubric_evaluation_plan(problem_dir: Path) -> EvaluationPlan | None:
-    """Load ``TASK.evaluation_plan`` when the scorer declares a ``RubricTask``."""
+    """Load ``TASK.evaluation_plan`` from a supported declarative registration."""
 
     scorer = Path(problem_dir) / "scorer" / "compute_score.py"
     if not scorer.is_file():
@@ -180,13 +180,10 @@ def load_rubric_evaluation_plan(problem_dir: Path) -> EvaluationPlan | None:
             if path in sys.path:
                 sys.path.remove(path)
     registration = getattr(module, "TASK", None)
-    try:
-        from grading.evaluation.rubric import RubricTask
-    except Exception:
+    plan = getattr(registration, "evaluation_plan", None)
+    if not isinstance(plan, EvaluationPlan):
         return None
-    if not isinstance(registration, RubricTask):
-        return None
-    return registration.evaluation_plan
+    return plan
 
 
 def _sync_evaluation_plan(
@@ -208,7 +205,7 @@ def _sync_evaluation_plan(
         return EvaluationPlanSyncResult(
             path=path,
             status="not_rubric",
-            message="scorer does not declare TASK = RubricTask(...)",
+            message="scorer does not declare a TASK with an evaluation_plan",
         )
 
     expected = serialized_evaluation_plan(plan)

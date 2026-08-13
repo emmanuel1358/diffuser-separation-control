@@ -41,13 +41,23 @@ def make_env(**kwargs):
 """
 
 
-def _server(tmp_path: Path, *, allowed=None) -> EnvServer:
+def _server(
+    tmp_path: Path,
+    *,
+    allowed=None,
+    require_allowlist: bool = False,
+    max_instances: int = 64,
+    max_instances_per_connection: int = 16,
+) -> EnvServer:
     env_py = tmp_path / "env.py"
     env_py.write_text(_ENV_SOURCE)
     cfg = EnvConfig(
         module_path=env_py.resolve(),
         factory_name="make_env",
         allowed_env_kwargs=frozenset(allowed) if allowed is not None else None,
+        require_public_methods_allowlist=require_allowlist,
+        max_instances=max_instances,
+        max_instances_per_connection=max_instances_per_connection,
     )
     return EnvServer(cfg, tmp_path / "env.sock")
 
@@ -100,6 +110,59 @@ def test_allowed_env_kwargs_enforced(tmp_path: Path) -> None:
         )
 
 
+def test_required_public_method_allowlist_fails_closed(tmp_path: Path) -> None:
+    srv = _server(tmp_path, require_allowlist=True)
+    srv._handle({"method": "__create__", "instance_id": 0, "args": {}})
+    delattr(type(srv._instances[0]), "_env_public_methods")
+
+    with pytest.raises(ValueError, match="requires _env_public_methods"):
+        srv._handle({"method": "step", "instance_id": 0, "args": {"action": 1}})
+
+
+def test_global_live_instance_cap_releases_after_destroy(tmp_path: Path) -> None:
+    srv = _server(
+        tmp_path,
+        max_instances=2,
+        max_instances_per_connection=2,
+    )
+    srv._handle({"method": "__create__", "instance_id": 0, "args": {}})
+    srv._handle({"method": "__create__", "instance_id": 1, "args": {}})
+
+    with pytest.raises(ValueError, match="live instance cap"):
+        srv._handle({"method": "__create__", "instance_id": 2, "args": {}})
+
+    srv._handle({"method": "__destroy__", "instance_id": 0, "args": {}})
+    assert srv._handle({"method": "__create__", "instance_id": 2, "args": {}})["ok"]
+
+
+def test_per_connection_live_instance_cap(tmp_path: Path) -> None:
+    srv = _server(
+        tmp_path,
+        max_instances=2,
+        max_instances_per_connection=1,
+    )
+    created: set[int] = set()
+    srv._handle(
+        {"method": "__create__", "instance_id": 0, "args": {}},
+        created_instance_ids=created,
+    )
+
+    with pytest.raises(ValueError, match="connection reached"):
+        srv._handle(
+            {"method": "__create__", "instance_id": 1, "args": {}},
+            created_instance_ids=created,
+        )
+
+    srv._handle(
+        {"method": "__destroy__", "instance_id": 0, "args": {}},
+        created_instance_ids=created,
+    )
+    assert srv._handle(
+        {"method": "__create__", "instance_id": 1, "args": {}},
+        created_instance_ids=created,
+    )["ok"]
+
+
 def test_private_path_kwargs_rejected() -> None:
     with pytest.raises(ValueError, match="server-private path"):
         _reject_private_paths({"states_path": "/mcp_server/data/truth.npz"})
@@ -119,12 +182,21 @@ def test_env_config_load_defaults_and_override(tmp_path: Path) -> None:
     assert cfg.module_path == (tmp_path / "env.py").resolve()
     assert cfg.factory_name == "make_env"
     assert cfg.allowed_env_kwargs is None
+    assert cfg.require_public_methods_allowlist is False
+    assert cfg.max_instances == 64
+    assert cfg.max_instances_per_connection == 16
 
     (tmp_path / "env_config.json").write_text(
-        '{"module": "env.py", "factory": "make_env", "allowed_env_kwargs": ["seed"]}'
+        '{"module": "env.py", "factory": "make_env", '
+        '"allowed_env_kwargs": ["seed"], '
+        '"require_public_methods_allowlist": true, '
+        '"max_instances": 8, "max_instances_per_connection": 3}'
     )
     cfg2 = EnvConfig.load(data_dir=tmp_path, config_path=tmp_path / "env_config.json")
     assert cfg2.allowed_env_kwargs == frozenset({"seed"})
+    assert cfg2.require_public_methods_allowlist is True
+    assert cfg2.max_instances == 8
+    assert cfg2.max_instances_per_connection == 3
 
 
 def test_socket_round_trip_with_client(tmp_path: Path) -> None:

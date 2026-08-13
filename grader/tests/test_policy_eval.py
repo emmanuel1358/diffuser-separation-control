@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 
 import pytest
-
 from grading import policy_eval
 from grading.policy_eval import aggregate, run_seeds
 
@@ -59,10 +58,16 @@ def test_run_seeds_forwards_loader_kwargs(monkeypatch) -> None:
         n_seeds=1,
         policy_path="/tmp/output/custom.py",
         policy_factory="make_policy",
+        call_timeout_s=2.5,
+        first_call_timeout_s=9.0,
+        total_timeout_s=30.0,
     )
 
     assert captured["path"] == "/tmp/output/custom.py"
     assert captured["factory_name"] == "make_policy"
+    assert captured["timeout_s"] == 2.5
+    assert captured["first_call_timeout_s"] == 9.0
+    assert captured["total_timeout_s"] == 30.0
     assert "source" not in captured  # path mode does not pass source
 
 

@@ -43,8 +43,10 @@ hidden_env = "env"      # or "hybrid" (also ship static data/ files)
 def make_env(**env_kwargs):
     return MyEnv(**env_kwargs)        # any public methods: reset/step/custom
 ```
-3. Hide the answer: keep oracle / target / budget methods OFF the socket -- prefix
-   with `_`, or pin the surface (`_env_public_methods` fails CLOSED if malformed):
+3. Hide the answer: keep oracle / target / budget methods OFF the socket and
+   declare the required surface (`_env_public_methods` fails CLOSED under the
+   strict config). Exposed methods use explicit keyword signatures, not
+   unrestricted `**kwargs`:
 ```python
 class MyEnv:
     _env_public_methods = frozenset({"reset", "step"})
@@ -69,6 +71,15 @@ def compute_score(workspace, trajectory, private):
         policy.close()
     return score_from(env, action)
 ```
+6. Pin the RPC contract in `scorer/data/env_config.json`:
+```json
+{
+  "allowed_env_kwargs": ["seed"],
+  "require_public_methods_allowlist": true,
+  "max_instances": 64,
+  "max_instances_per_connection": 16
+}
+```
 
 If this grader uses `ContinuousTask.calibrated()` and generated locks (rather
 than `PolicyEvaluationTask` paired controls), declare task-specific committed
@@ -89,12 +100,13 @@ from `hidden_env` or `ml_task_type`.
 
 ## Reward-hacking discipline (built in)
 
-Env source is root-only; `_`/non-allow-listed methods rejected over the wire;
-`env_kwargs` resolving under `/mcp_server` rejected (optional `allowed_env_kwargs`
-pins the create contract); socket closed before grading; policy results return
-over a dedicated pipe (never stdout); error replies to the agent carry no
-server traceback. `raise AgentFault` for agent faults (kept 0.0); let
-author/infra faults propagate (discarded). See `docs/REWARD_HACKING.md`.
+Env source is root-only; `_`/non-allow-listed methods are rejected over the
+wire; explicit `allowed_env_kwargs` pins construction; global/per-connection
+instance caps bound live state; socket-exposed methods cannot accept
+unrestricted `**kwargs`; socket closes before grading; policy results return
+over a dedicated pipe (never stdout); error replies carry no server traceback.
+`raise AgentFault` for agent faults (kept 0.0); let author/infra faults
+propagate (discarded). See `docs/REWARD_HACKING.md`.
 
 ## load_submitted_policy parity
 

@@ -12,7 +12,7 @@ from grading.evaluation.plan import refresh_evaluation_plan
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate scorer/evaluation.plan.json from TASK = RubricTask(...). "
+            "Generate scorer/evaluation.plan.json from a registered TASK. "
             "Prefer letting `lbx-rl-harness reference` / `ground-truth` do this; "
             "Trusted CI seals via an explicit refresh step before validate."
         )

@@ -11,25 +11,29 @@ Dockerfile)::
     # or
     hidden_env = ""         # (default) no env server -- classical static task
 
-If ``hidden_env`` is "env" or "hybrid" and ``env_config.json`` is present at
-``/mcp_server/data/env_config.json``, it overrides the defaults (``env.py`` /
-``make_env``). Shape::
+New ``hidden_env`` tasks ship ``env_config.json`` at
+``/mcp_server/data/env_config.json``. The runtime retains defaults for
+previously-built legacy images. Shape::
 
     {
       "module":  "env.py",        // path relative to /mcp_server/data/
       "factory": "make_env",      // module-level callable returning an instance
-      "allowed_env_kwargs": ["split", "seed"]  // optional allow-list
+      "allowed_env_kwargs": ["split", "seed"],
+      "require_public_methods_allowlist": true,
+      "max_instances": 64,
+      "max_instances_per_connection": 16
     }
 
 ``module`` / ``factory`` are optional (use them when your env is a package, e.g.
 ``"module": "envs/__init__.py"``, or ``make_env`` is the wrong name).
 
-``allowed_env_kwargs`` is an optional reward-hacking guard: the agent supplies
+``allowed_env_kwargs`` is a required reward-hacking guard for newly validated
+tasks: the agent supplies
 ``env_kwargs`` on ``__create__`` and the server forwards them to
-``make_env(**env_kwargs)``; if declared, any key not in this list is rejected
-before the factory runs. Pin it to exactly the kwargs your factory expects. Omit
-it to accept any keys (the always-on ``SERVER_PRIVATE_ROOT`` path guard in
-``server.py`` still applies regardless).
+``make_env(**env_kwargs)`` and any key not in this list is rejected before the
+factory runs. Pin it to exactly the kwargs your factory expects (including an
+explicit empty list). Legacy configs that omit it retain allow-all behavior;
+the always-on ``SERVER_PRIVATE_ROOT`` path guard still applies.
 """
 
 from __future__ import annotations
@@ -76,6 +80,9 @@ class EnvConfig:
     module_path: Path
     factory_name: str
     allowed_env_kwargs: frozenset[str] | None = None
+    require_public_methods_allowlist: bool = False
+    max_instances: int = 64
+    max_instances_per_connection: int = 16
 
     @classmethod
     def load(
@@ -88,6 +95,9 @@ class EnvConfig:
         module = "env.py"
         factory = "make_env"
         allowed: frozenset[str] | None = None
+        require_allowlist = False
+        max_instances = 64
+        max_instances_per_connection = 16
         if config_path.exists():
             try:
                 raw = json.loads(config_path.read_text(encoding="utf-8"))
@@ -110,10 +120,38 @@ class EnvConfig:
                         f"{config_path}: 'allowed_env_kwargs' must be a list of strings"
                     )
                 allowed = frozenset(declared)
+            require_allowlist = raw.get(
+                "require_public_methods_allowlist", require_allowlist
+            )
+            max_instances = raw.get("max_instances", max_instances)
+            max_instances_per_connection = raw.get(
+                "max_instances_per_connection",
+                max_instances_per_connection,
+            )
+            if not isinstance(require_allowlist, bool):
+                raise RuntimeError(
+                    f"{config_path}: 'require_public_methods_allowlist' must be a boolean"
+                )
+            for field, value in (
+                ("max_instances", max_instances),
+                ("max_instances_per_connection", max_instances_per_connection),
+            ):
+                if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                    raise RuntimeError(
+                        f"{config_path}: {field!r} must be a positive integer"
+                    )
+            if max_instances_per_connection > max_instances:
+                raise RuntimeError(
+                    f"{config_path}: 'max_instances_per_connection' must not "
+                    "exceed 'max_instances'"
+                )
         return cls(
             module_path=(data_dir / module).resolve(),
             factory_name=factory,
             allowed_env_kwargs=allowed,
+            require_public_methods_allowlist=require_allowlist,
+            max_instances=max_instances,
+            max_instances_per_connection=max_instances_per_connection,
         )
 
 

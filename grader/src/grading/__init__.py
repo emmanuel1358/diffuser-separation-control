@@ -30,6 +30,15 @@ The accepted return shapes from continuous/legacy `compute_score()` are:
 New `multi_deterministic_rubrics` tasks declare `TASK = RubricTask(...)` instead.
 """
 
+# Helpers and the calibration toolkit are exported as submodules rather than
+# flattened at top level. Keeps `from grading import RubricBuilder, helpers`
+# clean and avoids name collisions with whatever the author has in scope.
+from grading import (
+    calibration,  # noqa: F401  re-exported
+    evaluation,  # noqa: F401  re-exported
+    helpers,  # noqa: F401  re-exported
+    policy_eval,  # noqa: F401  re-exported
+)
 from grading.env_loading import load_env_module
 from grading.evaluation.rubric import (
     RubricContext,
@@ -45,20 +54,13 @@ from grading.normalize import normalize_compute_score_return
 from grading.policy_runner import (
     PolicyAgentFault,
     PolicyHandle,
+    PolicyMissingMethodError,
     PolicyTimeoutError,
     PolicyWorker,
     PolicyWorkerError,
     load_submitted_policy,
 )
 from grading.rubric_builder import RubricBuilder
-
-# Helpers and the calibration toolkit are exported as submodules rather than
-# flattened at top level. Keeps `from grading import RubricBuilder, helpers`
-# clean and avoids name collisions with whatever the author has in scope.
-from grading import calibration  # noqa: F401  re-exported
-from grading import evaluation  # noqa: F401  re-exported
-from grading import helpers  # noqa: F401  re-exported
-from grading import policy_eval  # noqa: F401  re-exported
 
 __all__ = [
     "Grade",
@@ -70,6 +72,7 @@ __all__ = [
     "PASS_THRESHOLD",
     "PolicyAgentFault",
     "PolicyHandle",
+    "PolicyMissingMethodError",
     "PolicyTimeoutError",
     "PolicyWorker",
     "PolicyWorkerError",

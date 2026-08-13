@@ -76,6 +76,25 @@ def _lock():
     )
 
 
+def _effective_floor_task() -> ContinuousTask:
+    return ContinuousTask.static(
+        artifact=CsvRows("submission.csv", columns=["value", "label"]),
+        targets=_task().targets,
+        calibration=GeneratedCalibration(
+            quality_floor_mode="effective_no_info",
+        ),
+    )
+
+
+def _effective_floor_lock():
+    return _effective_floor_task().build_lock(
+        reference_metrics=_REFERENCE_METRICS,
+        naive_metrics=_NAIVE_METRICS,
+        degenerate_metrics=_DEGENERATE_METRICS,
+        input_digests={"fixture": "digest"},
+    )
+
+
 def test_ceiling_is_audited_but_reviewed_quality_floor_is_preserved() -> None:
     lock = _lock()
 
@@ -102,6 +121,34 @@ def test_ceiling_is_audited_but_reviewed_quality_floor_is_preserved() -> None:
     assert qualification["naive_semantic_gap_acknowledgement"]["kind"] == (
         "reviewed_exception"
     )
+
+
+def test_effective_no_info_mode_removes_prevalence_bonus_at_runtime() -> None:
+    task = _effective_floor_task()
+    lock = _effective_floor_lock()
+
+    assert lock.payload["schema_version"] == "3.2"
+    assert lock.quality_floor_mode == "effective_no_info"
+    assert task.score_metrics(_REFERENCE_METRICS, lock)[0] == pytest.approx(0.5)
+
+    score, progress, _ = task.score_metrics(
+        {"value": 1.0, "label": 0.49},
+        lock,
+    )
+    assert score == pytest.approx(0.0)
+    assert progress == pytest.approx({"value": 0.0, "label": 0.0})
+
+    weak_score, weak_progress, _ = task.score_metrics(
+        {"value": 0.9, "label": 0.60},
+        lock,
+    )
+    assert 0.0 < weak_score < 0.5
+    assert weak_progress["label"] == pytest.approx((0.60 - 0.49) / (1.0 - 0.49))
+
+
+def test_lock_floor_mode_is_bound_to_task_identity() -> None:
+    with pytest.raises(RuntimeError, match="TASK registration"):
+        _task().score_metrics(_REFERENCE_METRICS, _effective_floor_lock())
 
 
 def test_lock_validation_rejects_missing_semantic_gap_acknowledgement(

@@ -27,6 +27,8 @@ from __future__ import annotations
 import ctypes
 import errno
 import logging
+import math
+import numbers
 import os
 import pwd
 import queue
@@ -34,6 +36,7 @@ import select
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -58,6 +61,15 @@ class PolicyAgentFault(PolicyWorkerError, AgentFault):
     """Submitted policy execution failed after the trusted worker was ready."""
 
 
+class PolicyMissingMethodError(PolicyAgentFault, AttributeError):
+    """The submitted policy object does not expose a required public method.
+
+    ``AttributeError`` keeps Python's ``hasattr`` semantics for optional hooks;
+    ``PolicyAgentFault`` ensures a direct required-method access is a kept zero
+    rather than an untyped grader crash.
+    """
+
+
 class PolicyTimeoutError(PolicyAgentFault, TimeoutError):
     """Raised when a submitted policy call (load or predict) exceeds its timeout.
 
@@ -71,6 +83,57 @@ class PolicyTimeoutError(PolicyAgentFault, TimeoutError):
     DISCARDED instead of kept at a real 0.0, handing the agent a free veto for a
     model that deliberately hangs.
     """
+
+
+def _validate_untrusted_reply_values(value: Any, *, path: str = "result") -> None:
+    """Reject non-finite numeric values returned by submitted policy code.
+
+    MessagePack accepts NaN and infinities as ordinary floats. Letting those
+    values reach a task-authored rollout is unsafe: Python's common
+    ``max(0, min(1, value))`` clamp maps NaN to 1.0, and array math can launder
+    an invalid action into a finite perfect score before the shared result
+    normalizer sees it. Validate the worker reply at the trust boundary while
+    preserving non-numeric return values and framework objects.
+    """
+    if isinstance(value, bool):
+        return
+    if isinstance(value, numbers.Real):
+        try:
+            number = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise PolicyAgentFault(
+                f"submitted policy returned out-of-range numeric value at {path}"
+            ) from exc
+        if not math.isfinite(number):
+            raise PolicyAgentFault(
+                f"submitted policy returned non-finite numeric value at {path}"
+            )
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _validate_untrusted_reply_values(key, path=f"{path}.<key>")
+            _validate_untrusted_reply_values(item, path=f"{path}[{key!r}]")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_untrusted_reply_values(item, path=f"{path}[{index}]")
+        return
+
+    # ndarray / torch / JAX replies are reconstructed by the shared protocol.
+    # Convert only array-shaped values; gym spaces and unrelated objects become
+    # object arrays and are deliberately ignored.
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        try:
+            import numpy as np
+
+            array = np.asarray(value)
+        except Exception:
+            return
+        if np.issubdtype(array.dtype, np.number):
+            if not np.isfinite(array).all():
+                raise PolicyAgentFault(
+                    f"submitted policy returned non-finite numeric array at {path}"
+                )
 
 
 # CLONE_NEWIPC: a private SysV-IPC/POSIX-message namespace. Used by every
@@ -419,39 +482,28 @@ def _payload_to_ndarray(payload, np_module):
 
 
 def _default(obj):
-    try:
-        import numpy as np
-    except ImportError:
-        np = None
+    # Framework objects imply their framework is already imported. Consult
+    # sys.modules instead of cold-importing torch/JAX/pandas while trying to
+    # reject an unrelated unsupported object; those imports can exceed a tight
+    # per-call deadline and misreport a serialization error as a timeout.
+    np = sys.modules.get("numpy")
     if np is not None:
         if isinstance(obj, np.ndarray):
             return _ndarray_to_ext(obj, np)
         if isinstance(obj, np.generic):
             return obj.item()
 
-    try:
-        import torch
-    except ImportError:
-        torch = None
+    torch = sys.modules.get("torch")
     if torch is not None and np is not None and isinstance(obj, torch.Tensor):
         return msgpack.ExtType(
             _EXT_TORCH_TENSOR, _ndarray_payload(obj.detach().cpu().numpy(), np)
         )
 
-    try:
-        import jax
-    except ImportError:
-        jax = None
+    jax = sys.modules.get("jax")
     if jax is not None and np is not None and isinstance(obj, jax.Array):
         return msgpack.ExtType(_EXT_JAX_ARRAY, _ndarray_payload(np.asarray(obj), np))
 
-    try:
-        import gymnasium as _gym
-    except ImportError:
-        try:
-            import gym as _gym
-        except ImportError:
-            _gym = None
+    _gym = sys.modules.get("gymnasium") or sys.modules.get("gym")
     if _gym is not None and np is not None:
         spaces = getattr(_gym, "spaces", None)
         if spaces is not None:
@@ -490,10 +542,7 @@ def _default(obj):
                     msgpack.packb(payload, default=_default, use_bin_type=True),
                 )
 
-    try:
-        import pandas as pd
-    except ImportError:
-        pd = None
+    pd = sys.modules.get("pandas")
     if pd is not None:
         if isinstance(obj, pd.DataFrame):
             return obj.to_dict(orient="records")
@@ -511,10 +560,10 @@ def _default(obj):
     if isinstance(obj, datetime.timedelta):
         return obj.total_seconds()
 
-    try:
-        from pydantic import BaseModel as _PydBaseModel
-    except ImportError:
-        _PydBaseModel = None
+    _pydantic = sys.modules.get("pydantic")
+    _PydBaseModel = (
+        getattr(_pydantic, "BaseModel", None) if _pydantic is not None else None
+    )
     if _PydBaseModel is not None and isinstance(obj, _PydBaseModel):
         if hasattr(obj, "model_dump") and callable(obj.model_dump):
             try:
@@ -674,6 +723,9 @@ def _send(obj):
 def _auto_factory(module):
     if hasattr(module, "act"):
         return module
+    factory = getattr(module, "load_policy", None)
+    if callable(factory):
+        return factory()
     if hasattr(module, "Policy"):
         return module.Policy()
     return module
@@ -852,6 +904,7 @@ class PolicyWorker:
         *,
         timeout_s: float = 5.0,
         first_call_timeout_s: float | None = None,
+        total_timeout_s: float | None = None,
         cwd: Path | None = None,
         max_stderr_chars: int = 8000,
         max_reply_bytes: int = _MAX_POLICY_REPLY_BYTES,
@@ -867,6 +920,14 @@ class PolicyWorker:
         self.policy_path = Path(policy_path)
         self.timeout_s = timeout_s
         self.first_call_timeout_s = first_call_timeout_s
+        if total_timeout_s is not None and (
+            not math.isfinite(total_timeout_s) or total_timeout_s <= 0.0
+        ):
+            raise ValueError("total_timeout_s must be positive and finite")
+        self.total_timeout_s = (
+            float(total_timeout_s) if total_timeout_s is not None else None
+        )
+        self._total_call_elapsed_s = 0.0
         self._first_call_done = False
         self.cwd = Path(cwd) if cwd is not None else None
         if max_stderr_chars <= 0:
@@ -954,6 +1015,7 @@ class PolicyWorker:
         self._responses = queue.Queue()
         self._reader_error = None
         self._stderr_text = ""
+        self._total_call_elapsed_s = 0.0
         self._first_call_done = False
 
         # IPC-isolation status pipe: when the drop runs through the preexec hook
@@ -1070,7 +1132,9 @@ class PolicyWorker:
         # died in trusted setup -> genuine infra failure (discarded rollout).
         try:
             ack = self._read_reply(
-                self._effective_timeout(), what="init handshake (pre-agent ack)"
+                self._effective_timeout(),
+                what="init handshake (pre-agent ack)",
+                charge_total=False,
             )
         except (PolicyWorkerError, TimeoutError) as exc:
             raise PolicyWorkerError(
@@ -1088,7 +1152,9 @@ class PolicyWorker:
         # agent hanging its own import), or an ok=False frame with a traceback.
         try:
             reply = self._read_reply(
-                self._effective_timeout(), what="init handshake (load result)"
+                self._effective_timeout(),
+                what="init handshake (load result)",
+                charge_total=False,
             )
         except (PolicyWorkerError, TimeoutError) as exc:
             raise AgentFault(
@@ -1179,6 +1245,7 @@ class PolicyWorker:
                 reply.get("error") if isinstance(reply, dict) else None
             ) or "policy worker error"
             raise PolicyAgentFault(str(err))
+        _validate_untrusted_reply_values(reply.get("result"))
         return reply
 
     def _write_frame(self, obj: Any) -> None:
@@ -1187,19 +1254,50 @@ class PolicyWorker:
         proc.stdin.write(_frame(_pack(obj)))
         proc.stdin.flush()
 
-    def _read_reply(self, timeout_s: float, *, what: str) -> Any:
+    def _read_reply(
+        self, timeout_s: float, *, what: str, charge_total: bool = True
+    ) -> Any:
+        if charge_total and self.total_timeout_s is not None:
+            remaining = self.total_timeout_s - self._total_call_elapsed_s
+            if remaining <= 0.0:
+                self.kill()
+                raise PolicyTimeoutError(
+                    "submitted policy exceeded its total compute budget "
+                    f"of {self.total_timeout_s:.3f}s"
+                )
+            timeout_s = min(timeout_s, remaining)
+        started = time.monotonic()
         try:
             frame = self._responses.get(timeout=timeout_s)
         except queue.Empty as exc:
             self.kill()
+            if (
+                charge_total
+                and self.total_timeout_s is not None
+                and self._total_call_elapsed_s + (time.monotonic() - started)
+                >= self.total_timeout_s
+            ):
+                raise PolicyTimeoutError(
+                    "submitted policy exceeded its total compute budget "
+                    f"of {self.total_timeout_s:.3f}s"
+                ) from exc
             raise PolicyTimeoutError(
                 f"policy.{what} timed out after {timeout_s:.3f}s"
             ) from exc
+        finally:
+            if charge_total:
+                self._total_call_elapsed_s += time.monotonic() - started
         if frame is None:
             if self._reader_error:
                 raise PolicyWorkerError(self._reader_error)
             raise PolicyWorkerError(self._error_context("policy worker exited"))
-        return _unpack(frame)
+        try:
+            return _unpack(frame)
+        except Exception as exc:
+            raise PolicyWorkerError(
+                "submitted policy returned an invalid msgpack reply: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     def _effective_timeout(self) -> float:
         if self._first_call_done:
@@ -1311,7 +1409,9 @@ class PolicyHandle:
         if name not in cache:
             cache[name] = self._worker.has(name, _path=self._path)
         if not cache[name]:
-            raise AttributeError(f"submitted policy has no attribute {name!r}")
+            raise PolicyMissingMethodError(
+                f"submitted policy has no attribute {name!r}"
+            )
         path = self._path
 
         def _bound(*args: Any, **kwargs: Any) -> Any:
@@ -1339,6 +1439,7 @@ def load_submitted_policy(
     sys_path_dirs: list[str | Path] | None = None,
     timeout_s: float = 5.0,
     first_call_timeout_s: float | None = None,
+    total_timeout_s: float | None = None,
     max_reply_bytes: int = _MAX_POLICY_REPLY_BYTES,
     memory_limit_bytes: int | None = None,
     cwd: str | Path | None = None,
@@ -1367,6 +1468,7 @@ def load_submitted_policy(
         Path(path),
         timeout_s=timeout_s,
         first_call_timeout_s=first_call_timeout_s,
+        total_timeout_s=total_timeout_s,
         max_reply_bytes=max_reply_bytes,
         memory_limit_bytes=memory_limit_bytes,
         cwd=Path(cwd) if cwd is not None else None,

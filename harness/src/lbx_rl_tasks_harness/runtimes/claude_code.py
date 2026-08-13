@@ -27,6 +27,7 @@ from lbx_rl_tasks_harness.runtimes.common import (
     parse_mcp_tool_payload,
     task_prompt_text,
 )
+from lbx_rl_tasks_harness.tmux_tool import _tmux_exec_args
 from lbx_rl_tasks_harness.trajectory import (
     print_grader_results,
     StreamingTrajectoryRenderer,
@@ -295,7 +296,7 @@ def _build_tmux_mcp_server(container_id: str) -> Any:
         try:
             proc = await asyncio.to_thread(
                 subprocess.run,
-                ["docker", "exec", container_id, "bash", "-lc", f"tmux {command}"],
+                _tmux_exec_args(container_id, command),
                 capture_output=True,
                 text=True,
                 timeout=120,

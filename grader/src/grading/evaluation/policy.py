@@ -20,7 +20,8 @@ from grading.evaluation.result import (
 from grading.faults import AgentFault
 from grading.policy_runner import PolicyWorkerError, load_submitted_policy
 
-POLICY_CHALLENGE_PROTOCOL = "paired-policy-challenge.v1"
+POLICY_CHALLENGE_PROTOCOL = "paired-policy-challenge.v2"
+SCENARIO_SEED_DERIVATION = "nonce_hmac_u64.v1"
 PolicyRollout = Callable[[Any, int], float]
 ControlRollout = Callable[[int], float]
 _CONTROL_FAMILY_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -34,11 +35,25 @@ def _binomial_upper_tail(*, wins: int, trials: int) -> float:
     return numerator / (2**trials)
 
 
-def _bounded_quality(value: Any, *, source: str) -> float:
-    number = float(value)
+def _bounded_quality(
+    value: Any, *, source: str, agent_controlled: bool = False
+) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        if agent_controlled:
+            raise AgentFault(f"{source} returned non-numeric policy quality") from exc
+        raise RuntimeError(f"{source} returned non-numeric policy quality") from exc
     if not math.isfinite(number):
+        if agent_controlled:
+            raise AgentFault(f"{source} returned non-finite policy quality")
         raise RuntimeError(f"{source} returned non-finite policy quality")
     return max(0.0, min(1.0, number))
+
+
+def _scenario_seeds(context: EvaluationContext, count: int) -> list[int]:
+    """Derive non-enumerable nonce-bound uint64 scenario seeds."""
+    return [context.seed(f"scenario:{index}") for index in range(count)]
 
 
 @dataclass(frozen=True)
@@ -51,6 +66,7 @@ class PolicyEvaluationTask:
     alpha: float = 0.01
     reference_quality: float = 0.95
     call_timeout_s: float = 2.0
+    total_timeout_s: float = 3600.0
     required_control_families: tuple[str, ...] = (
         "no_op",
         "constant",
@@ -72,8 +88,15 @@ class PolicyEvaluationTask:
             raise ValueError("policy challenge alpha must lie in (0, 1)")
         if not 0.0 < self.reference_quality < 1.0:
             raise ValueError("reference_quality must lie in (0, 1)")
-        if self.call_timeout_s <= 0.0:
-            raise ValueError("call timeout must be positive")
+        if not math.isfinite(self.call_timeout_s) or self.call_timeout_s <= 0.0:
+            raise ValueError("call timeout must be positive and finite")
+        if (
+            not math.isfinite(self.total_timeout_s)
+            or self.total_timeout_s < self.call_timeout_s
+        ):
+            raise ValueError(
+                "total timeout must be finite and at least the per-call timeout"
+            )
         families = tuple(str(family) for family in self.required_control_families)
         if (
             not families
@@ -87,13 +110,15 @@ class PolicyEvaluationTask:
 
     def spec_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": "policy-evaluation-task.v2",
+            "schema_version": "policy-evaluation-task.v4",
             "policy_path": self.policy_path,
             "factory_name": self.factory_name,
             "scenarios": self.scenarios,
+            "scenario_seed_derivation": SCENARIO_SEED_DERIVATION,
             "alpha": self.alpha,
             "reference_quality": self.reference_quality,
             "call_timeout_s": self.call_timeout_s,
+            "total_timeout_s": self.total_timeout_s,
             "required_control_families": list(self.required_control_families),
             "protocol": POLICY_CHALLENGE_PROTOCOL,
         }
@@ -118,6 +143,7 @@ class PolicyEvaluationTask:
         payload = json.dumps(
             {
                 "protocol": POLICY_CHALLENGE_PROTOCOL,
+                "scenario_seed_derivation": SCENARIO_SEED_DERIVATION,
                 "policy_path": self.policy_path,
                 "factory_name": self.factory_name,
                 "scenarios": self.scenarios,
@@ -136,6 +162,7 @@ class PolicyEvaluationTask:
         payload = json.dumps(
             {
                 "protocol": POLICY_CHALLENGE_PROTOCOL,
+                "scenario_seed_derivation": SCENARIO_SEED_DERIVATION,
                 "policy_path": self.policy_path,
                 "factory_name": self.factory_name,
                 "scenarios": self.scenarios,
@@ -154,6 +181,11 @@ class PolicyEvaluationTask:
                 "type": POLICY_CHALLENGE_PROTOCOL,
                 "scenarios": self.scenarios,
                 "alpha": self.alpha,
+                "scenario_seed_derivation": SCENARIO_SEED_DERIVATION,
+                "budgets": {
+                    "per_call_timeout_s": self.call_timeout_s,
+                    "total_policy_timeout_s": self.total_timeout_s,
+                },
                 "controls": {
                     "type": "author-registered-trusted.v2",
                     "required_families": list(self.required_control_families),
@@ -220,14 +252,12 @@ class PolicyEvaluationTask:
             ),
             candidate_digest=committed_digest,
         )
-        seeds = [
-            context.seed(f"scenario:{index}") % (2**31 - 1)
-            for index in range(self.scenarios)
-        ]
+        seeds = _scenario_seeds(context, self.scenarios)
         policy = load_submitted_policy(
             artifact,
             factory_name=self.factory_name,
             timeout_s=self.call_timeout_s,
+            total_timeout_s=self.total_timeout_s,
         )
         candidate_scores: list[float] = []
         try:
@@ -236,6 +266,7 @@ class PolicyEvaluationTask:
                     score = _bounded_quality(
                         rollout(policy, seed),
                         source="submitted policy rollout",
+                        agent_controlled=True,
                     )
                 except PolicyWorkerError as exc:
                     raise AgentFault(f"submitted policy failed: {exc}") from exc
@@ -311,6 +342,7 @@ class PolicyEvaluationTask:
             replay={
                 "nonce": context.nonce,
                 "artifact_digest": context.artifact_digest,
+                "scenario_seed_derivation": SCENARIO_SEED_DERIVATION,
                 "scenario_seeds": seeds,
             },
         )
@@ -332,4 +364,5 @@ __all__ = [
     "ControlRollout",
     "PolicyEvaluationTask",
     "PolicyRollout",
+    "SCENARIO_SEED_DERIVATION",
 ]

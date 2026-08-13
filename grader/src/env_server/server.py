@@ -68,13 +68,13 @@ instance (calling ``close()`` if present). Any other ``method`` whose name
 starts with ``_`` is rejected: a private/underscore method can expose internal
 state (an oracle, hidden parameters) the rollout is meant to infer.
 
---- Public-method allow-list (opt-in) -----------------------------------
+--- Public-method allow-list --------------------------------------------
 
-By default every PUBLIC method is dispatchable. A task can narrow that by
-declaring a class-level ``_env_public_methods`` (set/frozenset/list of names):
-only listed names dispatch. A declared-but-malformed value fails CLOSED
-(rejects every method), so an env that tried to lock its surface never silently
-falls open.
+New tasks set ``require_public_methods_allowlist`` in ``env_config.json`` and
+declare a class-level ``_env_public_methods`` (set/frozenset/list of names):
+only listed names dispatch. A missing or malformed declaration then fails
+CLOSED. Legacy configs retain the historical behavior where every public
+method is dispatchable when no allow-list is present.
 
 --- Concurrency ----------------------------------------------------------
 
@@ -158,9 +158,25 @@ class EnvServer:
         socket_path: Path,
         *,
         max_connection_handlers: int = _MAX_CONNECTION_HANDLERS,
+        max_instances: int | None = None,
+        max_instances_per_connection: int | None = None,
     ):
         if max_connection_handlers <= 0:
             raise ValueError("max_connection_handlers must be positive")
+        effective_max_instances = (
+            env_config.max_instances if max_instances is None else max_instances
+        )
+        effective_per_connection = (
+            env_config.max_instances_per_connection
+            if max_instances_per_connection is None
+            else max_instances_per_connection
+        )
+        if effective_max_instances <= 0 or effective_per_connection <= 0:
+            raise ValueError("environment instance caps must be positive")
+        if effective_per_connection > effective_max_instances:
+            raise ValueError(
+                "per-connection instance cap must not exceed the global cap"
+            )
         self.env_config = env_config
         self.socket_path = socket_path
         self._make_env = self._load_make_env()
@@ -172,6 +188,9 @@ class EnvServer:
         self._gen: str = uuid.uuid4().hex
         self._max_connection_handlers = max_connection_handlers
         self._handler_slots = threading.BoundedSemaphore(max_connection_handlers)
+        self._max_instances = effective_max_instances
+        self._max_instances_per_connection = effective_per_connection
+        self._instance_slots = threading.BoundedSemaphore(effective_max_instances)
         self._last_resource_warning = 0.0
 
     # ---- loading ------------------------------------------------------
@@ -210,15 +229,17 @@ class EnvServer:
                 self._instance_locks.pop(instance_id, None)
         if instance is None:
             return
-        close = getattr(instance, "close", None)
-        if callable(close):
-            try:
+        try:
+            close = getattr(instance, "close", None)
+            if callable(close):
                 close()
-            except Exception:
-                logger.exception(
-                    "[ENV_SERVER] close() raised for instance %d; discarding",
-                    instance_id,
-                )
+        except Exception:
+            logger.exception(
+                "[ENV_SERVER] close() raised for instance %d; discarding",
+                instance_id,
+            )
+        finally:
+            self._instance_slots.release()
 
     def _validate_env_kwargs(self, env_kwargs: dict) -> None:
         """Reward-hacking guard on agent-supplied ``__create__`` kwargs.
@@ -258,6 +279,14 @@ class EnvServer:
             env_kwargs = args.get("env_kwargs") or {}
             if not isinstance(env_kwargs, dict):
                 raise ValueError("args.env_kwargs must be a map (dict)")
+            if (
+                created_instance_ids is not None
+                and len(created_instance_ids) >= self._max_instances_per_connection
+            ):
+                raise ValueError(
+                    "connection reached its live environment instance cap "
+                    f"({self._max_instances_per_connection})"
+                )
             self._validate_env_kwargs(env_kwargs)
             lock = self._get_instance_lock(instance_id)
             with lock:
@@ -267,9 +296,17 @@ class EnvServer:
                             f"instance_id {instance_id} already exists; call "
                             f"{_OP_DESTROY!r} first or use a new id"
                         )
+                if not self._instance_slots.acquire(blocking=False):
+                    with self._instances_lock:
+                        self._instance_locks.pop(instance_id, None)
+                    raise ValueError(
+                        "environment server reached its live instance cap "
+                        f"({self._max_instances})"
+                    )
                 try:
                     new_instance = self._make_env(**env_kwargs)
                 except BaseException:
+                    self._instance_slots.release()
                     with self._instances_lock:
                         self._instance_locks.pop(instance_id, None)
                     raise
@@ -299,9 +336,14 @@ class EnvServer:
                 f"call {_OP_CREATE!r} first"
             )
 
-        # Per-task public-method allow-list (opt-in). Fail CLOSED on a malformed
-        # declaration so an env that tried to lock its surface never falls open.
+        # Per-task public-method allow-list. Strict configs require one; legacy
+        # configs retain opt-in behavior. Malformed declarations fail CLOSED.
         raw_allow = getattr(instance, "_env_public_methods", None)
+        if raw_allow is None and self.env_config.require_public_methods_allowlist:
+            raise ValueError(
+                "this env requires _env_public_methods but the instance did not "
+                "declare one"
+            )
         if raw_allow is not None:
             if isinstance(raw_allow, str):
                 logger.warning(

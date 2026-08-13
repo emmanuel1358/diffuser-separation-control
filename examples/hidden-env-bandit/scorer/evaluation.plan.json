@@ -1,15 +1,27 @@
 {
   "evidence": {
     "alpha": 0.01,
-    "controls": "author-registered-trusted",
+    "budgets": {
+      "per_call_timeout_s": 2.0,
+      "total_policy_timeout_s": 900.0
+    },
+    "controls": {
+      "required_families": [
+        "no_op",
+        "constant",
+        "open_loop"
+      ],
+      "type": "author-registered-trusted.v2"
+    },
+    "scenario_seed_derivation": "nonce_hmac_u64.v1",
     "scenarios": 128,
-    "type": "paired-policy-challenge.v1"
+    "type": "paired-policy-challenge.v2"
   },
   "metric_ids": [
     "paired.normalized_return.v1"
   ],
-  "plan_sha256": "2a85b002f04cf63faad6a91925b8da65a954ba1c541ec31b134637079ad6224b",
+  "plan_sha256": "0aa38d087ea0b73cb1220f981cefb4b0ccbd4f5ac7cd1cce68be900ddf7e73ca",
   "schema_version": "continuous-evaluation-plan.v1",
   "security_tier": "sealed_challenge",
-  "task_spec_sha256": "c6c34160cfbdfc90f61f4eb30fc29c983790809d1301c41fd3ea97e33bf7d1e2"
+  "task_spec_sha256": "e299b9a26d7b8a9782bb71ff50664f319325eebbd44ec6bfcd1d99d204b932bf"
 }

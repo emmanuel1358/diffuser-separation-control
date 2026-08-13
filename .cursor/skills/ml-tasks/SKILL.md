@@ -71,7 +71,10 @@ from grading.evaluation import ContinuousTask, PrivateTableChallenge, PythonPred
 TASK = ContinuousTask.model(
     artifact=PythonPredictor("predictor.py"),
     challenge=PrivateTableChallenge(
-        "challenge.parquet", feature_columns=["x1", "x2"], sample_size=256
+        "challenge.parquet",
+        feature_columns=["x1", "x2"],
+        sample_size=256,
+        selection_policy="stable_subset",
     ),
     targets=[...],
 )
@@ -97,7 +100,12 @@ def compute_score(workspace, trajectory, private):
   `allow_pickle=False`. Whole-object H5AD cannot be handed back to the root
   grader; evaluate it inside a dropped worker or expose bounded primitive HDF5
   datasets.
-- Use registered targets, reviewed `FloorAnchor`s, and generated lock schema v3. Never call `TASK.score(metrics)` from production.
+- Use registered targets, reviewed `FloorAnchor`s, and generated lock schema v3.
+  New classification-heavy tasks should set
+  `GeneratedCalibration(quality_floor_mode="effective_no_info")`. Never call
+  `TASK.score(metrics)` from production.
+- Disclose `PythonPredictor` load/predict, row, and reply limits in the prompt.
+  Static CSVs with IDs use `CsvRows(..., join_key="id")`.
 
 ## Shapes (nothing to declare)
 

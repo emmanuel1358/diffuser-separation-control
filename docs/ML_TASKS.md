@@ -144,7 +144,10 @@ TASK = ContinuousTask.model(
             perfect=0.0,
         )
     ],
-    calibration=GeneratedCalibration("calibration.lock.json"),
+    calibration=GeneratedCalibration(
+        "calibration.lock.json",
+        quality_floor_mode="effective_no_info",
+    ),
     naive="baselines/naive",
 )
 
@@ -177,18 +180,19 @@ Rules:
   batch with shuffled fresh-worker partitions.
 - **Declare the real inference budget.** `PythonPredictor` commits
   `predict_timeout_s`, `first_call_timeout_s`, `max_rows`, and
-  `max_reply_bytes` into the task digest. Reference inference must retain
-  headroom under those exact limits.
+  `max_reply_bytes` into the task digest. State those exact limits in
+  `instruction.md`; reference inference must retain headroom under them.
 - **Use stable private selection.** `PrivateTableChallenge` evaluates the full
-  bank by default. For a bounded draw, set both `sample_size` and
-  `selection_policy="stable_subset"` so calibration and production score
-  identical rows. Existing sized challenges without that policy retain
-  artifact-bound selection until migrated.
+  bank by default and a sized challenge now defaults to `stable_subset`, so
+  calibration and production score identical rows. Explicit
+  `selection_policy="artifact_digest"` is retained only for legacy `3.0` lock
+  migration.
 - **Never preserve undeclared CSV fields just to be permissive.** Use
   `extra_columns="drop"` for safe tolerance, or `"reject"` (the default).
-  `"preserve"` is an explicit expert-only escape hatch. For keyed comparisons,
-  use `join_submission_to_truth_or_fault`, which projects declared columns
-  before merging.
+  `"preserve"` is an explicit expert-only escape hatch. For keyed static CSV
+  comparisons, declare `CsvRows(..., join_key="id")`; it uses
+  `join_submission_to_truth_or_fault`, which projects declared columns before
+  merging.
 - **Run ground truth locally only when you need calibration feedback.** The
   framework measures committed reference/naive strategies, writes an ignored
   development lock/evidence bundle, and replays no-op/reference/oracle
@@ -205,6 +209,10 @@ Rules:
   exceeds the configured threshold, calibration fails until
   `GeneratedCalibration(naive_semantic_gap_acknowledgement=...)` records a
   reviewed exception.
+- **Use effective no-information floors for new classification-heavy tasks.**
+  `GeneratedCalibration(quality_floor_mode="effective_no_info")` starts
+  grade-time credit above the measured no-information ceiling. Existing
+  author-floor locks remain supported until explicitly regenerated.
 - **Metric names are not formulas.** Use exact versioned definitions such as
   `sre.rmse_over_population_std.v1`; documentation and the generated lock expose
   denominator, `ddof`, threshold, label, and averaging conventions.
@@ -344,6 +352,13 @@ before candidate evaluation. Legacy calls without the mapping remain supported
 as unclassified controls. Override the required tuple only when a family is
 genuinely meaningless for the domain, and keep that choice reviewable in the
 task spec.
+
+Policy tasks also declare `call_timeout_s` and `total_timeout_s`. The first
+limits one policy-worker RPC; the second charges cumulative time waiting for
+submitted policy calls so thousands of individually compliant sleeps cannot
+reach the outer grader timeout and discard the run. State both limits in
+`instruction.md`, measure the reference under them, and keep the total at or
+below 80% of the effective grading timeout.
 
 If the honest naive exactly ties every effective no-information floor and no
 weak-positive baseline exists, opt in explicitly with

@@ -85,6 +85,54 @@ def test_ensure_agent_output_directory_replaces_symlink(tmp_path: Path) -> None:
     assert secret.read_text() == "answer"
 
 
+def test_ensure_output_rejects_symlink_when_open_ignores_nofollow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    private_mode = stat.S_IMODE(private.stat().st_mode)
+    output = tmp_path / "output"
+    os.symlink(private, output)
+    real_open = os.open
+
+    def open_ignoring_nofollow(path, flags, *args, **kwargs):
+        return real_open(path, flags & ~os.O_NOFOLLOW, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_hardening.os, "open", open_ignoring_nofollow)
+
+    assert ensure_agent_output_directory(output) is True
+    assert output.is_dir()
+    assert not output.is_symlink()
+    assert stat.S_IMODE(private.stat().st_mode) == private_mode
+
+
+def test_pre_grade_cleanup_scrubs_top_level_symlink_before_restore(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    private_mode = stat.S_IMODE(private.stat().st_mode)
+    output = tmp_path / "output"
+    os.symlink(private, output)
+    real_open = os.open
+
+    def open_ignoring_nofollow(path, flags, *args, **kwargs):
+        return real_open(path, flags & ~os.O_NOFOLLOW, *args, **kwargs)
+
+    monkeypatch.setattr(runtime_hardening.os, "open", open_ignoring_nofollow)
+    monkeypatch.setattr(runtime_hardening.os, "geteuid", lambda: 1000)
+
+    result = pre_grade_cleanup(output)
+
+    assert result["removed_symlinks"] == 1
+    assert result["restored_output_directory"] == 1
+    assert output.is_dir()
+    assert not output.is_symlink()
+    assert stat.S_IMODE(private.stat().st_mode) == private_mode
+
+
 def test_pre_grade_cleanup_runs_scrubs(tmp_path: Path) -> None:
     output = tmp_path / "output"
     private = tmp_path / "private"
@@ -282,6 +330,96 @@ def test_quiesce_proc_enumeration_failure_fails_closed(monkeypatch) -> None:
         match="could not enumerate",
     ):
         runtime_hardening.kill_pre_grade_agent_processes(max_passes=1)
+
+
+def test_quiesce_waits_for_same_killed_process_identity(monkeypatch) -> None:
+    snapshots = iter((["123"], ["123"], [], []))
+    killed: list[tuple[int, int]] = []
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(runtime_hardening.os, "getpid", lambda: 900)
+    monkeypatch.setattr(runtime_hardening.os, "getppid", lambda: 901)
+    monkeypatch.setattr(runtime_hardening.os, "listdir", lambda _path: next(snapshots))
+    monkeypatch.setattr(
+        runtime_hardening.os,
+        "stat",
+        lambda _path: type("ProcStat", (), {"st_uid": 1000})(),
+    )
+    monkeypatch.setattr(
+        runtime_hardening,
+        "_read_proc_identity",
+        lambda _path: ("R", 77),
+    )
+    monkeypatch.setattr(
+        runtime_hardening.os,
+        "kill",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
+    monkeypatch.setattr(runtime_hardening.time, "sleep", sleeps.append)
+
+    assert runtime_hardening.kill_pre_grade_agent_processes() == 1
+    assert killed == [(123, signal.SIGKILL)]
+    assert sleeps == [0.05, 0.05]
+
+
+def test_quiesce_classifies_new_process_identity_as_respawn(monkeypatch) -> None:
+    snapshots = iter((["123"], ["124"]))
+
+    monkeypatch.setattr(runtime_hardening.os, "getpid", lambda: 900)
+    monkeypatch.setattr(runtime_hardening.os, "getppid", lambda: 901)
+    monkeypatch.setattr(runtime_hardening.os, "listdir", lambda _path: next(snapshots))
+    monkeypatch.setattr(
+        runtime_hardening.os,
+        "stat",
+        lambda _path: type("ProcStat", (), {"st_uid": 1000})(),
+    )
+    monkeypatch.setattr(
+        runtime_hardening,
+        "_read_proc_identity",
+        lambda path: ("R", int(path.rsplit("/", 1)[-1])),
+    )
+    monkeypatch.setattr(runtime_hardening.os, "kill", lambda _pid, _sig: None)
+
+    with pytest.raises(
+        runtime_hardening.AgentProcessQuiesceError,
+        match="did not converge",
+    ):
+        runtime_hardening.kill_pre_grade_agent_processes(
+            max_passes=2,
+            inter_pass_delay_s=0.0,
+        )
+
+
+def test_quiesce_classifies_stuck_killed_identity_as_infrastructure(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        runtime_hardening.os,
+        "listdir",
+        lambda _path: ["123"],
+    )
+    monkeypatch.setattr(runtime_hardening.os, "getpid", lambda: 900)
+    monkeypatch.setattr(runtime_hardening.os, "getppid", lambda: 901)
+    monkeypatch.setattr(
+        runtime_hardening.os,
+        "stat",
+        lambda _path: type("ProcStat", (), {"st_uid": 1000})(),
+    )
+    monkeypatch.setattr(
+        runtime_hardening,
+        "_read_proc_identity",
+        lambda _path: ("D", 77),
+    )
+    monkeypatch.setattr(runtime_hardening.os, "kill", lambda _pid, _sig: None)
+
+    with pytest.raises(
+        runtime_hardening.ProcessQuiesceError,
+        match="kernel teardown",
+    ):
+        runtime_hardening.kill_pre_grade_agent_processes(
+            max_passes=2,
+            inter_pass_delay_s=0.0,
+        )
 
 
 def test_root_cleanup_without_proc_fails_closed(monkeypatch, tmp_path: Path) -> None:

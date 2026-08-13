@@ -33,6 +33,14 @@ def _reward(grade: server.Grade) -> float:
     return sum(grade.subscores[k] * grade.weights.get(k, 0.0) for k in grade.subscores)
 
 
+def test_setup_private_roots_seal_authoring_metadata_and_solution() -> None:
+    assert "/task/task.toml" in server._SETUP_PRIVATE_ROOTS
+    assert "/solution" in server._SETUP_PRIVATE_ROOTS
+    assert "/task" not in server._SETUP_PRIVATE_ROOTS
+    assert "/task/task.toml" not in server._SETUP_READONLY_PRIVATE_ROOTS
+    assert "/solution" not in server._SETUP_READONLY_PRIVATE_ROOTS
+
+
 def test_promoted_calibration_digest_is_verified(monkeypatch, tmp_path) -> None:
     lock = tmp_path / "calibration.lock.json"
     plan_sha = "b" * 64
@@ -845,6 +853,32 @@ def test_attested_agent_fault_keeps_zero_and_records_replay_identity(
     assert grade.subscores == {"score": 0.0}
     assert grade.env_internal_failure is False
     assert trace["protocol"] == "agent-fault.v1"
+    assert len(trace["replay"]["nonce"]) == 32
+
+
+def test_attested_unclassified_crash_keeps_zero_and_records_failure_trace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    monkeypatch.setattr(server, "OUTPUT_DIR", output)
+    monkeypatch.setenv("LBX_EVALUATION_PLAN_ATTESTED", "1")
+
+    grade = server._evaluate(
+        "def compute_score():\n    raise ValueError('candidate-triggered decode')\n",
+        timeout_s=2.0,
+        trace_required=True,
+    )
+
+    trace = json.loads(
+        (output / ".lbx-evaluation" / "evaluation-details.json").read_text()
+    )
+    assert grade.subscores == {"score": 0.0}
+    assert grade.env_internal_failure is False
+    assert grade.metadata["return_shape"] == "unclassified_grader_crash"
+    assert grade.metadata["critical_operator_alert"] is True
+    assert trace["protocol"] == "unclassified-grader-crash.v1"
     assert len(trace["replay"]["nonce"]) == 32
 
 

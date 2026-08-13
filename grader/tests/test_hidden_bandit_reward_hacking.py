@@ -54,7 +54,7 @@ def test_hidden_bandit_reference_passes_fresh_policy_challenges(
 
     assert details["score"] == pytest.approx(0.5, abs=0.03)
     receipt = details["metadata"]["evaluation"]
-    assert receipt["protocol"] == "paired-policy-challenge.v1"
+    assert receipt["protocol"] == "paired-policy-challenge.v2"
     assert all(decision["accepted"] for decision in receipt["decisions"].values())
 
 

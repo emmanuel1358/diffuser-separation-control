@@ -131,6 +131,23 @@ def test_run_policy_helper_runs_a_workspace_policy(tmp_path: Path) -> None:
         assert policy.drop_privileges is True
 
 
+def test_run_policy_helper_forwards_explicit_factory(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "policy.py").write_text(
+        "class Configured:\n"
+        "    def __init__(self, value):\n"
+        "        self.value = value\n"
+        "    def act(self, obs):\n"
+        "        return self.value + obs['x']\n"
+        "def make_policy():\n"
+        "    return Configured(40)\n"
+    )
+
+    with helpers.run_policy(workspace, factory_name="make_policy") as policy:
+        assert policy.act({"x": 2}) == 42
+
+
 def test_run_policy_uses_submitted_snapshot_after_original_is_removed(
     tmp_path: Path,
 ) -> None:

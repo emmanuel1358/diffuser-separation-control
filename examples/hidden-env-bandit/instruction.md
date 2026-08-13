@@ -61,4 +61,5 @@ policy a fixed pull budget on each fresh bandit. Quality is the final recommende
 arm's normalized true mean. The policy must beat trusted fixed/open-loop controls
 across the paired scenarios; constant, seed-indexed, crashing, or observation-
 independent policies receive zero. Certified policies retain their continuous
-quality reward.
+quality reward. Each policy method call has a 2-second deadline, and all policy
+method calls across grading share a 900-second cumulative compute budget.

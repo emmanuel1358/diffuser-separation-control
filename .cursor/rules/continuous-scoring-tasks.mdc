@@ -18,5 +18,13 @@ alwaysApply: false
 - **Committed-strategy contract (mandatory):** every reference/naive declares digest-bound artifacts and an inference-only entrypoint. Existing trained models may keep `model.manifest.json`; use `strategy.manifest.json` with explicit `trained_model` or `committed_artifact` kind for procedural training and hand-authored policies/static artifacts. Never invent training data. Trusted CI / ground-truth / seal never train.
 - Numeric tabular tasks retain built-in no-information probes. Non-tabular callbacks declare deterministic ready-to-measure workspaces under `baselines/degenerate/` with `WorkspaceDegenerateProbes`; any missing/faulting/nondeterministic probe fails calibration.
 - Reference must score `0.5 ± 0.05`; naive is weak-positive by default. A naive that exactly ties every effective no-information floor needs `naive_score_min=0` plus a reviewed `naive_at_floor` rationale.
+- Sized private challenges use `selection_policy="stable_subset"` (now the
+  default); `artifact_digest` is legacy-lock migration only. Static CSVs with
+  IDs declare `join_key`.
+- New classification-heavy tasks should set
+  `GeneratedCalibration(quality_floor_mode="effective_no_info")` so prevalence
+  below the no-information ceiling earns no grade-time credit.
+- Prompts must disclose every `PythonPredictor` load/predict, row, and serialized
+  reply limit committed in the task spec.
 - Do not introduce `RubricTask` / rubric criteria unless the task is actually decomposed into deterministic rubric checks (`reward_type = "multi_deterministic_rubrics"`).
 - Before opening or updating a PR, run `uv run lbx-rl-harness run --runtime ground-truth --problem-dir problems/<task_id>` (inference-only; never shells out to `train.py`). While iterating, use `uv run lbx-rl-harness reference --problem-dir problems/<task_id>`.

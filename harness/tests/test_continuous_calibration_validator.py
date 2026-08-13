@@ -4,19 +4,24 @@ import hashlib
 import json
 
 import pytest
-
 from alignerr_plugin.proof import PROOF_PATH
-from alignerr_plugin.validators.task.validator import TaskValidator
+from alignerr_plugin.validators.task.validator import (
+    TaskValidator,
+    _predictor_budget_prompt_issues,
+)
 from grading.evaluation import (
     AnchorRationale,
     BinaryF1Target,
     ContinuousTask,
     FloorAnchor,
     GeneratedCalibration,
+    PolicyEvaluationTask,
+    PythonPredictor,
     SRETarget,
     write_calibration_lock_atomic,
 )
 from grading.evaluation.lock import canonical_json_bytes, validate_calibration_lock
+from grading.evaluation.plan import serialized_evaluation_plan
 
 LOW = FloorAnchor(
     0.0, AnchorRationale("metric_bound", "Binary F1 is bounded below by zero.")
@@ -181,6 +186,53 @@ def _write_v2_task(tmp_path):
         + "\n"
     )
     return task_dir
+
+
+def _write_policy_task(tmp_path, *, total_timeout_s: float):
+    task_dir = tmp_path / f"policy-{int(total_timeout_s)}"
+    scorer = task_dir / "scorer"
+    scorer.mkdir(parents=True)
+    (task_dir / "task.toml").write_text(_TASK_TOML)
+    task = PolicyEvaluationTask(scenarios=8, total_timeout_s=total_timeout_s)
+    (task_dir / "instruction.md").write_text(
+        "Each policy call has a 2-second deadline. "
+        f"All policy calls share a cumulative {total_timeout_s:g}-second "
+        "compute budget.\n"
+    )
+    (scorer / "compute_score.py").write_text(
+        "from grading.evaluation import PolicyEvaluationTask\n"
+        f"TASK = PolicyEvaluationTask(scenarios=8, total_timeout_s={total_timeout_s!r})\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    return TASK.grade(workspace=workspace, "
+        "rollout=lambda policy, seed: 0.0, "
+        "controls={'fixed': lambda seed: 0.0})\n"
+    )
+    (scorer / "evaluation.plan.json").write_text(
+        json.dumps(serialized_evaluation_plan(task.evaluation_plan), indent=2) + "\n"
+    )
+    return task_dir
+
+
+def test_predictor_budget_prompt_disclosure(tmp_path) -> None:
+    task_dir = tmp_path / "predictor-budgets"
+    task_dir.mkdir()
+    predictor = PythonPredictor(
+        predict_timeout_s=60,
+        first_call_timeout_s=120,
+        max_rows=100_000,
+        max_reply_bytes=64 * 1024 * 1024,
+    )
+    (task_dir / "instruction.md").write_text(
+        "Loading and the first call have a 120-second timeout. "
+        "Each predict call has a 60-second deadline and accepts up to "
+        "100000 rows. The serialized output is limited to 64 MiB.\n"
+    )
+
+    assert _predictor_budget_prompt_issues(task_dir, predictor) == []
+
+    (task_dir / "instruction.md").write_text("Submit predictor.py.\n")
+    issues = _predictor_budget_prompt_issues(task_dir, predictor)
+    assert len(issues) == 4
 
 
 def test_v2_calibration_stage_accepts_generated_lock_and_evidence(tmp_path) -> None:
@@ -440,3 +492,30 @@ def test_non_continuous_reward_types_are_unchanged(tmp_path, task_type) -> None:
 
     assert result.passed is True
     assert result.issues == []
+
+
+@pytest.mark.parametrize(
+    ("total_timeout_s", "expected_pass"),
+    [(3600.0, True), (9000.0, False)],
+)
+def test_policy_total_timeout_must_leave_grading_headroom(
+    tmp_path, total_timeout_s, expected_pass
+) -> None:
+    task_dir = _write_policy_task(tmp_path, total_timeout_s=total_timeout_s)
+
+    result = TaskValidator()._continuous_calibration(task_dir)
+
+    assert result.passed is expected_pass
+    if not expected_pass:
+        assert any("leave at least 20%" in issue for issue in result.issues)
+
+
+def test_policy_budgets_must_be_disclosed_in_prompt(tmp_path) -> None:
+    task_dir = _write_policy_task(tmp_path, total_timeout_s=3600.0)
+    (task_dir / "instruction.md").write_text("Keep the submitted policy fast.\n")
+
+    result = TaskValidator()._continuous_calibration(task_dir)
+
+    assert result.passed is False
+    assert any("per-call deadline" in issue for issue in result.issues)
+    assert any("cumulative compute budget" in issue for issue in result.issues)

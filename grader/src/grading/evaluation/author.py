@@ -10,7 +10,7 @@ import os
 import re
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
@@ -31,6 +31,7 @@ from grading.evaluation.lock import (
 from grading.evaluation.metrics import (
     AnchorRationale,
     MetricTarget,
+    effective_floor,
     measure_registered_targets,
     normalize_weights,
     validate_metric_vector,
@@ -41,7 +42,10 @@ from grading.evaluation.result import (
     write_private_trace,
 )
 from grading.faults import AgentFault
-from grading.helpers import load_submission_or_fault
+from grading.helpers import (
+    join_submission_to_truth_or_fault,
+    load_submission_or_fault,
+)
 from grading.policy_runner import load_submitted_policy
 
 # Thread-parallel inference (the common shape for tree ensembles) sums float
@@ -234,6 +238,7 @@ class CsvRows:
     path: str
     columns: tuple[str, ...]
     extra_columns: Literal["reject", "drop", "preserve"] = "reject"
+    join_key: str | None = None
     value_domains: Mapping[str, tuple[Any, ...]] = field(default_factory=dict)
     constraints: tuple[PredictionConstraint, ...] = ()
 
@@ -244,6 +249,7 @@ class CsvRows:
         columns: list[str] | tuple[str, ...],
         extra_columns: Literal["reject", "drop", "preserve"] | None = None,
         allow_extra_columns: bool | None = None,
+        join_key: str | None = None,
         value_domains: Mapping[str, list[Any] | tuple[Any, ...]] | None = None,
         constraints: list[PredictionConstraint] | tuple[PredictionConstraint, ...] = (),
     ) -> None:
@@ -264,6 +270,9 @@ class CsvRows:
             extra_policy = extra_columns or "reject"
         if extra_policy not in {"reject", "drop", "preserve"}:
             raise ValueError("extra_columns must be 'reject', 'drop', or 'preserve'")
+        normalized_join_key = str(join_key) if join_key is not None else None
+        if normalized_join_key is not None and normalized_join_key not in normalized:
+            raise ValueError("CsvRows join_key must be one of the declared columns")
         domains = _normalize_value_domains(value_domains)
         normalized_constraints = tuple(constraints)
         constrained_columns = set(domains)
@@ -279,6 +288,7 @@ class CsvRows:
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "columns", normalized)
         object.__setattr__(self, "extra_columns", extra_policy)
+        object.__setattr__(self, "join_key", normalized_join_key)
         object.__setattr__(self, "value_domains", domains)
         object.__setattr__(self, "constraints", normalized_constraints)
 
@@ -288,8 +298,8 @@ class CsvRows:
         return self.extra_columns == "preserve"
 
     def spec_dict(self) -> dict[str, Any]:
-        return {
-            "type": "csv_rows.v2",
+        payload = {
+            "type": "csv_rows.v3" if self.join_key is not None else "csv_rows.v2",
             "path": self.path,
             "columns": list(self.columns),
             "extra_columns": self.extra_columns,
@@ -299,10 +309,16 @@ class CsvRows:
             },
             "constraints": [constraint.spec_dict() for constraint in self.constraints],
         }
+        if self.join_key is not None:
+            payload["join_key"] = self.join_key
+        return payload
 
     def legacy_spec_dict(self) -> dict[str, Any] | None:
         """V1 identity for default-only descriptors during lock migration."""
-        if self.extra_columns not in {"reject", "preserve"}:
+        if (
+            self.extra_columns not in {"reject", "preserve"}
+            or self.join_key is not None
+        ):
             return None
         if self.value_domains or self.constraints:
             return None
@@ -438,7 +454,7 @@ class PrivateTableChallenge:
         ):
             raise ValueError("invalid private table challenge descriptor")
         policy = selection_policy or (
-            "full_bank" if sample_size is None else "artifact_digest"
+            "full_bank" if sample_size is None else "stable_subset"
         )
         if policy not in {"artifact_digest", "full_bank", "stable_subset"}:
             raise ValueError(
@@ -556,6 +572,7 @@ class GeneratedCalibration:
         DEFAULT_MAX_UNACKNOWLEDGED_NAIVE_SCORE_GAP
     )
     naive_semantic_gap_acknowledgement: AnchorRationale | None = None
+    quality_floor_mode: Literal["author", "effective_no_info"] = "author"
 
     def __post_init__(self) -> None:
         if self.filename != DEFAULT_LOCK_FILENAME:
@@ -575,10 +592,18 @@ class GeneratedCalibration:
                 "naive semantic gap acknowledgement must use "
                 "kind='reviewed_exception'"
             )
+        if self.quality_floor_mode not in {"author", "effective_no_info"}:
+            raise ValueError(
+                "quality_floor_mode must be 'author' or 'effective_no_info'"
+            )
 
     def spec_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "type": "generated_lock.v2",
+            "type": (
+                "generated_lock.v3"
+                if self.quality_floor_mode != "author"
+                else "generated_lock.v2"
+            ),
             "filename": self.filename,
             "max_unacknowledged_naive_score_gap": (
                 self.max_unacknowledged_naive_score_gap
@@ -590,6 +615,8 @@ class GeneratedCalibration:
             payload["naive_semantic_gap_acknowledgement"] = (
                 self.naive_semantic_gap_acknowledgement.spec_dict()
             )
+        if self.quality_floor_mode != "author":
+            payload["quality_floor_mode"] = self.quality_floor_mode
         return payload
 
     def legacy_spec_dict(self) -> dict[str, Any] | None:
@@ -598,6 +625,7 @@ class GeneratedCalibration:
             self.max_unacknowledged_naive_score_gap
             != DEFAULT_MAX_UNACKNOWLEDGED_NAIVE_SCORE_GAP
             or self.naive_semantic_gap_acknowledgement is not None
+            or self.quality_floor_mode != "author"
         ):
             return None
         payload: dict[str, Any] = {
@@ -1253,11 +1281,17 @@ class ContinuousTask:
             )
         if not isinstance(self.artifact, CsvRows):
             raise RuntimeError("unsupported continuous artifact descriptor")
+        numeric_columns = [
+            column
+            for column in self.artifact.columns
+            if column != self.artifact.join_key
+        ]
         submission = load_submission_or_fault(
             workspace / self.artifact.path,
             required_columns=self.artifact.columns,
-            numeric_columns=self.artifact.columns,
+            numeric_columns=numeric_columns,
             n_rows=len(truth),
+            unique_key_column=self.artifact.join_key,
             extra_columns=self.artifact.extra_columns,
         )
         _validate_prediction_contract(
@@ -1265,6 +1299,26 @@ class ContinuousTask:
             value_domains=self.artifact.value_domains,
             constraints=self.artifact.constraints,
         )
+        if self.artifact.join_key is not None:
+            prediction_columns = [target.prediction_column for target in self.targets]
+            truth_columns = [target.truth_column for target in self.targets]
+            joined = join_submission_to_truth_or_fault(
+                submission,
+                truth,
+                key_column=self.artifact.join_key,
+                prediction_columns=prediction_columns,
+                truth_columns=truth_columns,
+            )
+            aligned_submission = joined[prediction_columns].reset_index(drop=True)
+            aligned_truth = pd.DataFrame(
+                {
+                    column: joined[
+                        (f"{column}_truth" if column in prediction_columns else column)
+                    ].reset_index(drop=True)
+                    for column in dict.fromkeys(truth_columns)
+                }
+            )
+            return aligned_submission, aligned_truth
         return submission, truth
 
     def measure(
@@ -1367,6 +1421,7 @@ class ContinuousTask:
                 if self.calibration.naive_semantic_gap_acknowledgement is not None
                 else None
             ),
+            quality_floor_mode=self.calibration.quality_floor_mode,
         )
 
     def score_metrics(
@@ -1401,15 +1456,15 @@ class ContinuousTask:
         for target in self.targets:
             actual = lock_targets[target.name]
             expected = target.spec_dict()
-            for field, value in expected.items():
-                if field == "weight":
+            for field_name, value in expected.items():
+                if field_name == "weight":
                     # Locks persist normalized weights; author specs intentionally
                     # preserve the original positive relative weights.
                     continue
-                if actual.get(field) != value:
+                if actual.get(field_name) != value:
                     raise RuntimeError(
                         f"calibration lock target {target.name!r} field "
-                        f"{field!r} does not match the TASK"
+                        f"{field_name!r} does not match the TASK"
                     )
             if not math.isclose(
                 float(actual.get("weight")),
@@ -1422,8 +1477,31 @@ class ContinuousTask:
                 )
         finite = validate_metric_vector(self.targets, metrics)
         weights = normalized_weights
+        lock_floor_mode = lock.quality_floor_mode
+        if lock_floor_mode != self.calibration.quality_floor_mode:
+            raise RuntimeError(
+                "calibration lock quality floor mode does not match the TASK"
+            )
+        quality_targets = (
+            tuple(
+                replace(
+                    target,
+                    floor=replace(
+                        target.floor,
+                        value=effective_floor(
+                            target,
+                            lock.no_info_ceilings[target.name],
+                        ),
+                    ),
+                )
+                for target in self.targets
+            )
+            if lock_floor_mode == "effective_no_info"
+            else self.targets
+        )
         progress = {
-            target.name: target.progress(finite[target.name]) for target in self.targets
+            target.name: target.progress(finite[target.name])
+            for target in quality_targets
         }
         aggregate = sum(weights[name] * progress[name] for name in progress)
         final = PiecewiseLinearCurve.from_reference(lock.x_ref).score(aggregate)

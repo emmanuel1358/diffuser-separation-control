@@ -48,6 +48,10 @@ def load_predictor():
 - The predictor must not require network access.
 - Calls must be deterministic for the same rows.
 - You may place additional model files beside `predictor.py`.
+- The `load_predictor()`/first-call timeout is 120 seconds; each later
+  `predict(rows)` call has a 60-second deadline.
+- The predictor may receive up to 100000 rows, and its serialized output must
+  stay within 64 MiB.
 
 ## Scoring
 

@@ -8,8 +8,8 @@ from grading.evaluation import (
     ContinuousTask,
     FloorAnchor,
     GeneratedCalibration,
-    PrivateTableChallenge,
     PopulationSRETarget,
+    PrivateTableChallenge,
     PythonPredictor,
 )
 
@@ -39,6 +39,8 @@ TASK = ContinuousTask.model(
         "challenge.parquet",
         feature_columns=["x1", "x2", "x3"],
         sample_size=400,
+        # Grandfathered lock compatibility. New tasks use stable_subset.
+        selection_policy="artifact_digest",
     ),
     targets=[
         PopulationSRETarget.lower("t1", weight=0.35, perfect=0.0, floor=SRE_FLOOR),

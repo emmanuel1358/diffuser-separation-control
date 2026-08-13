@@ -1,0 +1,8 @@
+{
+  "allowed_env_kwargs": [
+    "seed"
+  ],
+  "require_public_methods_allowlist": true,
+  "max_instances": 64,
+  "max_instances_per_connection": 16
+}

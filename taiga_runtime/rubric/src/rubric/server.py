@@ -241,15 +241,26 @@ def _verify_continuous_evaluation(fields: dict[str, Any]) -> bool:
 
 # Grader-private trees sealed (root:root, no group/other bits) before the agent
 # starts. Held-out truth and calibration are delivered as read-only squashfs
-# mounts on the CPU-QA lane, so this same set is passed as readonly_mount_ok in
-# setup_problem -- see the note there.
-_SETUP_PRIVATE_ROOTS = (
+# mounts on the CPU-QA lane, so only those delivered roots are passed as
+# readonly_mount_ok in setup_problem -- see the note there.
+_SETUP_READONLY_PRIVATE_ROOTS = (
     "/mcp_server/data",
     "/mcp_server/calibration",
     "/mcp_server/grader",
     "/mcp_server/grading",
     "/mcp_server/src/rubric",
     "/runtime/grading",
+)
+_SETUP_PRIVATE_ROOTS = (
+    *_SETUP_READONLY_PRIVATE_ROOTS,
+    # Authoring metadata can contain disabled hints, generator provenance, and
+    # private reference guidance. Root services still read this file after the
+    # lockdown; the uid-1000 agent must not.
+    "/task/task.toml",
+    # Production images must not ship /solution, but seal it defensively when a
+    # development image accidentally does. `missing_ok=True` keeps normal
+    # Taiga images unchanged.
+    "/solution",
 )
 
 
@@ -261,24 +272,23 @@ async def setup_problem(
 ) -> str:
     """Return the task prompt."""
     _ = use_hinted_problem
-    # Every sealed root may legitimately arrive on a read-only mount: grader
-    # CODE via the scorer:ro bind mount, and held-out truth (/mcp_server/data) /
-    # calibration (/mcp_server/calibration) via Taiga is_read_only squashfs
-    # mounts. On firecracker (the CPU-QA lane) those squashfs mounts are
+    # Delivered grader roots may legitimately arrive on a read-only mount:
+    # grader CODE via the scorer:ro bind mount, and held-out truth
+    # (/mcp_server/data) / calibration (/mcp_server/calibration) via Taiga
+    # is_read_only squashfs mounts. On firecracker those squashfs mounts are
     # genuinely read-only, so the ownership-reset chown fails with EROFS and
     # this setup tool would abort the whole episode; gVisor (deploy lane) masks
     # it because its writable overlay lets the chown succeed. A read-only mount
     # already delivers the tamper-proofing this lockdown exists for (the bytes
     # cannot be modified, and the baked 0700 root /mcp_server parent blocks the
-    # uid-1000 agent from reading in), so the tolerated set is the SAME as the
-    # sealed set -- keeping them identical prevents a sealed-but-not-tolerated
-    # root from re-introducing the CPU-QA setup failure. lock_down_grader_private
-    # still only relaxes when the filesystem really is read-only, so a writable
-    # non-root private tree fails hard regardless.
+    # uid-1000 agent from reading in). Authoring metadata such as task.toml is
+    # not delivery-mounted and therefore is not tolerated if it cannot be
+    # sealed. lock_down_grader_private still only relaxes a delivered root when
+    # the filesystem really is read-only.
     lock_down_grader_private(
         _SETUP_PRIVATE_ROOTS,
         missing_ok=True,
-        readonly_mount_ok=_SETUP_PRIVATE_ROOTS,
+        readonly_mount_ok=_SETUP_READONLY_PRIVATE_ROOTS,
     )
     lock_down_public_readonly("/data")
     lock_down_public_readonly("/lbx-public-files")
@@ -1367,11 +1377,11 @@ def _persist_evaluation_trace(path: str) -> Path:
             os.close(root_fd)
 
 
-def _write_agent_fault_trace(path: str, *, nonce: str) -> None:
-    """Record replay identity when grading stops before protocol evaluation."""
+def _write_terminal_failure_trace(path: str, *, nonce: str, protocol: str) -> None:
+    """Record replay identity for an explicitly kept terminal failure."""
     payload = {
         "schema_version": "continuous-evaluation-trace.v1",
-        "protocol": "agent-fault.v1",
+        "protocol": protocol,
         "replay": {"nonce": nonce},
         "targets": {},
     }
@@ -1388,6 +1398,12 @@ def _write_agent_fault_trace(path: str, *, nonce: str) -> None:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+_KEPT_FAILURE_TRACE_PROTOCOLS = {
+    "agent_fault": "agent-fault.v1",
+    "unclassified_grader_crash": "unclassified-grader-crash.v1",
+}
 
 
 def _coerce_timeout(value: Any) -> float | None:
@@ -1797,20 +1813,29 @@ def _evaluate(
                 env_internal_failure_logs=[message],
             )
         payload_metadata = payload.get("metadata")
+        fallback_return_shape = (
+            payload_metadata.get("return_shape")
+            if isinstance(payload_metadata, dict)
+            else None
+        )
+        fallback_trace_protocol = _KEPT_FAILURE_TRACE_PROTOCOLS.get(
+            fallback_return_shape
+        )
         if (
             trace_required
             and trace_path
             and not Path(trace_path).exists()
-            and isinstance(payload_metadata, dict)
-            and payload_metadata.get("return_shape") == "agent_fault"
+            and payload.get("env_internal_failure") is False
+            and fallback_trace_protocol is not None
         ):
             try:
-                _write_agent_fault_trace(
+                _write_terminal_failure_trace(
                     trace_path,
                     nonce=runner_env["LBX_EVALUATION_NONCE"],
+                    protocol=fallback_trace_protocol,
                 )
             except OSError as exc:
-                message = f"could not record agent-fault replay trace: {exc}"
+                message = f"could not record kept-failure replay trace: {exc}"
                 return _failure_grade(
                     metadata,
                     message,

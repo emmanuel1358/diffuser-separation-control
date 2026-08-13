@@ -23,6 +23,7 @@ TASK = ContinuousTask.model(
         "challenge.parquet",
         feature_columns=["feature_1", "feature_2"],  # TODO: your features
         sample_size=256,
+        selection_policy="stable_subset",
     ),
     targets=[
         PopulationSRETarget.lower(
@@ -42,7 +43,10 @@ TASK = ContinuousTask.model(
             perfect=0.0,
         )
     ],
-    calibration=GeneratedCalibration("calibration.lock.json"),
+    calibration=GeneratedCalibration(
+        "calibration.lock.json",
+        quality_floor_mode="effective_no_info",
+    ),
     naive="baselines/naive",
 )
 

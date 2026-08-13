@@ -12,20 +12,34 @@ from grading import PolicyWorker
 
 def compute_score(workspace, trajectory, private):
     policy_path = workspace / "policy.py"
-    with PolicyWorker(policy_path, timeout_s=0.1) as policy:
+    with PolicyWorker(
+        policy_path,
+        timeout_s=0.1,
+        total_timeout_s=60.0,
+    ) as policy:
         obs = {"qpos": [0.0, 0.1], "qvel": [0.0, 0.0]}
         action = policy.act(obs)
 ```
 
 `PolicyWorker` runs the submitted policy in a child Python process. The grader
 keeps hidden state in the parent process and sends only public observations over
-a JSON line protocol. This prevents submitted code from using Python frame
-inspection or module monkeypatching to read grader locals such as hidden cases,
-perturbation schedules, or target labels.
+a length-prefixed MessagePack protocol. This prevents submitted code from using
+Python frame inspection or module monkeypatching to read grader locals such as
+hidden cases, perturbation schedules, or target labels.
+
+`timeout_s` limits one submitted-worker call. `total_timeout_s` optionally caps
+the cumulative time spent waiting for all submitted-worker calls, so many
+individually compliant sleeps cannot run into the outer grader timeout.
+Malformed and non-finite worker replies are rejected as agent faults. Task
+rollouts must still enforce domain-specific action bounds and validate states
+and aggregate metrics after applying finite actions.
 
 `PolicyWorker` is intentionally compatible with common scorer patterns:
 
 - `policy.act(obs)` for normal `act(obs)` / `Policy().act(obs)` submissions.
+- Factory-only modules defining `load_policy()` are auto-detected after a
+  module-level `act`; pass `factory_name="load_policy"` explicitly when the
+  prompt requires that contract.
 - `policy(obs)` as an alias for `policy.act(obs)`, useful when existing scorer
   code stores the loaded policy in a variable such as `policy_fn`.
 - `policy.call("method_name", *args, **kwargs)` for tasks whose submitted file
@@ -33,6 +47,11 @@ perturbation schedules, or target labels.
   `get_action(...)`.
 - `policy.init_model_xml(xml_text)` for policies that need to load the submitted
   `/tmp/output/model.xml` themselves.
+
+Missing required public methods raise both `AttributeError` (so `hasattr` works
+for optional hooks) and `AgentFault` (so a direct required-method call is a kept
+zero). Unsupported return values fail serialization immediately rather than
+being reported as policy timeouts.
 
 ## When To Use It
 
@@ -68,7 +87,10 @@ from grading.evaluation import (
 def evaluate(context):
     cases = context.fixtures["cases"]
     metrics = []
-    with context.policy("policy.py", timeout_s=0.1) as policy:
+    with context.policy(
+        timeout_s=0.1,
+        total_timeout_s=60.0,
+    ) as policy:
         for case in cases:
             obs = build_public_observation(case)
             action = policy.act(obs)

@@ -131,7 +131,10 @@ TASK = ContinuousTask.model(
         # the private bank is too large for the declared predictor budget.
     ),
     targets=[target],
-    calibration=GeneratedCalibration("calibration.lock.json"),
+    calibration=GeneratedCalibration(
+        "calibration.lock.json",
+        quality_floor_mode="effective_no_info",
+    ),
     naive="baselines/naive",
 )
 
@@ -157,13 +160,12 @@ must have at least `sample_size` rows. The runtime:
 
 #### Challenge selection policies
 
-Full-bank evaluation is preferred. For a bounded draw, set `sample_size` with
-`selection_policy="stable_subset"`; the hidden indices then derive from the
-task/challenge identity rather than submitted bytes or the fresh nonce.
-Reference calibration and every candidate measure the same private rows.
-Existing sized descriptors without an explicit policy retain
-`artifact_digest` selection so their v3.0 locks remain usable during migration.
-The bank remains root-only under every policy.
+Full-bank evaluation is preferred. A bounded draw with `sample_size` now
+defaults to `selection_policy="stable_subset"`; the hidden indices derive from
+the task/challenge identity rather than submitted bytes or the fresh nonce.
+Reference calibration and every candidate therefore measure the same private
+rows. Use explicit `artifact_digest` only while replaying a legacy v3.0 lock,
+then regenerate it. The bank remains root-only under every policy.
 
 The fresh private nonce is still committed after the artifact is hashed and is
 used for permutation evidence. Changing the nonce changes the public seed
@@ -195,6 +197,12 @@ row-independent probe compares a full call against shuffled partitions loaded in
 fresh workers, so same-batch repeatability alone cannot hide transductive
 cross-row pooling.
 
+State the committed `predict_timeout_s`, `first_call_timeout_s`, `max_rows`, and
+`max_reply_bytes` in the task prompt. For legacy/static table submissions, use
+`CsvRows(..., join_key="id")` when rows carry an identity column; the shared
+loader projects declared columns and aligns predictions to trusted truth before
+measuring.
+
 ## Tier-A policy challenge
 
 Use `PolicyEvaluationTask` when the grader can produce fresh hidden scenarios.
@@ -208,6 +216,8 @@ TASK = PolicyEvaluationTask(
     scenarios=32,
     alpha=0.01,
     reference_quality=0.72,
+    call_timeout_s=2.0,
+    total_timeout_s=900.0,
     required_control_families=("constant", "open_loop"),
 )
 
@@ -234,16 +244,22 @@ def compute_score(workspace, trajectory, private):
     )
 ```
 
-Candidate and trusted controls run on identical secret scenario seeds. The
-candidate must beat every control under paired return evidence. Candidate worker
-failures become kept zeros; environment/grader failures propagate as internal
-failures.
+Candidate and trusted controls run on identical full-width, nonce-HMAC secret
+scenario seeds (`policy-evaluation-task.v4`). The candidate must beat every
+control under paired return evidence. Candidate worker failures become kept
+zeros; environment/grader failures propagate as internal
+failures. `call_timeout_s` limits one submitted-worker RPC;
+`total_timeout_s` charges cumulative wall time waiting for all submitted-worker
+RPCs, excluding trusted environment/control work. Exceeding either budget is an
+`AgentFault`, not an outer grading timeout.
 
 Policy tasks must:
 
 - use scenarios—not timesteps—as independent units;
 - floor every failed episode rather than skipping it;
-- impose hard worker-call deadlines;
+- impose and disclose hard per-call and cumulative worker deadlines;
+- keep `total_timeout_s` at or below 80% of the effective grading timeout so
+  trusted controls, trace writing, and result publication retain headroom;
 - classify every trusted control and include every declared task-relevant
   no-op/constant/open-loop family;
 - reject a task whose reference cannot reliably beat those controls.
@@ -319,17 +335,21 @@ static artifacts that have no honest training dataset.
 - challenge/data/model/image input roots;
 - PWL reference aggregate and qualification results.
 
-The v3 lock preserves reviewed floors for quality. Degenerate measurements are
-used to qualify/audit no-information behavior; grade-time evidence determines
-eligibility.
+Lock schema 3.2 records `quality_floor_mode`. The legacy `author` mode preserves
+reviewed floors for runtime quality. New classification-heavy tasks can choose
+`effective_no_info`, which begins runtime credit above the measured
+no-information ceiling. Degenerate measurements still qualify/audit behavior,
+and grade-time evidence independently determines eligibility. Schemas 3.1 and
+3.0 remain readable.
 
 The naive qualification range remains exclusive by default: the naive must be
 weak but informative. A task whose honest naive exactly ties every effective
 no-information floor may set `naive_score_min=0.0` and provide
 `naive_at_floor=AnchorRationale(kind="reviewed_exception", ...)`. This emits an
 inclusive zero bound and is accepted only for an exact tie—not for a strategy
-that underperforms the no-information family. It does not alter authored floors
-or grade-time quality scoring.
+that underperforms the no-information family. In `author` mode it does not alter
+grade-time quality scoring; `effective_no_info` explicitly opts into the same
+effective floor at runtime.
 
 For local score feedback after changing data, metrics, targets, models,
 challenge protocol, or grader:

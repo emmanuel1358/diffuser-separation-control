@@ -239,6 +239,107 @@ def _continuous_task_method_calls(source: str) -> set[str]:
     }
 
 
+def _policy_budget_prompt_issues(problem_dir: Path, registration: Any) -> list[str]:
+    """Require agent-visible disclosure of sealed policy compute limits."""
+    try:
+        prompt = (problem_dir / "instruction.md").read_text(encoding="utf-8").lower()
+    except OSError as exc:
+        return [f"could not verify policy budget disclosure in instruction.md: {exc}"]
+
+    def has_number(value: float) -> bool:
+        token = f"{float(value):g}"
+        return (
+            re.search(
+                rf"(?<![\d.]){re.escape(token)}(?:\.0+)?(?![\d.])",
+                prompt,
+            )
+            is not None
+        )
+
+    call_disclosed = (
+        has_number(registration.call_timeout_s)
+        and "call" in prompt
+        and ("deadline" in prompt or "timeout" in prompt)
+    )
+    total_disclosed = (
+        has_number(registration.total_timeout_s)
+        and ("total" in prompt or "cumulative" in prompt)
+        and ("budget" in prompt or "timeout" in prompt)
+    )
+    issues: list[str] = []
+    if not call_disclosed:
+        issues.append(
+            "instruction.md must disclose the sealed policy per-call deadline "
+            f"({registration.call_timeout_s:g} seconds)"
+        )
+    if not total_disclosed:
+        issues.append(
+            "instruction.md must disclose the sealed policy cumulative compute "
+            f"budget ({registration.total_timeout_s:g} seconds)"
+        )
+    return issues
+
+
+def _predictor_budget_prompt_issues(problem_dir: Path, predictor: Any) -> list[str]:
+    """Require agent-visible disclosure of queryable-predictor limits."""
+    try:
+        prompt = (problem_dir / "instruction.md").read_text(encoding="utf-8").lower()
+    except OSError as exc:
+        return [f"could not verify predictor budget disclosure: {exc}"]
+
+    def has_number(value: float) -> bool:
+        rendered = f"{value:g}"
+        return (
+            re.search(rf"(?<![\d.]){re.escape(rendered)}(?![\d.])", prompt) is not None
+        )
+
+    reply_mebibytes = int(predictor.max_reply_bytes) / (1024 * 1024)
+    reply_disclosed = has_number(int(predictor.max_reply_bytes)) or (
+        reply_mebibytes.is_integer()
+        and has_number(int(reply_mebibytes))
+        and ("mib" in prompt or "megabyte" in prompt)
+    )
+    checks = (
+        (
+            has_number(float(predictor.predict_timeout_s))
+            and "predict" in prompt
+            and ("deadline" in prompt or "timeout" in prompt),
+            (
+                "instruction.md must disclose the predictor per-call deadline "
+                f"({predictor.predict_timeout_s:g} seconds)"
+            ),
+        ),
+        (
+            has_number(float(predictor.first_call_timeout_s))
+            and ("load" in prompt or "first call" in prompt)
+            and ("deadline" in prompt or "timeout" in prompt),
+            (
+                "instruction.md must disclose the predictor load/first-call deadline "
+                f"({predictor.first_call_timeout_s:g} seconds)"
+            ),
+        ),
+        (
+            has_number(int(predictor.max_rows))
+            and "row" in prompt
+            and ("maximum" in prompt or "max" in prompt or "up to" in prompt),
+            (
+                "instruction.md must disclose the predictor row limit "
+                f"({predictor.max_rows} rows)"
+            ),
+        ),
+        (
+            reply_disclosed
+            and ("reply" in prompt or "result" in prompt or "output" in prompt)
+            and ("byte" in prompt or "mib" in prompt or "megabyte" in prompt),
+            (
+                "instruction.md must disclose the predictor serialized reply limit "
+                f"({predictor.max_reply_bytes} bytes)"
+            ),
+        ),
+    )
+    return [message for passed, message in checks if not passed]
+
+
 def _string_constants(source: str) -> list[str]:
     """Every string-literal constant in ``source`` (empty on a parse error)."""
     try:
@@ -969,6 +1070,7 @@ class TaskValidator:
         try:
             from grading.evaluation import (
                 PolicyEvaluationTask,
+                PythonPredictor,
                 load_calibration_lock,
                 load_task_registration,
             )
@@ -981,9 +1083,39 @@ class TaskValidator:
                 policy_registration = getattr(module, "TASK", None)
                 if isinstance(policy_registration, PolicyEvaluationTask):
                     task_calls = _continuous_task_method_calls(grader_source)
+                    issues.extend(
+                        _agent_fault_issues(
+                            GRADER_SOURCE_REL,
+                            grader_source,
+                            require_agent_fault_propagation=True,
+                        )
+                    )
+                    issues.extend(
+                        _policy_budget_prompt_issues(
+                            problem_dir,
+                            policy_registration,
+                        )
+                    )
                     if "grade" not in task_calls:
                         issues.append(
                             "sealed policy TASK compute_score must call TASK.grade(...)"
+                        )
+                    from alignerr_plugin.schemas import ML_GRADING_TIMEOUT_SEC
+
+                    grading_timeout_s = (
+                        ML_GRADING_TIMEOUT_SEC
+                        if task_type == "ml"
+                        else task_toml.runner.timeouts.grading_sec
+                    )
+                    max_policy_budget_s = grading_timeout_s * 0.8
+                    if policy_registration.total_timeout_s > max_policy_budget_s:
+                        issues.append(
+                            "sealed policy TASK total_timeout_s must leave at least "
+                            "20% of grading time for trusted controls, trace writing, "
+                            "and result publication: expected <= "
+                            f"{max_policy_budget_s:.3f}s for grading timeout "
+                            f"{grading_timeout_s}s, got "
+                            f"{policy_registration.total_timeout_s:.3f}s"
                         )
                     plan_path = grader_path.parent / "evaluation.plan.json"
                     try:
@@ -1032,6 +1164,13 @@ class TaskValidator:
                 f"{registration.security_tier} TASK has no protected final-grade "
                 "call; compute_score must delegate to TASK.grade(...) or "
                 "TASK.compute_score(...)."
+            )
+        if isinstance(registration.artifact, PythonPredictor):
+            issues.extend(
+                _predictor_budget_prompt_issues(
+                    problem_dir,
+                    registration.artifact,
+                )
             )
 
         trusted_calibration_dir = os.environ.get(TRUSTED_CALIBRATION_DIR_ENV)
@@ -1087,6 +1226,21 @@ class TaskValidator:
         except Exception as exc:
             issues.append(f"invalid generated calibration lock: {exc}")
             return StageResult(passed=False, issues=issues, duration_ms=0)
+
+        if (
+            registration.challenge is not None
+            and registration.challenge.sample_size is not None
+            and registration.challenge.selection_policy == "artifact_digest"
+        ):
+            message = (
+                "sized PrivateTableChallenge must use "
+                "selection_policy='stable_subset' so identical artifacts are "
+                "graded on stable hidden rows; artifact_digest is legacy-only"
+            )
+            if lock.payload.get("schema_version") == "3.0":
+                warnings.append(f"{message}; regenerate this legacy lock to migrate")
+            else:
+                issues.append(message)
 
         qualification = lock.payload.get("qualification") or {}
         expected = {
@@ -1412,6 +1566,7 @@ class TaskValidator:
         module_rel = "env.py"
         factory = "make_env"
         config_path = scorer_data / "env_config.json"
+        cfg: dict[str, Any] | None = None
         if config_path.exists():
             try:
                 cfg = json.loads(config_path.read_text())
@@ -1425,6 +1580,28 @@ class TaskValidator:
                     )
             except Exception as exc:
                 issues.append(f"{priv_rel}/env_config.json is invalid: {exc}")
+        else:
+            issues.append(
+                f"[environment].hidden_env = {mode!r} requires "
+                f"{priv_rel}/env_config.json with explicit allowed_env_kwargs "
+                "and require_public_methods_allowlist=true"
+            )
+
+        if cfg is not None:
+            declared_kwargs = cfg.get("allowed_env_kwargs")
+            if not isinstance(declared_kwargs, list) or not all(
+                isinstance(key, str) for key in declared_kwargs
+            ):
+                issues.append(
+                    f"{priv_rel}/env_config.json must declare "
+                    "'allowed_env_kwargs' as a list of strings (use [] when "
+                    "construction accepts no agent kwargs)"
+                )
+            if cfg.get("require_public_methods_allowlist") is not True:
+                issues.append(
+                    f"{priv_rel}/env_config.json must set "
+                    "'require_public_methods_allowlist': true"
+                )
 
         env_module = scorer_data / module_rel
         if not env_module.exists():
@@ -1460,32 +1637,103 @@ class TaskValidator:
                 f"read the hidden dynamics. Remove {pub_rel}/{module_rel}."
             )
 
-        # Reward-hacking advisory (WARN, not fail): the env exposes every PUBLIC
-        # method over the socket unless it declares a class-level
-        # _env_public_methods allow-list. Without one, an oracle / hidden-parameter
-        # / budget accessor kept public for the in-process grader is also reachable
-        # by the agent. Warn when no .py under the private tree mentions it.
+        # Reward-hacking boundary: every env must explicitly pin the methods
+        # reachable over the root env-server socket.
         warnings: list[str] = []
         if env_module.exists():
-            declares_allowlist = False
-            for src in scorer_data.rglob("*.py"):
+            found_static_allowlist = False
+            for src in sorted(scorer_data.rglob("*.py")):
                 if not src.is_file():
                     continue
                 try:
-                    if "_env_public_methods" in src.read_text(encoding="utf-8"):
-                        declares_allowlist = True
-                        break
-                except OSError:
+                    tree = ast.parse(src.read_text(encoding="utf-8"))
+                except (OSError, SyntaxError):
                     continue
-            if not declares_allowlist:
-                warnings.append(
-                    "env/hybrid task does not declare a class-level "
-                    "_env_public_methods allow-list on its env, so every public "
-                    "method on the env instance is callable by the agent over the "
-                    "socket (any oracle / hidden-parameter / budget accessor kept "
-                    "public for the grader included). Declare _env_public_methods "
-                    "(the set of agent-facing method names) to lock the socket "
-                    "surface; see env_server.server for the contract."
+                relative_source = src.relative_to(problem_dir).as_posix()
+                for class_node in (
+                    node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+                ):
+                    class_location = f"{relative_source}:{class_node.name}"
+                    class_methods = {
+                        statement.name: statement
+                        for statement in class_node.body
+                        if isinstance(
+                            statement,
+                            (ast.FunctionDef, ast.AsyncFunctionDef),
+                        )
+                    }
+                    for statement in class_node.body:
+                        value_node: ast.AST | None = None
+                        if isinstance(statement, ast.Assign) and any(
+                            isinstance(target, ast.Name)
+                            and target.id == "_env_public_methods"
+                            for target in statement.targets
+                        ):
+                            value_node = statement.value
+                        elif (
+                            isinstance(statement, ast.AnnAssign)
+                            and isinstance(statement.target, ast.Name)
+                            and statement.target.id == "_env_public_methods"
+                        ):
+                            value_node = statement.value
+                        if value_node is None:
+                            continue
+                        if (
+                            isinstance(value_node, ast.Call)
+                            and isinstance(value_node.func, ast.Name)
+                            and value_node.func.id
+                            in {"frozenset", "set", "tuple", "list"}
+                            and len(value_node.args) == 1
+                        ):
+                            value_node = value_node.args[0]
+                        try:
+                            literal = ast.literal_eval(value_node)
+                        except (ValueError, TypeError):
+                            issues.append(
+                                f"{class_location} must declare "
+                                "_env_public_methods as a static string collection"
+                            )
+                            continue
+                        if not isinstance(literal, (set, frozenset, tuple, list)):
+                            issues.append(
+                                f"{class_location} must declare "
+                                "_env_public_methods as a static string collection"
+                            )
+                            continue
+                        public_methods = {
+                            name for name in literal if isinstance(name, str)
+                        }
+                        if not public_methods:
+                            issues.append(
+                                f"{class_location} must expose at least one method "
+                                "through _env_public_methods"
+                            )
+                            continue
+                        found_static_allowlist = True
+                        for method in sorted(public_methods):
+                            definition = class_methods.get(method)
+                            method_location = f"{class_location}.{method}"
+                            if definition is None:
+                                issues.append(
+                                    f"{method_location} is socket-public but is "
+                                    "not defined directly on the allow-listed "
+                                    "class; add a local wrapper with a reviewable "
+                                    "keyword signature instead of inheriting an "
+                                    "opaque implementation"
+                                )
+                                continue
+                            if definition.args.kwarg is not None:
+                                issues.append(
+                                    f"{method_location} is socket-public and "
+                                    "accepts unrestricted **kwargs; declare "
+                                    "explicit agent-facing keyword parameters so "
+                                    "hidden grader configuration cannot be injected"
+                                )
+            if not found_static_allowlist:
+                issues.append(
+                    "env/hybrid task must declare _env_public_methods as a "
+                    "statically reviewable string collection in scorer/data; "
+                    "dynamic or missing allow-lists cannot prove the socket surface"
                 )
 
         return StageResult(
@@ -4415,13 +4663,19 @@ def _declarative_rubric_api_issues(rel_path: str, text: str) -> list[str]:
     return issues
 
 
-def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
+def _agent_fault_issues(
+    rel_path: str,
+    text: str,
+    *,
+    require_agent_fault_propagation: bool = False,
+) -> list[str]:
     """Findings for the AgentFault keep-vs-discard discipline in one scorer file.
 
-    Three classes: a broad except that returns a score (over-keep), a
-    pickle-executing read of an agent artifact (RCE-as-root), and an
-    agent-writable-path read that is unguarded or not signalled via AgentFault
-    (over-discard).
+    Four classes: a broad except that returns a score (over-keep), an
+    ``AgentFault`` handler that returns a score instead of preserving the
+    runtime's kept-zero trace semantics, a pickle-executing read of an agent
+    artifact (RCE-as-root), and an agent-writable-path read that is unguarded or
+    not signalled via AgentFault (over-discard).
     """
     issues: list[str] = []
     try:
@@ -4447,7 +4701,8 @@ def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Try) and _on_live_path(id(node), enclosing, reachable):
             for handler in node.handlers:
-                if _handler_is_broad(handler) and _handler_swallows_to_score(handler):
+                swallows_to_score = _handler_swallows_to_score(handler)
+                if _handler_is_broad(handler) and swallows_to_score:
                     issues.append(
                         f"{rel_path}:{handler.lineno}: a broad `except` returns a "
                         f"score instead of raising. This converts BOTH agent faults "
@@ -4457,6 +4712,17 @@ def _agent_fault_issues(rel_path: str, text: str) -> list[str]:
                         f"grading.faults.AgentFault(...)`; let author/infra faults "
                         f"propagate so the runtime records env_internal_failure and "
                         f"discards the rollout."
+                    )
+                elif (
+                    require_agent_fault_propagation
+                    and _AGENT_FAULT_NAME in _handler_exc_names(handler)
+                    and swallows_to_score
+                ):
+                    issues.append(
+                        f"{rel_path}:{handler.lineno}: `AgentFault` is caught and "
+                        "converted into a returned score. Let AgentFault propagate "
+                        "so the runtime records a kept 0.0 and, for sealed "
+                        "evaluation, writes the required replay trace."
                     )
 
         if not isinstance(node, ast.Call) or not _on_live_path(

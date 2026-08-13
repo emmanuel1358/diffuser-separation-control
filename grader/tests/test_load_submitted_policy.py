@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from grading import load_env_module, load_submitted_policy
 from grading.faults import AgentFault
+from grading.policy_runner import PolicyMissingMethodError
 
 
 def _write(path: Path, body: str) -> Path:
@@ -28,6 +29,26 @@ def test_single_policy_handle(tmp_path: Path) -> None:
     handle = load_submitted_policy(p, timeout_s=10)
     try:
         assert handle.choose() == 3
+    finally:
+        handle.close()
+
+
+def test_policy_handle_missing_method_preserves_hasattr_and_agent_fault(
+    tmp_path: Path,
+) -> None:
+    p = _write(
+        tmp_path / "policy.py",
+        "def load_policy():\n"
+        "    class P:\n"
+        "        def choose(self):\n"
+        "            return 3\n"
+        "    return P()\n",
+    )
+    handle = load_submitted_policy(p, timeout_s=10)
+    try:
+        assert hasattr(handle, "reset") is False
+        with pytest.raises(PolicyMissingMethodError, match="no attribute 'reset'"):
+            handle.reset()
     finally:
         handle.close()
 

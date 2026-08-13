@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 from grading.evaluation import (
     AnchorRationale,
@@ -19,7 +20,9 @@ from grading.evaluation import (
     measure_task_module,
     write_calibration_lock_atomic,
 )
+from grading.evaluation.lock import validate_calibration_lock
 from grading.evaluation.plan import validate_serialized_plan
+from grading.faults import AgentFault
 
 
 def _floor(value: float, summary: str) -> FloorAnchor:
@@ -76,6 +79,25 @@ def test_generated_lock_maps_reference_and_oracle() -> None:
     assert null == pytest.approx(0.0)
     assert (x_null, x_ref, x_oracle) == pytest.approx((0.0, 0.85, 1.0))
     assert 0.0 < lock.payload["qualification"]["naive_score"] <= 0.1
+
+
+def test_previous_31_lock_schema_remains_readable() -> None:
+    task = _task()
+    lock = task.build_lock(
+        reference_metrics={"value": 0.2, "label": 0.9},
+        naive_metrics={"value": 0.98, "label": 0.0},
+        degenerate_metrics=_NOOP_DEGENERATE,
+        input_digests={},
+    )
+    payload = json.loads(json.dumps(lock.payload))
+    payload["schema_version"] = "3.1"
+    payload.pop("quality_floor_mode")
+
+    previous = validate_calibration_lock(
+        payload,
+        task_spec_sha256=task.spec_sha256,
+    )
+    assert previous.quality_floor_mode == "author"
 
 
 def test_lock_accepts_non_normalized_author_weights() -> None:
@@ -206,6 +228,89 @@ def test_default_calibration_and_naive_range_serialization() -> None:
         "exclusive_min": 1e-6,
         "inclusive_max": 0.1,
     }
+
+
+def test_static_csv_join_key_aligns_shuffled_predictions(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    private.mkdir()
+    pd.DataFrame(
+        {
+            "sample_id": ["a", "b", "c"],
+            "target": [1.0, 2.0, 3.0],
+        }
+    ).to_csv(private / "truth.csv", index=False)
+    pd.DataFrame(
+        {
+            "sample_id": ["c", "a", "b"],
+            "prediction": [3.0, 1.0, 2.0],
+        }
+    ).to_csv(workspace / "submission.csv", index=False)
+    artifact = CsvRows(
+        "submission.csv",
+        columns=["sample_id", "prediction"],
+        join_key="sample_id",
+    )
+    task = ContinuousTask.static(
+        artifact=artifact,
+        truth_filename="truth.csv",
+        targets=[
+            SRETarget.lower(
+                "target",
+                prediction_column="prediction",
+                truth_column="target",
+                weight=1.0,
+                floor=_floor(
+                    1.0,
+                    "Population-standardized RMSE has a no-skill value of one.",
+                ),
+            )
+        ],
+    )
+
+    assert artifact.spec_dict()["type"] == "csv_rows.v3"
+    assert task.measure(workspace=workspace, private=private)["target"] == 0.0
+
+
+def test_static_csv_join_key_rejects_duplicate_candidate_keys(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    private = tmp_path / "private"
+    workspace.mkdir()
+    private.mkdir()
+    pd.DataFrame({"sample_id": ["a", "b"], "target": [1.0, 2.0]}).to_csv(
+        private / "truth.csv",
+        index=False,
+    )
+    pd.DataFrame(
+        {
+            "sample_id": ["a", "a"],
+            "prediction": [1.0, 2.0],
+        }
+    ).to_csv(workspace / "submission.csv", index=False)
+    task = ContinuousTask.static(
+        artifact=CsvRows(
+            "submission.csv",
+            columns=["sample_id", "prediction"],
+            join_key="sample_id",
+        ),
+        truth_filename="truth.csv",
+        targets=[
+            SRETarget.lower(
+                "target",
+                prediction_column="prediction",
+                truth_column="target",
+                weight=1.0,
+                floor=_floor(
+                    1.0,
+                    "Population-standardized RMSE has a no-skill value of one.",
+                ),
+            )
+        ],
+    )
+
+    with pytest.raises(AgentFault, match="duplicate"):
+        task.measure(workspace=workspace, private=private)
 
 
 def test_workspace_probe_spec_is_bounded_and_canonical() -> None:

@@ -2632,6 +2632,25 @@ def test_agent_fault_stage_fails_for_broad_swallow(tmp_path: Path) -> None:
     assert any("broad `except`" in issue for issue in stage.issues)
 
 
+def test_sealed_policy_lint_fails_when_agent_fault_is_returned_as_score() -> None:
+    source = (
+        "from grading.faults import AgentFault\n"
+        "def compute_score(workspace, trajectory, private):\n"
+        "    try:\n"
+        "        raise AgentFault('missing submission')\n"
+        "    except AgentFault:\n"
+        "        return 0.0\n"
+    )
+
+    issues = validator_module._agent_fault_issues(
+        "scorer/compute_score.py",
+        source,
+        require_agent_fault_propagation=True,
+    )
+
+    assert any("`AgentFault` is caught and converted" in issue for issue in issues)
+
+
 def test_shipped_scorers_pass_agent_fault_lint() -> None:
     # Dogfood: every example/problem/starter scorer must obey the AgentFault
     # keep-vs-discard discipline, so the template never ships a scorer that

@@ -200,11 +200,12 @@ smoke tests are the solver validation surface.
 in `lbx-rl-tasks-iso-mothership`,
 so the production CPU and GPU base images are built from these exact files
 (`requirements-solvers.txt` + `install-solvers-heavy.sh` + the Dockerfiles).
-After this change lands, the **mothership must rebuild both base images and bump
-`BASE_IMAGE_TAG`** (in its `exporters/taiga.py`) so exported tasks pick up the
-new base. The sync workflow preserves the existing tag; it does not bump it
-automatically. Local harness runs already use the updated `base/` files
-directly, so no tag bump is needed for local authoring.
+After this change lands via sync and auto-merges to mothership `main`,
+**Build Base Images** runs automatically (path filter on `grader/**`, `base/**`,
+`taiga_runtime/rubric/**`) for all flavors and bumps `BASE_IMAGE_TAG` (and the
+other flavor pins) in `exporters/taiga.py`. The sync workflow itself preserves
+the existing tag; it does not bump it. Local harness runs already use the
+updated `base/` files directly, so no tag bump is needed for local authoring.
 
 Heads-up on size/time: the heavy engines (conda envs + OpenROAD copy) add
 several GB and minutes to each base build, and the `gpu-openroad` overlay pulls

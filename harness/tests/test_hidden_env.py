@@ -3,10 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
-
 from alignerr_plugin.schemas import EnvironmentSection
 from alignerr_plugin.validators.task.validator import TaskValidator
+from pydantic import ValidationError
 
 _TASK_TOML = """
 schema_version = "1.1"
@@ -35,6 +34,11 @@ def _make_task(
     env_py: bool = True,
     client: bool = True,
     leak_env: bool = False,
+    env_config: bool = True,
+    public_allowlist: bool = True,
+    unrestricted_public_kwargs: bool = False,
+    imported_env: bool = False,
+    inherited_env: bool = False,
 ) -> Path:
     d = tmp_path / "task"
     (d / "scorer" / "data").mkdir(parents=True, exist_ok=True)
@@ -44,8 +48,53 @@ def _make_task(
         "def compute_score(workspace, trajectory, private):\n    return 0.0\n"
     )
     if env_py:
-        (d / "scorer" / "data" / "env.py").write_text(
-            "def make_env(**k):\n    return object()\n"
+        if inherited_env:
+            (d / "scorer" / "data" / "env_impl.py").write_text(
+                "class Base:\n"
+                "    def reset(self, **kwargs):\n"
+                "        return None\n"
+                "class Env(Base):\n"
+                '    _env_public_methods = frozenset({"reset"})\n'
+                "class Unrelated:\n"
+                "    def reset(self, seed=None):\n"
+                "        return None\n"
+            )
+            (d / "scorer" / "data" / "env.py").write_text(
+                "from env_impl import Env\n" "def make_env(**k):\n" "    return Env()\n"
+            )
+        elif imported_env:
+            (d / "scorer" / "data" / "env_impl.py").write_text(
+                "class Env:\n"
+                '    _env_public_methods = frozenset({"reset"})\n'
+                "    def reset(self, **kwargs):\n"
+                "        return None\n"
+            )
+            (d / "scorer" / "data" / "env.py").write_text(
+                "from env_impl import Env\n" "def make_env(**k):\n" "    return Env()\n"
+            )
+        else:
+            reset_signature = (
+                "def reset(self, **kwargs):"
+                if unrestricted_public_kwargs
+                else "def reset(self, seed=None):"
+            )
+            allowlist = (
+                '    _env_public_methods = frozenset({"reset"})\n'
+                if public_allowlist
+                else ""
+            )
+            (d / "scorer" / "data" / "env.py").write_text(
+                "class Env:\n"
+                f"{allowlist}"
+                f"    {reset_signature}\n"
+                "        return None\n"
+                "def make_env(**k):\n"
+                "    return Env()\n"
+            )
+    if env_config:
+        (d / "scorer" / "data" / "env_config.json").write_text(
+            '{"allowed_env_kwargs": ["seed"], '
+            '"require_public_methods_allowlist": true}'
         )
     if client:
         (d / "data" / "env_client.py").write_text("# client\n")
@@ -97,6 +146,42 @@ def test_validator_fails_without_env_module(tmp_path: Path) -> None:
     stage = TaskValidator()._hidden_env(_make_task(tmp_path, env_py=False))
     assert not stage.passed
     assert any("env module" in i for i in stage.issues)
+
+
+def test_validator_fails_without_env_config(tmp_path: Path) -> None:
+    stage = TaskValidator()._hidden_env(_make_task(tmp_path, env_config=False))
+    assert not stage.passed
+    assert any("env_config.json" in issue for issue in stage.issues)
+
+
+def test_validator_fails_without_public_method_allowlist(tmp_path: Path) -> None:
+    stage = TaskValidator()._hidden_env(_make_task(tmp_path, public_allowlist=False))
+    assert not stage.passed
+    assert any("_env_public_methods" in issue for issue in stage.issues)
+
+
+def test_validator_fails_for_unrestricted_public_method_kwargs(
+    tmp_path: Path,
+) -> None:
+    stage = TaskValidator()._hidden_env(
+        _make_task(tmp_path, unrestricted_public_kwargs=True)
+    )
+    assert not stage.passed
+    assert any("unrestricted **kwargs" in issue for issue in stage.issues)
+
+
+def test_validator_checks_imported_env_method_signatures(tmp_path: Path) -> None:
+    stage = TaskValidator()._hidden_env(_make_task(tmp_path, imported_env=True))
+    assert not stage.passed
+    assert any("env_impl.py:Env.reset" in issue for issue in stage.issues)
+    assert any("unrestricted **kwargs" in issue for issue in stage.issues)
+
+
+def test_validator_binds_allowlist_to_declaring_class(tmp_path: Path) -> None:
+    stage = TaskValidator()._hidden_env(_make_task(tmp_path, inherited_env=True))
+    assert not stage.passed
+    assert any("env_impl.py:Env.reset" in issue for issue in stage.issues)
+    assert any("not defined directly" in issue for issue in stage.issues)
 
 
 def test_validator_fails_without_client(tmp_path: Path) -> None:

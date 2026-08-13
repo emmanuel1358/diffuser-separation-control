@@ -264,8 +264,10 @@ class RubricContext:
     def policy(
         self,
         *,
+        factory_name: str | None = None,
         timeout_s: float = 5.0,
         first_call_timeout_s: float | None = None,
+        total_timeout_s: float | None = None,
         cwd: str | Path | None = None,
     ):
         """Open the declared regular-file artifact in a sandboxed policy worker."""
@@ -278,8 +280,10 @@ class RubricContext:
             )
         return run_policy(
             self.candidate.original_path,
+            factory_name=factory_name,
             timeout_s=timeout_s,
             first_call_timeout_s=first_call_timeout_s,
+            total_timeout_s=total_timeout_s,
             cwd=cwd,
             submitted_snapshot=self.candidate.path,
         )

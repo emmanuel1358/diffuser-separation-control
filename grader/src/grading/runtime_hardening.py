@@ -20,7 +20,7 @@ from grading.secure_io import open_directory_fd
 
 logger = logging.getLogger(__name__)
 
-SHARED_RUNTIME_SECURITY_REVISION = "2026-08-10.1"
+SHARED_RUNTIME_SECURITY_REVISION = "2026-08-12.1"
 _NON_SYSTEM_UID_THRESHOLD = 1000
 _QUIESCE_MAX_PASSES = 32
 _QUIESCE_CONSECUTIVE_ZEROS = 2
@@ -468,16 +468,30 @@ def prepare_grader_cache(
     return isolated_grader_environ(cache_root=root)
 
 
-def _read_proc_state(proc_dir: str) -> str:
+def _read_proc_identity(proc_dir: str) -> tuple[str, int | None]:
+    """Return ``(state, starttime)`` from one ``/proc/<pid>/stat`` entry."""
     try:
         with open(f"{proc_dir}/stat", "rb") as handle:
             stat_line = handle.read()
     except OSError:
-        return ""
+        return "", None
     rparen = stat_line.rfind(b")")
     if rparen == -1 or rparen + 2 >= len(stat_line):
-        return ""
-    return stat_line[rparen + 2 : rparen + 3].decode("ascii", errors="replace")
+        return "", None
+    fields = stat_line[rparen + 2 :].split()
+    if not fields:
+        return "", None
+    state = fields[0].decode("ascii", errors="replace")
+    # The suffix begins at proc field 3 (state); starttime is field 22.
+    try:
+        starttime = int(fields[19])
+    except (IndexError, ValueError):
+        starttime = None
+    return state, starttime
+
+
+def _read_proc_state(proc_dir: str) -> str:
+    return _read_proc_identity(proc_dir)[0]
 
 
 def kill_pre_grade_agent_processes(
@@ -485,6 +499,7 @@ def kill_pre_grade_agent_processes(
     min_uid: int = _NON_SYSTEM_UID_THRESHOLD,
     max_passes: int = _QUIESCE_MAX_PASSES,
     required_zero_passes: int = _QUIESCE_CONSECUTIVE_ZEROS,
+    inter_pass_delay_s: float = 0.05,
 ) -> int:
     """SIGKILL uid>=1000 processes before root-side grading reads outputs.
 
@@ -497,6 +512,11 @@ def kill_pre_grade_agent_processes(
     protected = {self_pid, parent_pid, 1}
     total_killed = 0
     consecutive_zeros = 0
+    killed_identities: set[tuple[int, int | None]] = set()
+    saw_replacement = False
+
+    if inter_pass_delay_s < 0.0:
+        raise ValueError("inter_pass_delay_s must be non-negative")
 
     for pass_idx in range(max_passes):
         try:
@@ -506,7 +526,7 @@ def kill_pre_grade_agent_processes(
                 f"could not enumerate /proc during pre-grade quiesce: {exc}"
             ) from exc
 
-        eligible: list[tuple[int, int, str]] = []
+        eligible: list[tuple[int, int, str, tuple[int, int | None]]] = []
         for entry in proc_entries:
             if not entry.isdigit():
                 continue
@@ -522,7 +542,8 @@ def kill_pre_grade_agent_processes(
                 raise ProcessQuiesceError(
                     f"could not inspect {proc_path} during pre-grade quiesce: {exc}"
                 ) from exc
-            if uid < min_uid or _read_proc_state(proc_path) == "Z":
+            state, starttime = _read_proc_identity(proc_path)
+            if uid < min_uid or state == "Z":
                 continue
             cmd = "<unknown>"
             try:
@@ -534,7 +555,7 @@ def kill_pre_grade_agent_processes(
                 )
             except OSError:
                 pass
-            eligible.append((pid, uid, cmd))
+            eligible.append((pid, uid, cmd, (pid, starttime)))
 
         if not eligible:
             consecutive_zeros += 1
@@ -543,10 +564,19 @@ def kill_pre_grade_agent_processes(
             continue
 
         consecutive_zeros = 0
-        for pid, uid, cmd in eligible:
+        previously_killed = set(killed_identities)
+        for pid, uid, cmd, identity in eligible:
+            if identity in killed_identities:
+                # SIGKILL is asynchronous. Give the same process identity time
+                # to leave kernel teardown instead of counting it repeatedly as
+                # a respawner.
+                continue
+            if previously_killed:
+                saw_replacement = True
             try:
                 os.kill(pid, signal.SIGKILL)
                 total_killed += 1
+                killed_identities.add(identity)
                 logger.warning(
                     "[GRADING] pre-grade SIGKILL pid=%d uid=%d cmd=%r", pid, uid, cmd
                 )
@@ -556,9 +586,17 @@ def kill_pre_grade_agent_processes(
                 raise ProcessQuiesceError(
                     f"could not SIGKILL pid={pid} uid={uid} cmd={cmd!r}: {exc}"
                 ) from exc
+        if inter_pass_delay_s:
+            time.sleep(inter_pass_delay_s)
 
-    raise AgentProcessQuiesceError(
-        f"pre-grade quiesce did not converge after {max_passes} passes; killed {total_killed} process(es)"
+    message = (
+        f"pre-grade quiesce did not converge after {max_passes} passes; "
+        f"killed {total_killed} process(es)"
+    )
+    if saw_replacement or not killed_identities:
+        raise AgentProcessQuiesceError(message)
+    raise ProcessQuiesceError(
+        f"{message}; already-killed process identities remained in kernel teardown"
     )
 
 
@@ -764,30 +802,55 @@ def ensure_agent_output_directory(output_dir: str | Path) -> bool:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
         try:
-            directory_fd = os.open(output.name, flags, dir_fd=parent_fd)
+            info = os.stat(
+                output.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             os.mkdir(output.name, mode=0o777, dir_fd=parent_fd)
             restored = True
-            directory_fd = os.open(output.name, flags, dir_fd=parent_fd)
         except OSError as exc:
             try:
-                info = os.stat(
-                    output.name,
-                    dir_fd=parent_fd,
-                    follow_symlinks=False,
+                os.close(parent_fd)
+            finally:
+                parent_fd = -1
+            raise ProcessQuiesceError(
+                f"could not inspect output directory {output}: {exc}"
+            ) from exc
+        else:
+            if not stat.S_ISDIR(info.st_mode):
+                try:
+                    os.unlink(output.name, dir_fd=parent_fd)
+                    os.mkdir(output.name, mode=0o777, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise ProcessQuiesceError(
+                        f"could not replace unsafe output leaf {output}: {exc}"
+                    ) from exc
+                restored = True
+
+        try:
+            expected = os.stat(
+                output.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(expected.st_mode):
+                raise ProcessQuiesceError(
+                    f"output leaf is not a directory after restoration: {output}"
                 )
-            except OSError as stat_exc:
-                raise ProcessQuiesceError(
-                    f"could not inspect output directory {output}: {stat_exc}"
-                ) from stat_exc
-            if stat.S_ISDIR(info.st_mode):
-                raise ProcessQuiesceError(
-                    f"could not securely open output directory {output}: {exc}"
-                ) from exc
-            os.unlink(output.name, dir_fd=parent_fd)
-            os.mkdir(output.name, mode=0o777, dir_fd=parent_fd)
-            restored = True
             directory_fd = os.open(output.name, flags, dir_fd=parent_fd)
+            opened = os.fstat(directory_fd)
+        except ProcessQuiesceError:
+            raise
+        except OSError as exc:
+            raise ProcessQuiesceError(
+                f"could not securely open output directory {output}: {exc}"
+            ) from exc
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ProcessQuiesceError(
+                f"output directory changed while being opened: {output}"
+            )
 
         if os.geteuid() == 0:
             os.fchown(directory_fd, 0, 0)
@@ -800,7 +863,8 @@ def ensure_agent_output_directory(output_dir: str | Path) -> bool:
     finally:
         if directory_fd >= 0:
             os.close(directory_fd)
-        os.close(parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def pre_grade_cleanup(output_dir: str | Path) -> dict[str, int]:
@@ -817,8 +881,8 @@ def pre_grade_cleanup(output_dir: str | Path) -> dict[str, int]:
         raise AgentTmpfsFloodError(
             "agent flooded /dev/shm beyond the bounded cleanup budget"
         )
-    restored = ensure_agent_output_directory(output_dir)
     symlinks = scrub_escaping_symlinks(output_dir)
+    restored = ensure_agent_output_directory(output_dir)
     nonregular = scrub_nonregular_files(output_dir)
     return {
         "killed_processes": killed,

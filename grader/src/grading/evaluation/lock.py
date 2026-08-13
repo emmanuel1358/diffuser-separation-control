@@ -10,7 +10,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from grading.calibration import PiecewiseLinearCurve
 from grading.evaluation.metrics import (
@@ -22,7 +22,8 @@ from grading.evaluation.metrics import (
     validate_metric_vector,
 )
 
-CALIBRATION_LOCK_SCHEMA = "3.1"
+CALIBRATION_LOCK_SCHEMA = "3.2"
+PREVIOUS_CALIBRATION_LOCK_SCHEMA = "3.1"
 LEGACY_CALIBRATION_LOCK_SCHEMA = "3.0"
 CALIBRATION_POLICY = "continuous-pwl-v3"
 DEFAULT_LOCK_FILENAME = "calibration.lock.json"
@@ -97,6 +98,10 @@ class CalibrationLock:
             for name, spec in self.payload["targets"].items()
         }
 
+    @property
+    def quality_floor_mode(self) -> str:
+        return str(self.payload.get("quality_floor_mode", "author"))
+
 
 def _aggregate_progress(
     targets: tuple[MetricTarget, ...],
@@ -167,13 +172,15 @@ def build_calibration_lock(
     naive_at_floor: Mapping[str, Any] | None = None,
     max_unacknowledged_naive_score_gap: float = 0.05,
     naive_semantic_gap_acknowledgement: Mapping[str, Any] | None = None,
+    quality_floor_mode: Literal["author", "effective_no_info"] = "author",
 ) -> CalibrationLock:
     """Build a canonical quality lock plus auditable no-information probes.
 
-    The reviewed author floor remains the quality anchor. Degenerate-family
-    measurements are persisted for qualification and adversarial audit, but
-    information eligibility is decided independently at grade time. This
-    preserves low reward for weak candidates that carry real row-level signal.
+    ``quality_floor_mode='author'`` preserves the reviewed author floor as the
+    runtime quality anchor. ``'effective_no_info'`` uses the measured
+    no-information ceiling at runtime as well as qualification, removing
+    prevalence credit below that ceiling while the evidence gate independently
+    verifies row-level information.
     """
 
     reference = validate_metric_vector(targets, reference_metrics)
@@ -185,6 +192,8 @@ def build_calibration_lock(
         for strategy, metrics in degenerate_metrics.items()
     }
     weights = normalize_weights(targets)
+    if quality_floor_mode not in {"author", "effective_no_info"}:
+        raise ValueError("quality_floor_mode must be 'author' or 'effective_no_info'")
 
     ceilings = {
         target.name: no_info_ceiling(
@@ -219,14 +228,17 @@ def build_calibration_lock(
         )
         for target in targets
     )
-    x_ref = _aggregate_progress(targets, reference)
+    quality_targets = (
+        qualification_targets if quality_floor_mode == "effective_no_info" else targets
+    )
+    x_ref = _aggregate_progress(quality_targets, reference)
     if not 0.0 < x_ref < 1.0:
         raise ValueError(
             "reference aggregate progress must lie strictly between floor and "
             f"perfect; got {x_ref:.12g}"
         )
     curve = PiecewiseLinearCurve.from_reference(x_ref)
-    naive_quality_progress = _aggregate_progress(targets, naive)
+    naive_quality_progress = _aggregate_progress(quality_targets, naive)
     naive_progress = _aggregate_progress(qualification_targets, naive)
     naive_score = curve.score(naive_progress)
     naive_quality_score = curve.score(naive_quality_progress)
@@ -279,6 +291,7 @@ def build_calibration_lock(
     payload: dict[str, Any] = {
         "schema_version": CALIBRATION_LOCK_SCHEMA,
         "policy": CALIBRATION_POLICY,
+        "quality_floor_mode": quality_floor_mode,
         "task_spec_sha256": task_spec_sha256,
         "evaluation_plan_sha256": evaluation_plan_sha256,
         "evaluation_plan": dict(evaluation_plan),
@@ -458,6 +471,7 @@ def validate_calibration_lock(
     schema_version = payload.get("schema_version")
     if schema_version not in {
         CALIBRATION_LOCK_SCHEMA,
+        PREVIOUS_CALIBRATION_LOCK_SCHEMA,
         LEGACY_CALIBRATION_LOCK_SCHEMA,
     }:
         raise ValueError(
@@ -466,6 +480,17 @@ def validate_calibration_lock(
         )
     if payload.get("policy") != CALIBRATION_POLICY:
         raise ValueError(f"unsupported calibration policy {payload.get('policy')!r}")
+    quality_floor_mode = payload.get("quality_floor_mode", "author")
+    if quality_floor_mode not in {"author", "effective_no_info"}:
+        raise ValueError(
+            "calibration lock quality_floor_mode must be 'author' or "
+            "'effective_no_info'"
+        )
+    if (
+        schema_version == CALIBRATION_LOCK_SCHEMA
+        and "quality_floor_mode" not in payload
+    ):
+        raise ValueError("calibration lock is missing quality_floor_mode")
     accepted_task_digests = {
         digest
         for digest in (task_spec_sha256, *compatible_task_spec_sha256s)
@@ -610,7 +635,10 @@ def validate_calibration_lock(
     }
     reference = measurements["reference"]
     naive = measurements["naive"]
-    derived_x_ref = _aggregate_from_payload(targets, reference)
+    quality_targets = (
+        qualification_targets if quality_floor_mode == "effective_no_info" else targets
+    )
+    derived_x_ref = _aggregate_from_payload(quality_targets, reference)
     _close(x_ref, derived_x_ref, field="curve.x_ref")
     qualification = payload.get("qualification")
     if not isinstance(qualification, Mapping):
@@ -621,7 +649,7 @@ def validate_calibration_lock(
         "oracle_score": curve_obj.score(1.0),
         "null_score": curve_obj.score(0.0),
         "naive_progress": _aggregate_from_payload(qualification_targets, naive),
-        "naive_quality_progress": _aggregate_from_payload(targets, naive),
+        "naive_quality_progress": _aggregate_from_payload(quality_targets, naive),
     }
     expected_qualification["naive_score"] = curve_obj.score(
         expected_qualification["naive_progress"]
@@ -638,7 +666,7 @@ def validate_calibration_lock(
     )
     stored_qualification = (
         expected_qualification
-        if schema_version == CALIBRATION_LOCK_SCHEMA
+        if schema_version in {CALIBRATION_LOCK_SCHEMA, PREVIOUS_CALIBRATION_LOCK_SCHEMA}
         else {
             field: expected_qualification[field]
             for field in (
@@ -659,7 +687,7 @@ def validate_calibration_lock(
                 f"calibration lock qualification is missing {field}"
             ) from exc
         _close(actual, expected, field=f"qualification.{field}")
-    if schema_version == CALIBRATION_LOCK_SCHEMA:
+    if schema_version in {CALIBRATION_LOCK_SCHEMA, PREVIOUS_CALIBRATION_LOCK_SCHEMA}:
         try:
             semantic_gap_threshold = float(
                 qualification["max_unacknowledged_naive_score_gap"]

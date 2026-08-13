@@ -3,13 +3,19 @@ from __future__ import annotations
 import errno
 import os
 import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from grading import policy_runner
 from grading.faults import AgentFault
-from grading.policy_runner import PolicyTimeoutError, PolicyWorker, PolicyWorkerError
+from grading.policy_runner import (
+    PolicyAgentFault,
+    PolicyTimeoutError,
+    PolicyWorker,
+    PolicyWorkerError,
+)
 
 
 def test_policy_worker_accepts_module_act(tmp_path: Path) -> None:
@@ -119,6 +125,38 @@ def test_policy_worker_accepts_policy_class(tmp_path: Path) -> None:
         assert policy.act({"x": 3}) == {"u": 6}
 
 
+def test_policy_worker_auto_detects_load_policy_factory(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text(
+        "class Policy:\n"
+        "    def __init__(self, value):\n"
+        "        self.value = value\n"
+        "    def choose(self):\n"
+        "        return self.value\n"
+        "def load_policy():\n"
+        "    return Policy(7)\n"
+    )
+
+    with PolicyWorker(policy_path) as policy:
+        assert policy.call("choose") == 7
+
+
+def test_policy_worker_auto_detect_keeps_module_act_precedence(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text(
+        "def act(obs):\n"
+        "    return 'module-act'\n"
+        "class P:\n"
+        "    def act(self, obs):\n"
+        "        return 'factory-act'\n"
+        "def load_policy():\n"
+        "    return P()\n"
+    )
+
+    with PolicyWorker(policy_path) as policy:
+        assert policy.act({}) == "module-act"
+
+
 def test_policy_worker_can_call_named_methods(tmp_path: Path) -> None:
     policy_path = tmp_path / "policy.py"
     policy_path.write_text(
@@ -199,6 +237,85 @@ def test_policy_worker_times_out(tmp_path: Path) -> None:
     assert isinstance(excinfo.value, RuntimeError)
     assert isinstance(excinfo.value, PolicyWorkerError)
     assert isinstance(excinfo.value, AgentFault)
+
+
+def test_policy_worker_enforces_cumulative_call_budget(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text(
+        "import time\n" "def act(obs):\n" "    time.sleep(0.04)\n" "    return obs\n"
+    )
+
+    with PolicyWorker(
+        policy_path,
+        timeout_s=0.2,
+        total_timeout_s=0.07,
+    ) as policy:
+        assert policy.act(1) == 1
+        with pytest.raises(PolicyTimeoutError, match="total compute budget"):
+            policy.act(2)
+
+
+def test_policy_worker_rejects_invalid_total_call_budget(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text("def act(obs):\n    return obs\n")
+
+    with pytest.raises(ValueError, match="total_timeout_s"):
+        PolicyWorker(policy_path, total_timeout_s=float("nan"))
+
+
+def test_policy_worker_maps_poison_reply_decode_to_agent_fault(tmp_path: Path) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text(
+        "import msgpack\n"
+        "def act(obs):\n"
+        "    payload = msgpack.packb(['object', [1], b'12345678'], "
+        "use_bin_type=True)\n"
+        "    return msgpack.ExtType(1, payload)\n"
+    )
+
+    with (
+        PolicyWorker(policy_path) as policy,
+        pytest.raises(PolicyAgentFault, match="invalid msgpack reply"),
+    ):
+        policy.act({})
+
+
+@pytest.mark.parametrize(
+    ("result_source", "error_match"),
+    [
+        ("float('nan')", "non-finite"),
+        ("float('inf')", "non-finite"),
+        ("__import__('numpy').array([0.0, float('nan')])", "non-finite"),
+    ],
+)
+def test_policy_worker_rejects_non_finite_reply_values(
+    tmp_path: Path, result_source: str, error_match: str
+) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text(f"def act(obs):\n    return {result_source}\n")
+
+    with (
+        PolicyWorker(policy_path) as policy,
+        pytest.raises(PolicyAgentFault, match=error_match),
+    ):
+        policy.act({})
+
+
+def test_policy_worker_rejects_unserializable_reply_without_cold_import_timeout(
+    tmp_path: Path,
+) -> None:
+    policy_path = tmp_path / "policy.py"
+    policy_path.write_text(
+        "class Policy:\n" "    def act(self, obs):\n" "        return self\n"
+    )
+
+    started = time.monotonic()
+    with (
+        PolicyWorker(policy_path, timeout_s=0.5) as policy,
+        pytest.raises(PolicyAgentFault, match="unencodable response"),
+    ):
+        policy.act({})
+    assert time.monotonic() - started < 2.0
 
 
 def test_policy_worker_first_call_gets_generous_budget(tmp_path: Path) -> None:

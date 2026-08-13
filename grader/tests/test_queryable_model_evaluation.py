@@ -302,10 +302,19 @@ def test_predictor_budgets_and_full_bank_policy_are_in_spec() -> None:
     assert challenge.spec_dict()["selection_policy"] == "full_bank"
     assert challenge.spec_dict()["sample_size"] is None
 
+    stable = PrivateTableChallenge(
+        "challenge.parquet",
+        feature_columns=["x"],
+        sample_size=120,
+    )
+    assert stable.selection_policy == "stable_subset"
+    assert stable.legacy_spec_dict() is None
+
     legacy = PrivateTableChallenge(
         "challenge.parquet",
         feature_columns=["x"],
         sample_size=120,
+        selection_policy="artifact_digest",
     )
     assert legacy.selection_policy == "artifact_digest"
     assert legacy.legacy_spec_dict()["type"] == "private_table.v1"

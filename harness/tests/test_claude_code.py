@@ -6,10 +6,12 @@ import types
 
 from lbx_rl_tasks_harness.runtimes.claude_code import (
     _build_rubric_mcp_server,
+    _build_tmux_mcp_server,
     _effective_model,
     _invoke_bridge_tool,
     _model_facing_tool_name,
 )
+from lbx_rl_tasks_harness.tmux_tool import _tmux_exec_args
 
 
 def test_effective_model_prefers_cli_then_env(monkeypatch) -> None:
@@ -66,6 +68,55 @@ def test_build_rubric_mcp_server_uses_existing_bridge(monkeypatch) -> None:
         "bash",
         "str_replace_editor",
     ]
+
+
+def test_build_tmux_mcp_server_uses_hardened_exec_args(monkeypatch) -> None:
+    captured = {}
+    run_calls = []
+
+    def fake_tool(*, name, description, input_schema):
+        def decorate(func):
+            func._tool_name = name
+            func._description = description
+            func._input_schema = input_schema
+            return func
+
+        return decorate
+
+    def fake_create_sdk_mcp_server(*, name, version, tools):
+        captured.update({"name": name, "version": version, "tools": tools})
+        return captured
+
+    def fake_run(args, **kwargs):
+        run_calls.append((args, kwargs))
+        return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    module = types.ModuleType("claude_agent_sdk")
+    module.tool = fake_tool
+    module.create_sdk_mcp_server = fake_create_sdk_mcp_server
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
+    monkeypatch.setattr(
+        "lbx_rl_tasks_harness.runtimes.claude_code.subprocess.run",
+        fake_run,
+    )
+
+    server = _build_tmux_mcp_server("container-123")
+    result = asyncio.run(
+        server["tools"][0]({"command": "new-session -d -s train python fit.py"})
+    )
+
+    assert run_calls[0][0] == _tmux_exec_args(
+        "container-123",
+        "new-session -d -s train python fit.py",
+    )
+    assert result == {
+        "content": [
+            {
+                "type": "text",
+                "text": "exit_code=0\nstdout:\nok\nstderr:\n",
+            }
+        ]
+    }
 
 
 def test_invoke_bridge_tool_returns_sdk_content() -> None:

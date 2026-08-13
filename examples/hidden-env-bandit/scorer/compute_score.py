@@ -18,6 +18,7 @@ TASK = PolicyEvaluationTask(
     # inside the 0.5 +/- 0.05 ground-truth band without a steep upper segment.
     reference_quality=0.925,
     call_timeout_s=2.0,
+    total_timeout_s=900.0,
 )
 
 

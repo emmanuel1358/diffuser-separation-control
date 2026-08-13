@@ -779,7 +779,7 @@ class _FixedDateTime(datetime):
     [
         (
             "alignerr_plugin/src/alignerr_plugin/starter_templates/ml",
-            "d081336e7395cf44ab2f69073511796953890082084783578f2e58c38828b140",
+            "96e8adbfd950b7a3ae38a559d552920c96f321de88f77bb1e2c1883349ef00d3",
         ),
         pytest.param(
             "examples/mujoco-pendulum",

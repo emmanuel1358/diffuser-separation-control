@@ -91,13 +91,15 @@ black-box env over `/tmp/env.sock`; see `docs/HIDDEN_ENV.md`):
 - **Source stays hidden**: the env (`scorer/data/env.py`) is baked root-only
   (0700) to `/mcp_server/data/`; the blocking `hidden_env` validator stage fails
   the task if the env module is also shipped under the public `data/`.
-- **Private methods are unreachable**: the server rejects any `_`-prefixed method
-  and anything outside an env's `_env_public_methods` allow-list (which fails
-  CLOSED if malformed), so an oracle / held-out-target / budget method cannot be
-  called over the socket.
-- **No path redirection via env_kwargs**: agent-supplied `__create__` kwargs whose
-  string values resolve under `/mcp_server` are rejected; optional
-  `allowed_env_kwargs` (in `env_config.json`) pins the create contract.
+- **Private methods are unreachable**: every new env/hybrid task must declare
+  `_env_public_methods` and set
+  `require_public_methods_allowlist=true` in `env_config.json`. The server
+  rejects `_`-prefixed/non-allow-listed methods and fails closed when a strict
+  env omits the declaration.
+- **No path redirection via env kwargs**: agent-supplied `__create__` kwargs
+  whose string values resolve under `/mcp_server` are rejected, and new tasks
+  explicitly pin `allowed_env_kwargs`. Socket-exposed methods use explicit
+  keyword signatures rather than unrestricted `**kwargs`.
 - **No grade-time env access**: `stop_env_server()` closes the socket before the
   grader runs, defeating free `reset()`-seed fingerprinting, twin-env oracles,
   and private-method probing; the grader loads the held-out env in-process via
@@ -111,6 +113,7 @@ black-box env over `/tmp/env.sock`; see `docs/HIDDEN_ENV.md`):
   its own cwd; tool subprocesses receive `/workdir` explicitly.
 - **Flood resistance**: connection handlers are capped, excess sockets are
   closed, and `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` backs off without exiting.
+  Global and per-connection live-instance caps bound env-object memory.
   Exhausting the restart budget leaves the MCP alive so a deliberate crash
   cannot void grading.
 
@@ -123,8 +126,10 @@ every grade) closes the classic exploits with no author action:
   PID-hopper that leaks the answer key via `/proc/<pid>/root|fd`);
 - quiesces uid >= 1000 processes before grading (freezes the filesystem so a
   `while true; ln -sf <truth> submission.csv` cannot re-plant in the read
-  window); confirmed respawning agent processes earn a kept `0.0`, while an
-  inability to inspect or terminate processes aborts as infrastructure failure;
+  window); it tracks PID start times and waits for already-killed processes to
+  exit, so only genuinely new process identities count as respawn. Confirmed
+  respawners earn a kept `0.0`, while an inability to inspect or terminate
+  processes aborts as infrastructure failure;
 - repeats quiescence after grading before publishing traces/results, so
   descendants spawned by submitted code cannot race post-grade root I/O;
 - gives every submitted policy or executable worker a fresh best-effort IPC
@@ -134,9 +139,16 @@ every grade) closes the classic exploits with no author action:
   submitted policy/executable workers. The default is 75% of the detected
   cgroup memory limit (capped at 56 GiB), leaving headroom for the root MCP and
   grader; `RUBRIC_AGENT_MEMORY_LIMIT_BYTES` and
-  `RUBRIC_POLICY_MEMORY_LIMIT_BYTES` provide trusted deployment overrides;
-- scrubs escaping symlinks and non-regular files (FIFOs/sockets/devices) under
-  the output dir (symlink-to-truth and FIFO-hang-to-discard defenses);
+  `RUBRIC_POLICY_MEMORY_LIMIT_BYTES` provide trusted deployment overrides. This
+  is per process, not an aggregate multiprocessing-tree cap;
+- enforces per-call and cumulative submitted-policy deadlines. Malformed or
+  non-finite worker replies and either deadline becoming exhausted are
+  `AgentFault` kept zeros, rather than reaching the outer grader timeout and
+  discarding the run;
+- `lstat`s and descriptor-pins the output-directory leaf before changing
+  ownership, then scrubs escaping symlinks and non-regular files
+  (FIFOs/sockets/devices). This does not rely on gVisor honoring
+  `O_NOFOLLOW`;
 - traps non-finite scores (`NaN`/`inf` cannot clamp up to `1.0`);
 - enforces the uid-1000 / `0700`-private filesystem model and an
   agent-unwritable grader cache.
@@ -202,6 +214,8 @@ contacts turned off. Gate the score on it for control tasks.
 - [ ] Rubric tasks declare `TASK = RubricTask(...)` and a matching
       `scorer/evaluation.plan.json`; they do not define `compute_score()`.
 - [ ] No bare/broad `except` that returns a score; agent faults `raise AgentFault`.
+- [ ] Sealed policy tasks disclose `call_timeout_s` and `total_timeout_s`, with
+      the total leaving trusted grading/trace headroom.
 - [ ] Author/infra reads (hidden truth) are outside the agent `try`.
 - [ ] Submissions are read via the sanctioned loader for their type.
 - [ ] The score is computed from artifacts, never the agent's stdout/claimed score.

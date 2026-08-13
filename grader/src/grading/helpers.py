@@ -756,8 +756,10 @@ def _resolve_policy_path(policy: str | Path) -> Path:
 def run_policy(
     policy: str | Path,
     *,
+    factory_name: str | None = None,
     timeout_s: float = 5.0,
     first_call_timeout_s: float | None = None,
+    total_timeout_s: float | None = None,
     cwd: str | Path | None = None,
     unshare_ipc: bool = True,
     submitted_snapshot: str | Path | None = None,
@@ -769,6 +771,10 @@ def run_policy(
     over a dedicated fd so the score is NEVER parsed from stdout. Use as a
     context manager and read the score from the return value, not stdout.
     ``unshare_ipc`` (default True) gives each worker a private IPC namespace.
+    ``total_timeout_s`` optionally caps cumulative time waiting for submitted
+    worker calls in addition to the per-call ``timeout_s``. ``factory_name``
+    selects an explicit submitted factory; ``None`` keeps compatibility
+    auto-detection (module ``act``, ``load_policy()``, then ``Policy()``).
     """
     from grading.policy_runner import PolicyWorker
 
@@ -779,6 +785,8 @@ def run_policy(
         resolved_policy,
         timeout_s=timeout_s,
         first_call_timeout_s=first_call_timeout_s,
+        total_timeout_s=total_timeout_s,
+        factory_name=factory_name,
         cwd=Path(cwd) if cwd is not None else None,
         unshare_ipc=unshare_ipc,
         submitted_snapshot=submitted_snapshot,
