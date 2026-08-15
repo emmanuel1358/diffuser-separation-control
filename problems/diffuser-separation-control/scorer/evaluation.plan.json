@@ -1,0 +1,53 @@
+{
+  "decision_ids": [
+    "pressure_recovery",
+    "separation_penalty",
+    "outlet_uniformity",
+    "robustness",
+    "inlet_extension_bonus"
+  ],
+  "evidence": {
+    "aggregation": "weighted",
+    "artifact": {
+      "allow_extra_keys": false,
+      "max_bytes": 67108864,
+      "max_depth": 64,
+      "max_nodes": 100000,
+      "numeric_fields": [
+        {
+          "maximum": 12.0,
+          "minimum": 4.0,
+          "path": "half_angle_deg",
+          "required": true
+        },
+        {
+          "maximum": 8.0,
+          "minimum": 3.0,
+          "path": "length_ratio",
+          "required": true
+        },
+        {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "path": "inlet_extension_m",
+          "required": true
+        }
+      ],
+      "path": "diffuser_design.json",
+      "require_object": true,
+      "required_keys": [
+        "half_angle_deg",
+        "length_ratio",
+        "inlet_extension_m"
+      ],
+      "type": "json-artifact.v1"
+    },
+    "type": "declarative-rubric.v1"
+  },
+  "metric_ids": [],
+  "plan_sha256": "78dac3b74b036f93e99263857e32da645a64346bc344b20368ec74c8c97bbfc0",
+  "protocol": "declarative-rubric.v1",
+  "schema_version": "evaluation-plan.v2",
+  "security_tier": "sealed_rescore",
+  "task_spec_sha256": "290886858e24856872b2611d2012daac0851623812719eda9f4c8157fcfdc970"
+}

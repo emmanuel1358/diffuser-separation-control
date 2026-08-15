@@ -1,6 +1,1 @@
-{
-  "fluid": "air",
-  "inlet_velocity_m_per_s": 15.0,
-  "kinematic_viscosity_m2_per_s": 1.5e-5,
-  "reference_density_kg_per_m3": 1.225
-}
+{"inlet_velocity_m_per_s": 15.0, "kinematic_viscosity_m2_per_s": 1.5e-5}

@@ -1,14 +1,9 @@
-#!/usr/bin/env bash
-# _rev: 2026-06-16.b7prc04t3_batch6
-set -euo pipefail
-OUT_DIR="${LBT_OUTPUT_DIR:-/tmp/output}"
-mkdir -p "$OUT_DIR"
-cat > "$OUT_DIR/hydrofoil_flap.json" <<'JSON'
+#!/bin/bash
+set -e
+mkdir -p /tmp/output
+cat > /tmp/output/diffuser_design.json << 'JSON'
 {
-  "flap_deflection_deg": 6.8,
-  "hinge_gap_m": 0.009,
-  "flap_chord_fraction": 0.26,
-  "blend_radius_m": 0.018
-}
+  "half_angle_deg": 4.0,
+  "length_ratio": 3.0,
+  "inlet_extension_m": 0.0}
 JSON
-cat "$OUT_DIR/hydrofoil_flap.json"

@@ -9,7 +9,6 @@ required_resources = "8vcpu+64gib"
 storage_mb = 50000
 allow_internet = false
 
-
 [agent]
 timeout_sec = 1800
 
@@ -20,6 +19,7 @@ env = []
 [ground_truth]
 score_epsilon = 0.001
 in_container = true
+max_trivial_score = 0.85
 
 [delivery]
 platform = "prometheus"
