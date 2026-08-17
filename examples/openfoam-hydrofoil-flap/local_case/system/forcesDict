@@ -1,9 +1,0 @@
-type            forces;
-libs            (forces);
-
-patches         (hydrofoilFlap);
-
-rho             rhoInf;
-rhoInf          1000;
-
-CofR            (0 0 0);

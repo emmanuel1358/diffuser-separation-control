@@ -49,3 +49,6 @@ __pycache__/
 
 # Base image package lists memoized by the dependency-channel image diff.
 .alignerr-cache/
+
+# Local OpenFOAM simulation output
+examples/openfoam-hydrofoil-flap/local_case/
