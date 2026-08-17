@@ -419,7 +419,7 @@ def test_trace_publish_failure_writes_infrastructure_result(
         "removed_symlinks": 0,
         "removed_nonregular": 0,
     }
-    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths: None)
+    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths, **_kwargs: None)
     monkeypatch.setattr(run_grader, "pre_grade_cleanup", lambda _path: cleanup)
     monkeypatch.setattr(run_grader, "prepare_grader_cache", lambda: {})
 
@@ -475,7 +475,7 @@ def test_runner_writes_failure_when_worker_launch_raises(
     for path in (workspace, grader_dir, private_dir):
         path.mkdir()
 
-    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths: None)
+    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths, **_kwargs: None)
     monkeypatch.setattr(
         run_grader,
         "pre_grade_cleanup",
@@ -527,7 +527,7 @@ def test_unreadable_result_on_a_full_disk_is_charged_to_the_agent(
     for path in (workspace, grader_dir, private_dir):
         path.mkdir()
 
-    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths: None)
+    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths, **_kwargs: None)
     monkeypatch.setattr(
         run_grader,
         "pre_grade_cleanup",
@@ -579,7 +579,7 @@ def test_runner_ignores_success_payload_on_signal_exit(
     for path in (workspace, grader_dir, private_dir):
         path.mkdir()
 
-    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths: None)
+    monkeypatch.setattr(run_grader, "lock_down_grader_private", lambda _paths, **_kwargs: None)
     monkeypatch.setattr(
         run_grader,
         "pre_grade_cleanup",

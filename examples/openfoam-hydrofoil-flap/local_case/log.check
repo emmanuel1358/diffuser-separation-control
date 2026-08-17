@@ -1,0 +1,8 @@
+Using: OpenFOAM-2512 (2512) - visit www.openfoam.com
+Build: _87ed40d2-20251219
+
+Invalid option: -latestTime
+
+See 'simpleFoam -help' for usage
+ or 'simpleFoam -help-full' for extended usage
+

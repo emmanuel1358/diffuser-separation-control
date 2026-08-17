@@ -71,22 +71,36 @@ def test_list_factory_returns_handles(tmp_path: Path) -> None:
 
 
 def test_source_mode_wraps_agent_artifact(tmp_path: Path) -> None:
-    (tmp_path / "weights.txt").write_text("7")
-    # Grader-supplied LITERAL wrapper that loads the agent's data artifact.
-    wrapper = (
-        "def load_policy():\n"
-        "    class P:\n"
-        "        def choose(self):\n"
-        f"            return int(open({str(tmp_path / 'weights.txt')!r}).read())\n"
-        "    return P()\n"
-    )
-    handle = load_submitted_policy(
-        tmp_path / "ignored.py", source=wrapper, timeout_s=10
-    )
+    import shutil
+    import tempfile
+
+    artifact_dir = Path(tempfile.mkdtemp(prefix="policy-artifact-", dir="/tmp"))
+    artifact_dir.chmod(0o755)
+
     try:
-        assert handle.choose() == 7
+        weights = artifact_dir / "weights.txt"
+        weights.write_text("7")
+        weights.chmod(0o644)
+
+        # Grader-supplied LITERAL wrapper that loads the agent's data artifact.
+        wrapper = (
+            "def load_policy():\n"
+            "    class P:\n"
+            "        def choose(self):\n"
+            f"            return int(open({str(weights)!r}).read())\n"
+            "    return P()\n"
+        )
+
+        handle = load_submitted_policy(
+            tmp_path / "ignored.py", source=wrapper, timeout_s=10
+        )
+        try:
+            assert handle.choose() == 7
+        finally:
+            handle.close()
+
     finally:
-        handle.close()
+        shutil.rmtree(artifact_dir, ignore_errors=True)
 
 
 def test_missing_policy_raises_agent_fault(tmp_path: Path) -> None:

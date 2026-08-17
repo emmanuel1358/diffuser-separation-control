@@ -1,0 +1,94 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2512                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _87ed40d2-20251219 OPENFOAM=2512 version=2512
+Arch   : "LSB;label=32;scalar=64"
+Exec   : simpleFoam
+Date   : Aug 16 2026
+Time   : 09:50:30
+Host   : 1b26b3f7ac2b
+PID    : 751
+I/O    : uncollated
+Case   : /home/emman/cfd-project/examples/openfoam-hydrofoil-flap/local_case
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+memory pool : not available
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create mesh for time = 70
+
+
+SIMPLE: convergence criteria
+    field p	 tolerance 1e-05
+    field U	 tolerance 1e-06
+
+Reading field p
+
+Reading field U
+
+Reading/calculating face flux field phi
+
+Selecting incompressible transport model Newtonian
+Selecting turbulence model type laminar
+Selecting laminar stress model Stokes
+No MRF models present
+
+No finite volume options present
+
+Starting time loop
+
+Time = 71
+
+smoothSolver:  Solving for Ux, Initial residual = 2.5211642e-05, Final residual = 1.3749118e-07, No Iterations 2
+smoothSolver:  Solving for Uy, Initial residual = 0.00010580432, Final residual = 3.9287226e-07, No Iterations 2
+GAMG:  Solving for p, Initial residual = 0.00052494601, Final residual = 1.3938887e-05, No Iterations 4
+GAMG:  Solving for p, Initial residual = 1.7976043e-05, Final residual = 5.806422e-07, No Iterations 5
+time step continuity errors : sum local = 8.7021356e-07, global = -1.052172e-07, cumulative = 0.0029376207
+ExecutionTime = 0.05 s  ClockTime = 0 s
+
+Time = 72
+
+smoothSolver:  Solving for Ux, Initial residual = 2.1869371e-05, Final residual = 1.160558e-07, No Iterations 2
+smoothSolver:  Solving for Uy, Initial residual = 9.4348017e-05, Final residual = 3.6461146e-07, No Iterations 2
+GAMG:  Solving for p, Initial residual = 0.00046983519, Final residual = 1.3361873e-05, No Iterations 4
+GAMG:  Solving for p, Initial residual = 1.6602232e-05, Final residual = 6.7957679e-07, No Iterations 5
+time step continuity errors : sum local = 1.0184246e-06, global = -1.0569661e-07, cumulative = 0.002937515
+ExecutionTime = 0.08 s  ClockTime = 0 s
+
+Time = 73
+
+smoothSolver:  Solving for Ux, Initial residual = 1.8958167e-05, Final residual = 9.7769132e-08, No Iterations 2
+smoothSolver:  Solving for Uy, Initial residual = 8.6424962e-05, Final residual = 3.2395838e-07, No Iterations 2
+GAMG:  Solving for p, Initial residual = 0.00041915463, Final residual = 1.1474266e-05, No Iterations 4
+GAMG:  Solving for p, Initial residual = 1.4497075e-05, Final residual = 5.4001765e-07, No Iterations 5
+time step continuity errors : sum local = 8.0925176e-07, global = -1.2070597e-07, cumulative = 0.0029373943
+ExecutionTime = 0.11 s  ClockTime = 0 s
+
+Time = 74
+
+smoothSolver:  Solving for Ux, Initial residual = 1.6376577e-05, Final residual = 8.2388331e-08, No Iterations 2
+smoothSolver:  Solving for Uy, Initial residual = 7.9166662e-05, Final residual = 2.8334473e-07, No Iterations 2
+GAMG:  Solving for p, Initial residual = 0.00038790408, Final residual = 9.4544121e-06, No Iterations 4
+GAMG:  Solving for p, Initial residual = 1.2454101e-05, Final residual = 3.121996e-07, No Iterations 6
+time step continuity errors : sum local = 4.6784382e-07, global = -3.6944219e-08, cumulative = 0.0029373573
+ExecutionTime = 0.14 s  ClockTime = 0 s
+
+Time = 75
+
+smoothSolver:  Solving for Ux, Initial residual = 1.4023104e-05, Final residual = 6.9679537e-08, No Iterations 2
+smoothSolver:  Solving for Uy, Initial residual = 7.0090981e-05, Final residual = 2.572178e-07, No Iterations 2
+GAMG:  Solving for p, Initial residual = 0.00035346977, Final residual = 9.9538564e-06, No Iterations 4
+GAMG:  Solving for p, Initial residual = 1.237493e-05, Final residual = 2.9854963e-07, No Iterations 6
+time step continuity errors : sum local = 4.4738788e-07, global = -3.5663176e-08, cumulative = 0.0029373217
+ExecutionTime = 0.16 s  ClockTime = 0 s
+
+End
+
