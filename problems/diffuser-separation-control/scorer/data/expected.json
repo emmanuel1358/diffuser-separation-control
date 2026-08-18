@@ -1,0 +1,145 @@
+{
+  "official_design_note": "Private scoring anchors for hidden cases. Batch7 stores no direct official design vector in expected.json; the oracle derives its output by evaluating candidates through compute_score.py.",
+  "oracle_policy_note": "Ground-truth uses the same normal continuous scoring path as every other valid submission. No digest shortcut is used.",
+  "piecewise_error_anchors": {
+    "tight": [
+      [
+        0.0,
+        1.0
+      ],
+      [
+        0.0007,
+        0.45
+      ],
+      [
+        0.0015,
+        0.18
+      ],
+      [
+        0.003,
+        0.06
+      ],
+      [
+        0.006,
+        0.015
+      ],
+      [
+        0.012,
+        0.0
+      ],
+      [
+        0.024,
+        0.0
+      ],
+      [
+        0.04,
+        0.0
+      ]
+    ],
+    "medium": [
+      [
+        0.0,
+        1.0
+      ],
+      [
+        0.0015,
+        0.5
+      ],
+      [
+        0.004,
+        0.2
+      ],
+      [
+        0.008,
+        0.08
+      ],
+      [
+        0.016,
+        0.02
+      ],
+      [
+        0.03,
+        0.0
+      ],
+      [
+        0.052,
+        0.0
+      ],
+      [
+        0.08,
+        0.0
+      ]
+    ],
+    "broad": [
+      [
+        0.0,
+        1.0
+      ],
+      [
+        0.004,
+        0.55
+      ],
+      [
+        0.01,
+        0.25
+      ],
+      [
+        0.02,
+        0.08
+      ],
+      [
+        0.038,
+        0.02
+      ],
+      [
+        0.065,
+        0.0
+      ],
+      [
+        0.1,
+        0.0
+      ]
+    ]
+  },
+  "geometry_targets": {
+    "trailing_edge_offset_m": 0.0235078699692054,
+    "blockage_fraction": 0.14692418730753376,
+    "gap_ratio": 0.03864247311827957,
+    "blend_fraction": 0.11872759856630824,
+    "reference_flap_chord_ratio": 0.288
+  },
+  "case_targets": {
+    "nominal_tow": {
+      "lift_coefficient": 0.7337451261614654,
+      "drag_coefficient": 0.073510800461361,
+      "separation_index": 0.0,
+      "wake_uniformity": 0.924168
+    },
+    "fast_positive_trim": {
+      "lift_coefficient": 0.7546168908673477,
+      "drag_coefficient": 0.07975869319492501,
+      "separation_index": 0.0,
+      "wake_uniformity": 0.9153444705882353
+    },
+    "slow_negative_trim": {
+      "lift_coefficient": 0.7046886555732301,
+      "drag_coefficient": 0.07550645444059975,
+      "separation_index": 0.0,
+      "wake_uniformity": 0.9190209411764706
+    },
+    "mid_speed_shallow": {
+      "lift_coefficient": 0.745063361455583,
+      "drag_coefficient": 0.07621031689734716,
+      "separation_index": 0.0,
+      "wake_uniformity": 0.9204915294117647
+    }
+  },
+  "robustness_targets": {
+    "lift_spread_target": 0.04992823529411761,
+    "drag_spread_target": 0.006247892733564006,
+    "separation_spread_target": 0.0
+  },
+  "fallback_policy_note": "If blockMesh or simpleFoam fails, analytic response metrics may provide capped partial signal only. Full physics credit requires solver health except for the exact private oracle proof path.",
+  "public_disclosure_alignment_note": "The public files include coarse design guidance and public_calibration_samples.json. Hidden case targets remain private; public calibration data provides coarse tradeoff guidance without copying a private oracle point.",
+  "case_target_tolerance_note": "Physics criteria combine hidden fixed-case anchors with public useful-performance windows. High credit requires hidden-case performance, while public windows provide partial credit for plausible non-oracle designs."
+}

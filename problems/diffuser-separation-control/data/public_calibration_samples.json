@@ -1,0 +1,87 @@
+{
+  "task": "marine_hydrofoil_flap",
+  "summary_type": "public_calibration_samples",
+  "purpose": "Public qualitative calibration samples for coarse response trends. They complement public_transfer_guidance.json so agents can reason about off-design robustness without seeing private coefficient targets or exact reward anchors.",
+  "representative_public_samples": [
+    {
+      "label": "conservative_schema_template",
+      "design": {
+        "flap_deflection_deg": 4.5,
+        "hinge_gap_m": 0.016,
+        "flap_chord_fraction": 0.18,
+        "blend_radius_m": 0.006
+      },
+      "qualitative_result": "stable and low drag, but low lift authority"
+    },
+    {
+      "label": "center_of_public_guidance",
+      "design": {
+        "flap_deflection_deg": 6.8,
+        "hinge_gap_m": 0.009,
+        "flap_chord_fraction": 0.26,
+        "blend_radius_m": 0.018
+      },
+      "qualitative_result": "moderate authority and controlled separation; useful as a starting point, not as an optimized high-authority design"
+    },
+    {
+      "label": "upper_guidance_edge",
+      "design": {
+        "flap_deflection_deg": 7.8,
+        "hinge_gap_m": 0.006,
+        "flap_chord_fraction": 0.3,
+        "blend_radius_m": 0.024
+      },
+      "qualitative_result": "higher authority but increased drag and sensitivity risk"
+    },
+    {
+      "label": "over_aggressive_warning",
+      "design": {
+        "flap_deflection_deg": 10.5,
+        "hinge_gap_m": 0.005,
+        "flap_chord_fraction": 0.33,
+        "blend_radius_m": 0.01
+      },
+      "qualitative_result": "can look powerful but tends toward drag, blockage, and separation penalties"
+    }
+  ],
+  "disclosure_note": "The samples and metric windows are public calibration aids for coarse partial credit. They do not disclose hidden operating cases, private case targets, exact high-credit coefficient anchors, or a single official design.",
+  "public_transfer_guidance_note": "Use public_transfer_guidance.json to reason about speed, trim, Reynolds, and submergence transfer. The samples here are not ranked and are not an official design.",
+  "metric_windows": {
+    "lift_coefficient": {
+      "useful_band": [
+        0.66,
+        0.82
+      ],
+      "lower_falloff": 0.08,
+      "upper_falloff": 0.08,
+      "floor_weight": 0.34
+    },
+    "drag_coefficient": {
+      "useful_band": [
+        0.055,
+        0.095
+      ],
+      "lower_falloff": 0.02,
+      "upper_falloff": 0.03,
+      "floor_weight": 0.32
+    },
+    "separation_index": {
+      "useful_band": [
+        0.0,
+        0.3
+      ],
+      "lower_falloff": 0.0,
+      "upper_falloff": 0.2,
+      "floor_weight": 0.3
+    },
+    "wake_uniformity": {
+      "useful_band": [
+        0.72,
+        1.0
+      ],
+      "lower_falloff": 0.18,
+      "upper_falloff": 0.0,
+      "floor_weight": 0.3
+    }
+  }
+}

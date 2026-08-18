@@ -1,10 +1,24 @@
 {
   "decision_ids": [
-    "pressure_recovery",
-    "separation_penalty",
-    "outlet_uniformity",
-    "robustness",
-    "inlet_extension_bonus"
+    "output_exists",
+    "json_parses",
+    "required_fields",
+    "finite_numeric",
+    "public_range_margin",
+    "public_guidance_alignment",
+    "public_transfer_alignment",
+    "derived_geometry",
+    "mesh_health",
+    "solver_health",
+    "nominal_lift_window",
+    "nominal_drag_fit",
+    "nominal_separation_fit",
+    "nominal_wake_fit",
+    "hidden_lift_window",
+    "hidden_drag_fit",
+    "hidden_wake_fit",
+    "hidden_case_stability",
+    "hidden_robustness_spread"
   ],
   "evidence": {
     "aggregation": "weighted",
@@ -15,39 +29,46 @@
       "max_nodes": 100000,
       "numeric_fields": [
         {
-          "maximum": 12.0,
-          "minimum": 4.0,
-          "path": "half_angle_deg",
+          "maximum": null,
+          "minimum": null,
+          "path": "flap_deflection_deg",
           "required": true
         },
         {
-          "maximum": 8.0,
-          "minimum": 3.0,
-          "path": "length_ratio",
+          "maximum": null,
+          "minimum": null,
+          "path": "hinge_gap_m",
           "required": true
         },
         {
-          "maximum": 1.0,
-          "minimum": 0.0,
-          "path": "inlet_extension_m",
+          "maximum": null,
+          "minimum": null,
+          "path": "flap_chord_fraction",
+          "required": true
+        },
+        {
+          "maximum": null,
+          "minimum": null,
+          "path": "blend_radius_m",
           "required": true
         }
       ],
-      "path": "diffuser_design.json",
+      "path": "hydrofoil_flap.json",
       "require_object": true,
       "required_keys": [
-        "half_angle_deg",
-        "length_ratio",
-        "inlet_extension_m"
+        "flap_deflection_deg",
+        "hinge_gap_m",
+        "flap_chord_fraction",
+        "blend_radius_m"
       ],
       "type": "json-artifact.v1"
     },
     "type": "declarative-rubric.v1"
   },
   "metric_ids": [],
-  "plan_sha256": "78dac3b74b036f93e99263857e32da645a64346bc344b20368ec74c8c97bbfc0",
+  "plan_sha256": "b62bf872cbe824eac0f427fcea1d05252803b6578276b571c0ee5fd5fc9f6e64",
   "protocol": "declarative-rubric.v1",
   "schema_version": "evaluation-plan.v2",
   "security_tier": "sealed_rescore",
-  "task_spec_sha256": "290886858e24856872b2611d2012daac0851623812719eda9f4c8157fcfdc970"
+  "task_spec_sha256": "e60ca101212d2df8d9751a68ce9767c1285415e90bdaa2bc064801093d999746"
 }

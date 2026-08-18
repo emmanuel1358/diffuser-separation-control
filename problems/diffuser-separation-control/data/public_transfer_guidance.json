@@ -1,0 +1,78 @@
+{
+  "task": "marine_hydrofoil_flap",
+  "summary_type": "public_offdesign_transfer_guidance",
+  "purpose": "Broad public bridge data for speed, trim, submergence, and Reynolds transfer. The operating points use public-specific field names so automated environment checks do not mistake the bridge data for hidden scorer targets. These cases support robustness reasoning but do not publish private coefficient targets or reward anchors.",
+  "public_offdesign_cases": [
+    {
+      "name": "nominal_public_bridge",
+      "public_operating_point": {
+        "speed_m_per_s": 3.4,
+        "trim_angle_deg": 0.0,
+        "submergence_factor": 1.0,
+        "reynolds_number": 6500
+      },
+      "qualitative_focus": "balanced nominal tow condition"
+    },
+    {
+      "name": "fast_positive_trim_bridge",
+      "public_operating_point": {
+        "speed_m_per_s": 4.6,
+        "trim_angle_deg": 1.1,
+        "submergence_factor": 0.92,
+        "reynolds_number": 8600
+      },
+      "qualitative_focus": "higher speed and positive trim expose over-deflection, drag, and shallow-clearance sensitivity"
+    },
+    {
+      "name": "slow_negative_trim_bridge",
+      "public_operating_point": {
+        "speed_m_per_s": 2.7,
+        "trim_angle_deg": -0.8,
+        "submergence_factor": 1.1,
+        "reynolds_number": 5400
+      },
+      "qualitative_focus": "lower speed and negative trim test whether authority remains useful without excessive flap loading"
+    },
+    {
+      "name": "mid_speed_shallow_bridge",
+      "public_operating_point": {
+        "speed_m_per_s": 3.9,
+        "trim_angle_deg": 0.55,
+        "submergence_factor": 0.88,
+        "reynolds_number": 7600
+      },
+      "qualitative_focus": "mid-speed shallow-submergence condition tests wake and separation robustness"
+    }
+  ],
+  "broad_performance_bands": {
+    "lift_coefficient": {
+      "useful_min": 0.7,
+      "useful_max": 0.82,
+      "lower_falloff": 0.08,
+      "upper_falloff": 0.16,
+      "note": "Useful authority should stay near or above this broad public floor across transfer cases; this is not an exact hidden target."
+    },
+    "drag_coefficient": {
+      "preferred_min": 0.05,
+      "soft_cap": 0.09,
+      "lower_falloff": 0.03,
+      "upper_falloff": 0.045,
+      "note": "Drag should stay controlled for the achieved authority."
+    },
+    "separation_index": {
+      "preferred_min": 0.0,
+      "soft_cap": 0.16,
+      "lower_falloff": 0.01,
+      "upper_falloff": 0.32,
+      "note": "Lower is better; broad cap only."
+    },
+    "wake_uniformity": {
+      "useful_min": 0.78,
+      "useful_max": 1.0,
+      "lower_falloff": 0.2,
+      "upper_falloff": 0.05,
+      "note": "Higher is better; broad public robustness signal."
+    }
+  },
+  "disclosure_note": "Public bridge points disclose broad operating regimes and acceptable bands. They are public measurement aids, not hidden case rows or private coefficient anchors."
+}

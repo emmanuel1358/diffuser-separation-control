@@ -1,0 +1,6 @@
+{
+  "flap_deflection_deg": 4.5,
+  "hinge_gap_m": 0.016,
+  "flap_chord_fraction": 0.18,
+  "blend_radius_m": 0.006
+}

@@ -1,0 +1,38 @@
+{
+  "task": "marine_hydrofoil_flap",
+  "summary_type": "public_baseline_trends",
+  "baseline_hydrofoil": {
+    "description": "Two-dimensional hydrofoil section with a neutral aft flap inside a deterministic water-tunnel style test section.",
+    "observed_behavior": [
+      "stable physical behavior over the public operating envelope",
+      "low drag and low separation risk but limited control authority",
+      "wake quality remains acceptable because the aft surface is not aggressively loaded"
+    ]
+  },
+  "flap_tradeoffs": [
+    {
+      "trend": "Small flap deflection",
+      "effect": "easy attached flow but weak lift/control authority"
+    },
+    {
+      "trend": "Moderate deflection with adequate chord and blend",
+      "effect": "can provide useful control authority while keeping drag and wake loss controlled"
+    },
+    {
+      "trend": "Large deflection or over-long flap",
+      "effect": "can trigger aft-surface separation, higher drag, and sensitivity to hidden trim cases"
+    },
+    {
+      "trend": "Excessive hinge gap",
+      "effect": "can reduce loading but leaks flow and worsens wake uniformity"
+    },
+    {
+      "trend": "Too little blend radius",
+      "effect": "increases hinge curvature and local separation risk"
+    }
+  ],
+  "disclosure_note": "This public summary is intentionally broad. It does not contain hidden case values, scoring anchors, ranked candidates, public scores, or the official reference geometry.",
+  "template_note": "The public hydrofoil_flap_template.json is only a conservative schema placeholder. It is deliberately low-authority and not the official reference design.",
+  "coarse_guidance_note": "The public envelope gives broad useful regions for deflection, hinge gap, flap chord, blend radius, trailing-edge offset, and blockage. Those regions are not hidden anchors.",
+  "scoring_disclosure_note": "The scoring surface combines public engineering guidance with independent hidden physical checks. Public calibration samples are broad trend data, not ranked candidates or exact hidden scores."
+}

@@ -1,0 +1,120 @@
+{
+  "task": "marine_hydrofoil_flap",
+  "units": {
+    "length": "m",
+    "angle": "deg",
+    "speed": "m/s"
+  },
+  "design_bounds": {
+    "flap_deflection_deg": {
+      "min": 2.0,
+      "max": 12.0,
+      "soft_note": "Deflections above roughly 8 degrees add control authority but become increasingly separation-prone in this simplified 2D flap model."
+    },
+    "hinge_gap_m": {
+      "min": 0.004,
+      "max": 0.02,
+      "soft_note": "A small hinge gap can relieve loading; excessive gap leaks momentum and increases wake loss."
+    },
+    "flap_chord_fraction": {
+      "min": 0.16,
+      "max": 0.34,
+      "soft_note": "Very short flaps have weak authority; very long flaps can over-load the aft section."
+    },
+    "blend_radius_m": {
+      "min": 0.004,
+      "max": 0.03,
+      "soft_note": "The blend radius softens hinge curvature. It must stay small relative to flap length."
+    }
+  },
+  "public_operating_ranges": {
+    "public_trim_angle_range_deg": {
+      "min": -1.4,
+      "max": 1.4
+    },
+    "public_speed_range_m_per_s": {
+      "min": 2.4,
+      "max": 4.9
+    },
+    "public_submergence_factor_range": {
+      "min": 0.88,
+      "max": 1.12
+    },
+    "public_reynolds_number_range": {
+      "min": 5200,
+      "max": 9000
+    }
+  },
+  "packaging_context": {
+    "chord_m": 0.62,
+    "upstream_length_m": 0.34,
+    "wake_length_m": 0.66,
+    "test_section_height_m": 0.16,
+    "minimum_clearance_m": 0.1,
+    "maximum_trailing_edge_offset_m": 0.06,
+    "target_trailing_edge_offset_band_m": [
+      0.018,
+      0.036
+    ],
+    "target_blockage_fraction_band": [
+      0.11,
+      0.23
+    ],
+    "channel_depth_m": 0.05
+  },
+  "engineering_notes": [
+    "Useful designs trade control authority against drag and separation risk rather than maximizing flap deflection.",
+    "The hidden cases stay inside the disclosed speed, trim-bias, Reynolds, and submergence ranges.",
+    "No ranked public candidates, public scores, hidden anchors, or oracle geometry are disclosed.",
+    "A conservative template copy should be treated as a schema smoke test, not as an optimized hydrofoil flap design.",
+    "Use the public bounds, calibration samples, and transfer guidance to reason about authority, drag risk, separation risk, wake loss, and robustness before finalizing the design.",
+    "The public_transfer_guidance.json file gives public off-design regime descriptions and broad acceptable bands so hidden robustness is estimable without exposing private coefficient targets or duplicating private case keys.",
+    "Public calibration samples and transfer guidance are broad engineering aids. They are not hidden scores and do not identify a single official design."
+  ],
+  "coarse_design_guidance": {
+    "purpose": "Broad public guidance for honest exploration. These bands give coarse feasibility and tradeoff guidance; they do not publish coefficient windows or a hidden scoring target surface.",
+    "useful_deflection_region_deg": [
+      5.8,
+      7.8
+    ],
+    "useful_hinge_gap_region_m": [
+      0.006,
+      0.012
+    ],
+    "useful_flap_chord_fraction_region": [
+      0.22,
+      0.3
+    ],
+    "useful_blend_radius_region_m": [
+      0.012,
+      0.024
+    ],
+    "preferred_trailing_edge_offset_region_m": [
+      0.018,
+      0.036
+    ],
+    "preferred_blockage_fraction_region": [
+      0.11,
+      0.23
+    ],
+    "note": "Strong candidates usually use moderate deflection, enough flap chord for authority, a controlled hinge gap, and a nonzero blend radius to delay separation. Excessive deflection or over-blockage can hurt drag and wake uniformity.",
+    "useful_performance_note": "Public guidance, calibration windows, and transfer cases help avoid low-authority or over-aggressive designs and can earn meaningful partial credit. Exact high-credit coefficient anchors are private.",
+    "nominal_lift_authority_hint": "Moderate designs should usually improve lift authority over neutral/template behavior. Exact coefficient anchors and high-credit windows remain private."
+  },
+  "public_validation_case": {
+    "name": "public_nominal_validation",
+    "iterations": 70,
+    "timeout_sec": 120,
+    "setup_timeout_sec": 30,
+    "health_timeout_sec": 20,
+    "analysis_timeout_sec": 70,
+    "note": "Small public operating point for broad design reasoning. Hidden coefficient targets remain private.",
+    "public_trim_angle_deg": 0.0,
+    "public_speed_m_per_s": 3.4,
+    "public_submergence_factor": 1.0,
+    "public_reynolds_number": 6500
+  },
+  "public_bridge_files": [
+    "public_transfer_guidance.json"
+  ]
+}
