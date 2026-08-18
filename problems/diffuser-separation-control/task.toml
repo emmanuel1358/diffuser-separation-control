@@ -1,7 +1,7 @@
 schema_version = "1.1"
 
 [task]
-name = "labelbox/openfoam-hydrofoil-flap"
+name = "labelbox/openfoam-hydrofoil-flap-vrlhh0hrv"
 description = "Design a 2D marine hydrofoil aft flap using public geometry bounds and off-design transfer guidance, then submit a JSON design for private physical scoring."
 
 [environment]
