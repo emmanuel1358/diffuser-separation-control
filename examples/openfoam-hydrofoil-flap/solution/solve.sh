@@ -22,18 +22,12 @@ from pathlib import Path
 
 data_dir = Path(os.environ["DATA_DIR"])
 out_dir = Path(os.environ["OUT_DIR"])
-def load_public(name):
-    candidates = [
-        data_dir / name,
-        Path("examples/openfoam-hydrofoil-flap/data") / name,
-    ]
-    for path in candidates:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    raise FileNotFoundError(f"Could not find public data file: {name}")
-
-calibration = load_public("public_calibration_samples.json")
-envelope = load_public("public_operating_envelope.json")
+calibration = json.loads(
+    (data_dir / "public_calibration_samples.json").read_text(encoding="utf-8")
+)
+envelope = json.loads(
+    (data_dir / "public_operating_envelope.json").read_text(encoding="utf-8")
+)
 
 samples = {
     row["label"]: row["design"]
