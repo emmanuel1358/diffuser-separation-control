@@ -274,20 +274,10 @@ def _run_worker(
                 # reading it), so both roots may sit on a read-only mount. The
                 # relaxation is gated on the filesystem really being read-only,
                 # so a writable non-root private tree still fails hard.
-                private_missing = (
-                    not private.exists() and not private.is_symlink()
+                lock_down_grader_private(
+                    (grader_dir, private),
+                    readonly_mount_ok=(grader_dir, private),
                 )
-                if private_missing:
-                    lock_down_grader_private(
-                        (grader_dir, private),
-                        missing_ok=True,
-                        readonly_mount_ok=(grader_dir, private),
-                    )
-                else:
-                    lock_down_grader_private(
-                        (grader_dir, private),
-                        readonly_mount_ok=(grader_dir, private),
-                    )
             elif os.name == "posix":
                 # Non-root: the private-dir lockdown AND the submitted-worker
                 # privilege drop / PID-namespace sandbox all no-op (they require

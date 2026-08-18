@@ -460,30 +460,20 @@ def test_h5_corrupt_file_raises_agent_fault_not_crash(tmp_path: Path) -> None:
 @pytest.mark.skipif(
     os.geteuid() != 0, reason="privilege drop only activates when grader is root"
 )
-def test_h5_read_worker_runs_unprivileged(tmp_path: Path) -> None:
-    """A root grader snapshots the submission before the dropped HDF5 worker
-    reads it, so the worker intentionally does not access the original
-    root-only path directly. Verify that the normal HDF5 read still succeeds
-    through that snapshot boundary.
+def test_h5_read_runs_unprivileged_not_as_root(tmp_path: Path) -> None:
+    """When the grader is root, the libhdf5 parse runs as the unprivileged agent
+    account, not in the root process. Proof: a valid .h5 readable ONLY by root
+    (0600 root:root) is unreadable to the uid-1000 worker, so the read fails as
+    an AgentFault -- whereas an in-process root read would have succeeded.
+    Mirrors test_policy_runner_sandbox.test_root_policy_cannot_read_root_only_*.
     """
-    if os.geteuid() != 0:
-        pytest.skip("privilege drop only activates when grader is root")
-
     h5py = pytest.importorskip("h5py")
-
     sub = tmp_path / "root_only.h5"
     with h5py.File(sub, "w") as f:
         f.create_dataset("preds", data=np.arange(4, dtype=float))
-
-    os.chmod(sub, 0o600)
-
-    out = helpers.load_submission_h5_or_fault(
-        sub,
-        datasets=["preds"],
-    )
-
-    assert "preds" in out
-    assert np.array_equal(out["preds"], np.arange(4, dtype=float))
+    os.chmod(sub, 0o600)  # root:root 0600 -- unreadable to the agent uid
+    with pytest.raises(AgentFault):
+        helpers.load_submission_h5_or_fault(sub, datasets=["preds"])
 
 
 # ── load_submission_h5ad_or_fault ─────────────────────────────────────────
