@@ -8,7 +8,6 @@ python3 << 'PYTHON'
 import json, math, sys
 from pathlib import Path
 
-# Must read from /data/expected.json
 paths = [
     Path("/data/expected.json"),
     Path("/mcp_server/data/expected.json"),
